@@ -1,8 +1,8 @@
 ---
 name: chsum
-description: Recover what happened in past Claude Code sessions using the `chsum` CLI — list this project's sessions, pull a verbatim digest of one (prompts in order, files changed, commands run, where it left off), drill into a subagent's own work, or produce a work log across a time window. Use whenever the user refers to earlier work you don't have in context ("what did we do yesterday", "the session where we fixed X", "pick up where we left off", "which session touched this file"), asks to reload context from a past conversation, or mentions chsum, claude-history, ch_ refs, or session digests.
+description: Recover whole past Claude Code sessions with the `chsum` CLI — list this project's sessions, digest one verbatim (prompts in order, files changed, commands run, where it left off), drill into a subagent's own work, or produce a work log across a time window. Use when the user refers to earlier work you don't have in context ("what did we do yesterday", "pick up where we left off", "which session touched this file"), or asks to reload a past session. For searching or quoting *inside* conversations, use the claude-history CLI directly.
 compatibility: Requires `chsum` on PATH (`pipx install chsum`) and `claude-history` for anything beyond the session listing.
-version: 1.0.0
+version: 1.0.1
 ---
 
 # chsum
