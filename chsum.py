@@ -245,6 +245,45 @@ def is_substantive(text: str) -> bool:
     return len(t) >= 12 and not _ACK_RE.match(t)
 
 
+# Harness-generated last words. They occupy the assistant's final turn but say
+# nothing about the work, so "where I left off" would otherwise report the manner
+# of death instead of the state. Matched, not guessed: each is a fixed string the
+# harness emits.
+_NOTICE_RES = [re.compile(p, re.IGNORECASE) for p in (
+    r"^you'?ve hit your (session|usage) limit",
+    r"^(claude )?(usage|session) limit reached",
+    r"^\[request interrupted",
+    r"^api error",
+    r"^\[the user (has )?(interrupted|stopped)",
+    r"^no response requested",
+)]
+
+
+def notice_kind(text: str) -> str:
+    """The notice text itself if this message is a harness notice, else ""."""
+    t = text.strip()
+    # Length-bounded: a real message that merely quotes a notice isn't one.
+    return t if len(t) <= 200 and any(r.match(t) for r in _NOTICE_RES) else ""
+
+
+def last_said(msgs: list[Message]) -> tuple[Message | None, str]:
+    """Last assistant message with content, plus any notice that came after it.
+
+    Both are returned because both are true and neither substitutes for the other:
+    the notice says how the session ended, the message says where the work was.
+    """
+    notice = ""
+    for m in reversed(msgs):
+        if m.role != "assistant" or not m.text.strip():
+            continue
+        kind = notice_kind(m.text)
+        if kind:
+            notice = notice or kind
+            continue
+        return m, notice
+    return None, notice
+
+
 # ---------------------------------------------------------------------------
 # Deterministic metadata, straight from the transcript
 # ---------------------------------------------------------------------------
@@ -529,11 +568,13 @@ def _bullets(items: list[str], limit: int) -> list[str]:
     return out
 
 
-def _clip(text: str, limit: int) -> str:
+def _clip(text: str, limit: int, hint: str = "read the anchor") -> str:
+    # The hint is a parameter because agent digests have no anchors — pointing at
+    # one invites the reader to invent a ref that claude-history will reject.
     text = text.strip()
     if len(text) <= limit:
         return text
-    return text[:limit].rstrip() + f"\n… [+{len(text) - limit} chars, read the anchor]"
+    return text[:limit].rstrip() + f"\n… [+{len(text) - limit} chars, {hint}]"
 
 
 def _quote(text: str) -> str:
@@ -578,6 +619,8 @@ def messages_from_jsonl(path: pathlib.Path) -> list[Message]:
         elif isinstance(content, list):
             texts = [p.get("text", "") for p in content
                      if isinstance(p, dict) and p.get("type") == "text"]
+            # Thinking blocks are not a fallback for a thin transcript: the JSONL
+            # keeps their signature and drops the text, so they are always empty.
         else:
             continue
         text = "\n".join(t for t in texts if t.strip()).strip()
@@ -586,12 +629,63 @@ def messages_from_jsonl(path: pathlib.Path) -> list[Message]:
     return msgs
 
 
+_SIDECAR_HINT = "read the sidecar under Drill down"
+
+# Below this an assistant turn is almost always tool narration, not a finding.
+_MEATY_CHARS = 400
+
+
+def _last_meaty(msgs: list[Message], exclude=None) -> "Message | None":
+    """Last turn long enough to carry a result. None if `exclude` already is one.
+
+    Speech wins over thinking; thinking is the fallback because an agent killed
+    mid-run may never have said anything substantial out loud.
+    """
+    if exclude is not None and len(exclude.text.strip()) >= _MEATY_CHARS:
+        return None
+    for m in reversed(msgs):
+        if exclude is not None and m.n >= exclude.n:
+            continue
+        if (m.role == "assistant" and not notice_kind(m.text)
+                and len(m.text.strip()) >= _MEATY_CHARS):
+            return m
+    return None
+
+
+def last_command_output(path: pathlib.Path, tail: int = 700) -> tuple[str, str]:
+    """Last Bash command in a transcript and the tail of what it printed.
+
+    An agent that dies mid-run leaves its state in test output, not in speech.
+    Verbatim, and the tail rather than the head: the verdict line is at the end.
+    """
+    pending: dict[str, str] = {}
+    cmd = out = ""
+    for rec in _records(path):
+        content = (rec.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("name") == "Bash":
+                pending[block.get("id", "")] = (block.get("input") or {}).get("command", "")
+            elif block.get("type") == "tool_result" and block.get("tool_use_id") in pending:
+                body = block.get("content")
+                if isinstance(body, list):
+                    body = "\n".join(b.get("text", "") for b in body
+                                     if isinstance(b, dict) and b.get("type") == "text")
+                if isinstance(body, str) and body.strip():
+                    cmd, out = pending[block["tool_use_id"]], body.strip()
+    return cmd, out[-tail:] if out else ""
+
+
 def render_agent_digest(meta: Meta, parent_ref: str, run: AgentRun) -> str:
     """One subagent's work. Same shape as a session digest, minus the intent trail:
     an agent gets one instruction, so 'what I asked for' is a single block."""
     msgs = messages_from_jsonl(run.path) if run.path else []
-    lines = ["---", f"ref: {parent_ref}/{run.id}", f"parent: {parent_ref}",
-             f"agent: {run.agent_type or 'agent'}"]
+    lines = ["---",
+             f"ref: {parent_ref}/{run.id}  # chsum only — claude-history has no agent ref",
+             f"parent: {parent_ref}", f"agent: {run.agent_type or 'agent'}"]
     if run.model:
         lines.append(f"model: {run.model}")
     if run.duration:
@@ -608,7 +702,7 @@ def render_agent_digest(meta: Meta, parent_ref: str, run: AgentRun) -> str:
 
     parts.append("## Task\n")
     task = next((m.text for m in msgs if m.role == "user"), "")
-    parts.append(_quote(_clip(task, 500)) + "\n" if task
+    parts.append(_quote(_clip(task, 500, _SIDECAR_HINT)) + "\n" if task
                  else "*No instruction recorded.*\n")
 
     if run.edited:
@@ -622,9 +716,28 @@ def render_agent_digest(meta: Meta, parent_ref: str, run: AgentRun) -> str:
     # Not "final report": an interrupted agent ends mid-thought, and the transcript
     # can't tell you which happened.
     parts.append("## Last thing it said\n")
-    final = next((m.text for m in reversed(msgs) if m.role == "assistant"), "")
-    parts.append(_quote(_clip(final, 900)) + "\n" if final
+    final, notice = last_said(msgs)
+    if notice:
+        parts.append(f"*Run ended on a harness notice: {notice.splitlines()[0]}*\n")
+    parts.append(_quote(_clip(final.text, 900, _SIDECAR_HINT)) + "\n" if final
                  else "*Nothing recorded.*\n")
+
+    # An agent killed mid-run often ends on tool narration ("let me read X"), which
+    # says nothing about what it found. The last long turn usually does, and it is
+    # still verbatim — a different message, not a summary of one.
+    meaty = _last_meaty(msgs, exclude=final)
+    if meaty:
+        what = ("Its last reasoning block (thinking, not spoken)"
+                if meaty.role == "thinking" else "Its last substantial message")
+        parts.append(f"## {what}\n")
+        parts.append(_quote(_clip(meaty.text, 1200, _SIDECAR_HINT)) + "\n")
+
+    if run.path:
+        cmd, out = last_command_output(run.path)
+        if out:
+            parts.append("## Last command it ran, and what came back\n")
+            parts.append(f"`{_clip(cmd, 200, 'clipped')}`\n")
+            parts.append(_quote(out) + "\n")
 
     parts.append("## Drill down\n")
     parts.append(f"Full sidecar: `{run.path}`\n")
@@ -697,6 +810,9 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
 
     parts.append("## Where I left off\n")
     tail = _last_exchange(msgs)
+    ended_on = last_said(msgs)[1]
+    if ended_on:
+        parts.append(f"*Session ended on a harness notice: {ended_on.splitlines()[0]}*\n")
     if tail:
         # Not labelled an exchange: two separate backward scans, so the reply
         # usually isn't answering the prompt above it.
@@ -743,10 +859,9 @@ def _last_exchange(msgs: list[Message]) -> list[Message]:
         if m.role == "user" and is_real_prompt(m.text):
             out.append(m)
             break
-    for m in reversed(msgs):
-        if m.role == "assistant" and m.text.strip():
-            out.append(m)
-            break
+    final, _ = last_said(msgs)
+    if final:
+        out.append(final)
     return sorted(out, key=lambda m: m.n)
 
 
