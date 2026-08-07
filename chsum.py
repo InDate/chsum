@@ -1,25 +1,12 @@
 #!/usr/bin/env python3
-"""chsum — turn Claude Code conversations into work logs and reload-ready context.
+"""chsum — Claude Code conversations as work logs and reload-ready context.
 
-Everything here is DETERMINISTIC. No model is involved, so nothing can be
-hallucinated: every line of output is either copied verbatim from a transcript
-or computed from it. That property is the whole point — a digest that feeds
-back into a future Claude session must not contain invented claims.
+DETERMINISTIC: every line of output is copied verbatim from a transcript or
+computed from it. Digests feed back into future sessions, where an invented
+claim would become ground truth. Prose generation waits behind the `Summariser`
+seam at the bottom.
 
-The load-bearing insight: your own prompts already are a faithful record of what
-you were trying to do. Extracting them in order gives a real intent trail for
-free, which is most of what a summary would have said anyway.
-
-Prose generation (a TL;DR, a narrative) is the one thing this can't do without a
-model. That slots in behind the `Summariser` seam at the bottom of this file —
-Haiku first to benchmark quality, local MLX after. Nothing above that seam
-changes when it lands.
-
-Commands:
-  find     search conversations
-  digest   deterministic digest of one conversation
-  context  reload artifact: facts + intent trail + last exchange + anchor map
-  journal  chronological work log across a time window
+Commands: sessions (default), last, find, digest, context, journal.
 """
 
 from __future__ import annotations
@@ -46,11 +33,9 @@ DIGEST_DIR = pathlib.Path.home() / ".claude" / "chsum" / "digests"
 # ch_ ref derivation
 # ---------------------------------------------------------------------------
 # Reimplements claude-history's AgentConversationRef::from_parts
-# (src/agent/refs.rs:31-54, 424-435): a length-prefixed 128-bit FNV-1a over
-# ["agent-v1", project_dir_name, session_filename].
-#
-# This is a versioned internal of another tool, so anything derived here is
-# verified against the uuid claude-history reports before it is trusted.
+# (src/agent/refs.rs:31-54): length-prefixed 128-bit FNV-1a over
+# ["agent-v1", project_dir_name, session_filename]. Their versioned internal, so
+# anything derived is verified against the uuid they report before it's trusted.
 
 _FNV_OFFSET = 0x6C62272E07BB014262B821756295C58D
 _FNV_PRIME = 0x0000000001000000000000000000013B
@@ -80,11 +65,9 @@ def project_dir_name(cwd: pathlib.Path) -> str:
 
 
 def transcripts(local: bool = False) -> list[pathlib.Path]:
-    """The addressable conversations: two levels only, no agent-* sidecars.
+    """Addressable conversations only: two levels, no agent-* sidecars.
 
     Mirrors claude-history's discover_agent_keys (src/agent/service.rs:477-486).
-    subagents/agent-*.jsonl are reachable via --subagents when reading, but are
-    not conversations in their own right.
     """
     if not PROJECTS_ROOT.is_dir():
         return []
@@ -147,11 +130,10 @@ def search(query: str, *, local: bool, mode: str, top: int) -> list[Hit]:
 
 
 def last_message_number(ref: str) -> int:
-    """Highest message ordinal, i.e. the upper bound for a full read.
+    """Highest message ordinal — the upper bound for a full read.
 
-    outline has two shapes: `seg m1..m38 ...` ranges for long conversations, and
-    bare per-message lines (`m1 role=user ...`) for short ones. Handle both, or
-    short conversations silently read as empty.
+    outline has two shapes: `seg m1..m38` for long conversations, bare `m1 role=…`
+    lines for short ones. Handle both, or short ones silently read as empty.
     """
     end = 0
     for line in _history("agent", "outline", ref, "--no-budget").splitlines():
@@ -180,10 +162,9 @@ class Message:
 
 
 def read_messages(ref: str, start: int = 1, end: int | None = None) -> list[Message]:
-    """Parse `agent read` output into messages carrying their mN and ma_ anchor.
+    """Parse `agent read` output into messages with their mN and ma_ anchor.
 
-    claude-history has already stripped tool sludge and normalised the text, which
-    is exactly why it's the text source rather than the raw JSONL.
+    claude-history is the text source because it has already stripped tool sludge.
     """
     end = end or last_message_number(ref)
     if not end:
@@ -257,10 +238,8 @@ _ACK_RE = re.compile(
 def is_substantive(text: str) -> bool:
     """Does this prompt say anything on its own?
 
-    A digest read cold, months later, gets nothing from "yes" — the meaning lived in
-    the message it was answering. Short affirmations and bare acknowledgements are
-    filtered out of the trail; the count is still reported so the back-and-forth
-    isn't silently erased.
+    "yes" read cold months later carries nothing — its meaning lived in the message
+    it answered. Filtered from the trail, but counted, so it isn't silently erased.
     """
     t = text.strip()
     return len(t) >= 12 and not _ACK_RE.match(t)
@@ -277,11 +256,8 @@ _AGENT_TOOLS = {"Agent", "Task"}  # Task is the older name for the same thing
 
 @dataclass
 class AgentRun:
-    """One subagent the session spawned, from its sidecar transcript.
-
-    Held per-agent as well as merged into the parent so a session digest can name
-    what was delegated in one line each, and hand out an address for the rest.
-    """
+    """One subagent, from its sidecar transcript. Kept per-agent as well as merged
+    into the parent, so a digest can name each in one line and address the rest."""
     id: str = ""  # sidecar stem minus the agent- prefix; the address
     agent_type: str = ""
     model: str = ""
@@ -341,12 +317,8 @@ def _parse_ts(s: str) -> datetime | None:
 
 
 def active_seconds(stamps: list[str]) -> int:
-    """Time actually spent working, not wall-clock from first record to last.
-
-    Sessions get resumed hours or days later, so first→last badly overstates
-    effort (the corpus has a session reading as "92h16m"). Gaps longer than
-    IDLE_GAP_SECONDS are treated as "walked away" and excluded.
-    """
+    """Time worked, not wall-clock. Sessions resume days later, so first→last
+    overstates badly (one reads as 92h). Gaps over IDLE_GAP_SECONDS are excluded."""
     times = sorted(t for t in (_parse_ts(s) for s in stamps) if t)
     total = 0
     for a, b in zip(times, times[1:]):
@@ -428,10 +400,8 @@ def extract_meta(path: pathlib.Path) -> Meta:
             meta.prompts += 1
     own_edits = set(edited)
 
-    # A delegated edit is still an edit the session made, so fold the subagents'
-    # tool use into the parent's totals — otherwise a session that handed the
-    # work to agents reads as no activity. Prompts stay parent-only: nobody
-    # typed a subagent's instructions.
+    # Fold subagent tool use into the parent: a session that delegated everything
+    # would otherwise read as no activity. Prompts stay parent-only.
     meta.agents = [extract_agent(s) for s in subagent_transcripts(path)]
     for run in meta.agents:
         edited.extend(run.edited)
@@ -449,22 +419,20 @@ def extract_meta(path: pathlib.Path) -> Meta:
     meta.edited = keep(edited)
     meta.read = keep(read)
     meta.commands = _dedupe(cmds)
-    # Project-relative only once the cwd is known, which is why it happens here
-    # rather than in extract_agent.
+    # Project-relative only once cwd is known, hence here not in extract_agent.
     for run in meta.agents:
         run.edited = keep(run.edited)
     meta.agent_only = set(meta.edited) - set(keep(own_edits))
     return meta
 
 
-# Scratch space and agent bookkeeping. Real work, but not changes to the project,
-# and they crowd out the files that matter in a work log.
+# Real work, but not project changes — they crowd out the files that matter.
 _NON_PROJECT_PREFIXES = ("/tmp/", "/private/tmp/", "/var/folders/")
 _NON_PROJECT_PARTS = ("/scratchpad/", "/.claude/plans/", "/.claude/projects/")
 
 
-# Commands that only look at things. One session logged 118 commands, almost all
-# greps and heads — listing them buries the few that actually did something.
+# Look-only commands. One session logged 118, nearly all greps — they bury the
+# few that did something.
 _INSPECTION_CMDS = {
     "ls", "cat", "head", "tail", "grep", "rg", "find", "echo", "wc", "which",
     "pwd", "cd", "file", "stat", "du", "df", "tree", "sed", "awk", "jq", "sort",
@@ -495,11 +463,8 @@ def _relpath(path: str, project: str) -> str:
 
 
 def _is_typed_prompt(rec: dict) -> bool:
-    """A user record carrying text the human actually wrote.
-
-    Most user-role records are tool_result payloads; the rest can be harness
-    scaffolding (interrupts, notifications, slash-command echoes).
-    """
+    """A user record carrying text the human actually wrote. Most user-role records
+    are tool_results; the rest is harness scaffolding (interrupts, notifications)."""
     content = (rec.get("message") or {}).get("content")
     if isinstance(content, str):
         texts = [content]
@@ -572,13 +537,8 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _quote(text: str) -> str:
-    """Render transcript text as a blockquote.
-
-    Necessary, not decorative: quoted messages routinely contain their own markdown
-    headings, and pasted verbatim those become sections of *this* document — an
-    assistant reply containing "## Summary" silently forges a digest section.
-    Blockquoting neutralises that, and correctly marks the text as not ours.
-    """
+    """Blockquote transcript text. Functional, not decorative: a quoted message
+    containing "## Summary" would otherwise forge a section of this document."""
     return "\n".join(f"> {line}" if line.strip() else ">"
                      for line in text.strip().splitlines())
 
@@ -601,14 +561,11 @@ def frontmatter(meta: Meta, ref: str) -> str:
 
 
 def messages_from_jsonl(path: pathlib.Path) -> list[Message]:
-    """Text messages straight from a transcript file.
+    """Text messages straight from a transcript file. Sidecars only.
 
-    Only used for subagent sidecars. claude-history is the text source everywhere
-    else because it strips tool sludge for us, but it has no per-agent ref —
-    `--subagents` inlines agent messages into the parent read with nothing saying
-    which agent produced them — so sidecars have to be parsed here. Anchors stay
-    empty: `ma_` values are claude-history's to mint, and a made-up one that
-    doesn't resolve is worse than none.
+    claude-history has no per-agent ref — `--subagents` inlines agent messages into
+    the parent read untagged — so these are parsed here. Anchors stay empty: `ma_`
+    values are claude-history's to mint, and a fabricated one is worse than none.
     """
     msgs: list[Message] = []
     for rec in _records(path):
@@ -651,23 +608,22 @@ def render_agent_digest(meta: Meta, parent_ref: str, run: AgentRun) -> str:
 
     parts.append("## Task\n")
     task = next((m.text for m in msgs if m.role == "user"), "")
-    parts.append(_quote(_clip(task, 900)) + "\n" if task
+    parts.append(_quote(_clip(task, 500)) + "\n" if task
                  else "*No instruction recorded.*\n")
 
     if run.edited:
         parts.append("## Files changed\n")
-        parts += _bullets(run.edited, 30) + [""]
+        parts += _bullets(run.edited, 20) + [""]
 
     if run.commands:
         parts.append("## Commands run\n")
-        parts += _bullets(run.commands, 15) + [""]
+        parts += _bullets(run.commands, 10) + [""]
 
-    # Not "final report": an agent that was interrupted or steered mid-run ends on
-    # whatever it happened to be saying, and calling that a conclusion would be a
-    # claim the transcript doesn't support.
+    # Not "final report": an interrupted agent ends mid-thought, and the transcript
+    # can't tell you which happened.
     parts.append("## Last thing it said\n")
     final = next((m.text for m in reversed(msgs) if m.role == "assistant"), "")
-    parts.append(_quote(_clip(final, 1800)) + "\n" if final
+    parts.append(_quote(_clip(final, 900)) + "\n" if final
                  else "*Nothing recorded.*\n")
 
     parts.append("## Drill down\n")
@@ -678,7 +634,7 @@ def render_agent_digest(meta: Meta, parent_ref: str, run: AgentRun) -> str:
 
 
 def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
-                  prompt_clip: int = 400, max_prompts: int = 40) -> str:
+                  prompt_clip: int = 300, max_prompts: int = 25) -> str:
     typed = [m for m in msgs if m.role == "user" and is_real_prompt(m.text)]
     prompts = [m for m in typed if is_substantive(m.text)]
     steering = len(typed) - len(prompts)
@@ -709,10 +665,9 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
 
     if meta.edited:
         parts.append("## Files changed\n")
-        # Marked, not separated: it's one session's work either way, but a file you
-        # never touched yourself is worth knowing about before you go looking for
-        # the turn where you changed it.
-        shown_files = meta.edited[:30]
+        # Marked, not separated: one session's work either way, but worth knowing
+        # before you hunt for the turn where you supposedly changed it.
+        shown_files = meta.edited[:20]
         parts += [f"- `{f}`" + ("  (agent)" if f in meta.agent_only else "")
                   for f in shown_files]
         if len(meta.edited) > len(shown_files):
@@ -721,7 +676,7 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
 
     if meta.agents:
         parts.append("## Delegated\n")
-        for run in meta.agents[:12]:
+        for run in meta.agents[:8]:
             bits = [b for b in (f"{run.agent_type or 'agent'}"
                                 + (f"/{run.model}" if run.model else ""),
                                 run.duration,
@@ -731,26 +686,25 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
             parts.append(f"- `{run.id}`  {' · '.join(bits)}")
             if run.description:
                 parts.append(f"  {run.description}")
-        if len(meta.agents) > 12:
-            parts.append(f"- …and {len(meta.agents) - 12} more")
+        if len(meta.agents) > 8:
+            parts.append(f"- …and {len(meta.agents) - 8} more")
         parts.append("")
         parts.append(f"One agent's own digest: `chsum context {ref}/<id>`\n")
 
     if meta.commands:
         parts.append("## Commands run\n")
-        parts += _bullets(meta.commands, 15) + [""]
+        parts += _bullets(meta.commands, 10) + [""]
 
     parts.append("## Where I left off\n")
     tail = _last_exchange(msgs)
     if tail:
-        # Deliberately not labelled as an exchange: these are found by two separate
-        # backward scans and can be far apart, so the reply usually is not answering
-        # the prompt above it.
+        # Not labelled an exchange: two separate backward scans, so the reply
+        # usually isn't answering the prompt above it.
         for m in tail:
             label = ("Last thing I asked" if m.role == "user"
                      else "Last thing Claude said")
             parts.append(f"**{label}** (m{m.n})\n")
-            parts.append(_quote(_clip(m.text, 900)) + "\n")
+            parts.append(_quote(_clip(m.text, 600)) + "\n")
     else:
         parts.append("*Nothing recorded.*\n")
 
@@ -759,18 +713,16 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
     cited = _citable_anchors(msgs, prompts[:max_prompts] + (tail or []))
     if cited:
         parts.append("Durable anchors (survive renumbering if the transcript changes):\n")
-        parts += [f"- m{n} → `{a}`" for n, a in cited[:20]] + [""]
+        parts += [f"- m{n} → `{a}`" for n, a in cited[:12]] + [""]
     return "\n".join(parts).rstrip() + "\n"
 
 
 def _citable_anchors(all_msgs: list[Message], cited: list[Message]) -> list[tuple[int, str]]:
-    """Anchors safe to publish: present, unique, one entry per message.
+    """Anchors safe to publish: present, unique, one per message.
 
-    Anchors are content-addressed, so two messages with byte-identical text share
-    one anchor and `read --anchor` then fails with ambiguous-ref. Verified against
-    the corpus: repeated harness lines like "[Request interrupted by user]" collide.
-    Ambiguous anchors are dropped rather than emitted — an mN alone is still useful,
-    but a citation that errors (or worse, silently resolves elsewhere) is not.
+    They are content-addressed, so byte-identical messages share one and
+    `read --anchor` fails with ambiguous-ref (measured: "[Request interrupted by
+    user]" collides). Dropped rather than emitted — mN alone still works.
     """
     counts: dict[str, int] = {}
     for m in all_msgs:
@@ -893,8 +845,7 @@ def cmd_context(args) -> int:
     print("<!-- Extracted verbatim from the transcript by chsum. No model wrote this;")
     print("     nothing here is paraphrased. Quotes may be clipped — full text is in")
     if agent_id:
-        # The agent ref is chsum's own address, not a claude-history one: pointing
-        # a reader at `agent read ch_…/a38…` would just fail.
+        # chsum's own address, not a claude-history one — `agent read` would fail.
         print("     the sidecar named under Drill down. -->")
     else:
         print(f"     the transcript: claude-history agent read {ref}:mN..mN --no-budget -->")
@@ -904,15 +855,10 @@ def cmd_context(args) -> int:
 
 
 def latest_transcript(local: bool = True, nth: int = 1) -> pathlib.Path:
-    """The nth-most-recent real conversation, newest first.
+    """Nth-most-recent conversation with activity, by last activity not filename.
 
-    Ordered by last activity, not filename: a resumed session is "last" if you
-    touched it last. Transcripts with no activity (aborted, tool-only, or a
-    single prompt that went nowhere) aren't conversations you had, so they're
-    skipped — `chsum sessions` lists those.
-
-    Run from inside Claude Code, the newest transcript is the session doing the
-    running — excluded, since "the last conversation" then means the one before.
+    Sessions that went nowhere are skipped (`chsum sessions` lists those), as is
+    the session doing the running when invoked from inside Claude Code.
     """
     live = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     cands = [p for p in transcripts(local=local) if p.stem != live]
@@ -936,12 +882,10 @@ def cmd_last(args) -> int:
 
 
 def cmd_sessions(args) -> int:
-    """One line per conversation in this project, newest first.
+    """One line per conversation, newest first. Triage: which were real work.
 
-    The point is triage: which sessions were real work and which were a typo you
-    abandoned. Empty ones are listed rather than hidden — knowing a session was a
-    dead end is the answer to "where did that work go", and silently dropping it
-    just makes you look for it twice.
+    Empty ones are listed, not hidden — knowing a session was a dead end is the
+    answer to "where did that work go".
     """
     cutoff = _parse_since(args.since) if args.since else None
     live = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
@@ -997,13 +941,8 @@ def cmd_sessions(args) -> int:
 
 
 def _has_activity(m: Meta) -> bool:
-    """A session counts as activity if you drove it somewhere.
-
-    Prompts alone don't qualify — a single prompt answered with "what do you
-    mean?" is exactly the session this listing exists to let you skip past.
-    Delegated work counts: `edited` and `commands` already include the
-    subagents', and spawning one at all is more than a dead end.
-    """
+    """Did the session go anywhere? One prompt answered with "what do you mean?"
+    is exactly what this exists to skip. Delegated work counts."""
     return bool(m.edited) or bool(m.commands) or m.agent_count > 0 or m.prompts >= 2
 
 
@@ -1021,8 +960,7 @@ def cmd_journal(args) -> int:
     cutoff = _parse_since(args.since)
     metas = []
     for p in transcripts(local=not args.all):
-        # mtime is a cheap superset filter; the authoritative test is when the
-        # work happened, since a resumed old session has a recent mtime.
+        # mtime is a cheap superset filter; a resumed old session has a recent one.
         if p.stat().st_mtime < cutoff:
             continue
         meta = extract_meta(p)
@@ -1036,8 +974,7 @@ def cmd_journal(args) -> int:
         print("no conversations in that window", file=sys.stderr)
         return 1
 
-    # Group by last activity, not first: a resumed session belongs to the day you
-    # last worked on it, which is what "what did I do this week" is asking.
+    # By last activity: a resumed session belongs to the day you last worked on it.
     metas.sort(key=lambda m: m.ended or "")
     by_day: dict[str, list[Meta]] = defaultdict(list)
     for m in metas:
@@ -1078,17 +1015,12 @@ def cmd_journal(args) -> int:
 
 
 class Summariser:
-    """Where prose generation will plug in.
+    """Where prose generation plugs in. Nothing above needs a model, and nothing
+    above should change when one arrives.
 
-    Nothing above this line needs a model, and nothing above it should change when
-    one arrives. The planned order is Haiku first (to establish what good output
-    looks like and what it costs), then a local MLX backend measured against it.
-
-    A backend receives the already-extracted, already-denoised material — the
-    intent trail and last exchange — never the raw transcript. Its output is
-    additive: a TL;DR and narrative layered on top of the verbatim record, never
-    replacing it, so a wrong sentence can always be checked against the quotes
-    sitting directly beneath it.
+    A backend gets the extracted material (intent trail, last exchange), never the
+    raw transcript, and its output is additive — layered on top of the verbatim
+    record so a wrong sentence can be checked against the quotes beneath it.
     """
 
     def summarise(self, meta: Meta, msgs: list[Message]) -> str:
@@ -1147,10 +1079,8 @@ def main(argv=None) -> int:
     p.add_argument("--all", action="store_true", help="all projects (default: this one)")
     p.set_defaults(func=cmd_journal)
 
-    # Bare `chsum` lists the project's sessions: you nearly always want to pick
-    # one, not have the most recent dumped at you — and "most recent" is often a
-    # session you abandoned after one prompt. Anything naming a real subcommand
-    # or asking for help is left alone.
+    # Bare `chsum` lists sessions: you usually want to pick one, and "most recent"
+    # is often a dud. Anything naming a subcommand or asking for help is left alone.
     raw = list(argv) if argv is not None else sys.argv[1:]
     if not any(tok in sub.choices or tok in ("-h", "--help") for tok in raw):
         raw = ["sessions"] + raw

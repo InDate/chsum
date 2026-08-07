@@ -10,8 +10,8 @@ session, where a plausible-but-wrong sentence would become ground truth.
 ## The idea
 
 Your own prompts already are a faithful record of what you were trying to do.
-Extracted in order, they read as the story of the session — which is most of what
-a summary would have said, without the risk:
+Extracted in order they read as the story of the session — most of what a summary
+would have said, without the risk:
 
 ```markdown
 **m1**
@@ -27,17 +27,26 @@ a summary would have said, without the risk:
 > The toolbar is no longer working to slow it down or speed it up live
 ```
 
-Quoted text is blockquoted for a functional reason, not a cosmetic one: messages
-routinely contain their own markdown headings, and pasted raw, an assistant reply
-containing `## Summary` would forge a section of the digest itself.
-
-Everything else — dates, duration, branch, files changed, commands run — is parsed
-straight out of the transcript.
+Blockquoting is functional, not cosmetic: a quoted reply containing `## Summary`
+would otherwise forge a section of the digest. Everything else — dates, duration,
+branch, files, commands — is parsed straight out of the transcript.
 
 ## Requirements
 
 - [`claude-history`](https://github.com/) on your `PATH`
 - Python 3.10+. No third-party packages, no model, no network.
+
+## Install
+
+```sh
+pipx install chsum            # from a checkout: pipx install .
+```
+
+pipx, not `pip install --user`: chsum is an application, so it gets its own venv
+and one symlink on `PATH`. `pipx install --editable .` while working on it.
+
+A real command rather than a shell alias, because an alias doesn't exist for
+scripts, hooks, or agents.
 
 ## Usage
 
@@ -68,43 +77,35 @@ ch_b99f11b7c257dafc8b93f53480ba3804  2026-08-05  6s     1        0      -       
 ```
 
 Listing is the default because picking is the common case, and "most recent" is
-often a session you abandoned after one prompt. Those are shown and flagged
-`empty` rather than hidden — knowing a session was a dead end is the answer to
-"where did that work go", and dropping it silently just makes you look twice.
+often a session you abandoned after one prompt. Those are flagged `empty` rather
+than hidden — knowing a session was a dead end is the answer to "where did that
+work go". Activity means a file edited, a notable command, an agent spawned, or a
+second prompt.
 
-A session counts as activity if it edited a file, ran a notable command, spawned
-an agent, or got past a second prompt.
+`chsum last` is `chsum context` on the most recent session with activity, ordered
+by last activity so one you resumed yesterday beats one you started last week.
+Run from inside Claude Code, the session doing the running is excluded.
 
-`chsum last` is `chsum context` pointed at the most recent session with activity
-— ordered by last activity, so one you resumed yesterday beats one you started
-last week. Run from inside Claude Code, the session doing the running is
-excluded, since "the last conversation" then means the one before it.
-
-`find`, `last`, `journal`, and the default listing all scope to the current
-project; `--all` widens to every workspace. Digests are written to
+Everything scopes to the current project; `--all` widens. Digests land in
 `~/.claude/chsum/digests/<uuid>.md` (`--out` to change).
 
 ### Subagents
 
-Work you delegated is still work the session did, so a subagent's file edits and
-commands are folded into its parent's totals — otherwise a session that handed
-everything to agents reads as no activity at all. Files no parent turn touched
-are marked `(agent)` in **Files changed**.
-
-Each agent also gets a line in **Delegated**, and an address:
+A subagent's edits and commands fold into its parent's totals — otherwise a
+session that delegated everything reads as no activity. Files no parent turn
+touched are marked `(agent)`. Each agent gets a line in **Delegated**, and an
+address:
 
 ```sh
 chsum context ch_da4e99d42e5efab11ebdedc22fb65145/a728cd49179f1a356
 ```
 
-That renders the agent's own digest — its task, its files, its commands, and the
-last thing it said. Everything beyond the one-line summary stays out of the parent
-digest and is fetched on demand, so a heavily-delegated session doesn't produce a
-digest nobody wants to read.
+Its task, files, commands, and last message. Everything past the one-line summary
+is fetched on demand, so a heavily-delegated session doesn't produce a digest
+nobody wants to read.
 
-The address is `<parent-ref>/<agent-id>`, resolved to
-`<uuid>/subagents/agent-<id>.jsonl`. It is chsum's own scheme, not a
-`claude-history` one — see *Notes on correctness*.
+`<parent-ref>/<agent-id>` resolves to `<uuid>/subagents/agent-<id>.jsonl`. chsum's
+own scheme, not claude-history's — see *Notes on correctness*.
 
 ### Search modes
 
@@ -128,8 +129,9 @@ and error strings, or `--exact` for exact tokens.
 An agent digest has the same shape minus the intent trail — an agent gets one
 instruction, so **Task** is a single block — and no anchor map (see below).
 
-Long quotes are clipped with a `[+N chars, read the anchor]` marker so you always
-know when you're seeing a fragment rather than the whole thing.
+Output is budgeted, because it lands in a future context window: quotes clip,
+lists cap. Every truncation is marked (`[+N chars, read the anchor]`, `…and N
+more`) so you always know when you're seeing a fragment.
 
 ## Notes on correctness
 
@@ -146,34 +148,30 @@ Several things here are non-obvious and were established by measuring, not assum
   harness scaffolding. Those are filtered out; `prompts:` counts what you typed.
 - **`outline` has two output shapes** — segment ranges for long conversations,
   per-message lines for short ones. Both are handled.
-- **Subagent transcripts** (`subagents/agent-*.jsonl`) are not conversations in their
-  own right and never appear in the listing, matching `claude-history`'s own
-  discovery rules. They are read for their parent's totals and addressed as
-  `<parent-ref>/<agent-id>`.
+- **Subagent transcripts** aren't conversations in their own right and never appear
+  in the listing, matching `claude-history`'s discovery rules.
 - **`claude-history` has no per-agent ref.** `--subagents` inlines agent messages
-  into the parent read with nothing marking which agent produced them, so they
-  can't be sliced back apart. Sidecars are therefore parsed directly, which is
-  why an agent digest carries no `ma_` anchors: those are `claude-history`'s to
-  mint, and a fabricated one that doesn't resolve is worse than none.
-- **An agent's last message is not necessarily its conclusion.** One that was
-  interrupted or steered mid-run ends on whatever it happened to be saying, so
-  the section is *Last thing it said*, not *Final report*.
-- **Agent counts take the larger of two sources** — `Agent`/`Task` calls seen in
-  the parent, and sidecar files on disk. Sidecars go missing on older sessions,
-  and an agent that spawns its own outnumbers the visible calls.
+  into the parent read untagged, so they can't be sliced apart. Sidecars are
+  parsed directly, which is why agent digests carry no `ma_` anchors — those are
+  claude-history's to mint, and a fabricated one is worse than none.
+- **An agent's last message isn't necessarily its conclusion**, so the section is
+  *Last thing it said*. An interrupted agent ends mid-thought.
+- **Agent counts take the larger of two sources** — `Agent`/`Task` calls in the
+  parent, and sidecars on disk. Sidecars go missing; an agent that spawns its own
+  outnumbers the visible calls.
 - **Scratch paths** (`/tmp`, scratchpads, plan files) are excluded from "files
   changed" so the work log shows real project changes.
 
 ## Adding prose later
 
-There is a `Summariser` seam at the bottom of `chsum.py`, deliberately unimplemented.
-A TL;DR and narrative are the one thing extraction can't produce, and the intended
-order is Haiku first — to establish what good output looks like and what it costs —
-then a local MLX backend measured against it.
+There is a deliberately unimplemented `Summariser` seam at the bottom of
+`chsum.py`. A TL;DR is the one thing extraction can't produce; the intended order
+is Haiku first to set a quality bar and a price, then a local MLX backend measured
+against it.
 
-The rule for any backend: it receives the already-extracted material, and its output
-is **additive**. Prose layers on top of the verbatim record, never replacing it, so a
-wrong sentence can always be checked against the quotes sitting directly beneath it.
+The rule for any backend: it gets the already-extracted material, and its output is
+**additive** — layered on top of the verbatim record so a wrong sentence can always
+be checked against the quotes beneath it.
 
 If you do go local, note that the model in `mlx-community/DeepSeek-R1-Distill-Qwen-14B-MLX`
 is **139 GB** of unquantised weights. The 4-bit build is `…-14B-4bit` at 8.32 GB. On a

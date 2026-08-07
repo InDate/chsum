@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chsum"
+version = "1.0.0"
+description = "Work logs and reload-ready context from Claude Code conversations. Deterministic: no model, nothing invented."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Joshua" }]
+keywords = ["claude", "claude-code", "transcripts", "context", "work-log"]
+
+# Deliberately empty, and worth keeping that way: chsum is stdlib-only, which is
+# what lets it be installed anywhere and run against any corpus without a venv
+# dance. `claude-history` is a runtime dependency but not a Python one — it's a
+# separate binary on PATH.
+dependencies = []
+
+[project.scripts]
+chsum = "chsum:main"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["chsum.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["chsum.py", "README.md", "CLAUDE.md", "LICENSE"]
