@@ -42,6 +42,15 @@ branch, files, commands — is parsed straight out of the transcript.
 pipx install chsum            # from a checkout: pipx install .
 ```
 
+Or as a Claude Code plugin, which brings the skill with it:
+
+```
+/plugin marketplace add InDate/indate-tools
+/plugin install chsum@indate-tools
+```
+
+The plugin carries the skill; the `chsum` command still comes from pipx.
+
 pipx, not `pip install --user`: chsum is an application, so it gets its own venv
 and one symlink on `PATH`. `pipx install --editable .` while working on it.
 
