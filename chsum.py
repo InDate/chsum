@@ -6,7 +6,7 @@ computed from it. Digests feed back into future sessions, where an invented
 claim would become ground truth. Prose generation waits behind the `Summariser`
 seam at the bottom.
 
-Commands: sessions (default), last, find, digest, context, journal.
+Commands: sessions (default), last, find, digest, context, mark, journal.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import textwrap
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -159,6 +160,7 @@ class Message:
     role: str
     anchor: str
     text: str
+    line: int = 0  # 1-based line of its first record in the JSONL; 0 when unknown
 
 
 def read_messages(ref: str, start: int = 1, end: int | None = None) -> list[Message]:
@@ -187,6 +189,9 @@ def read_messages(ref: str, start: int = 1, end: int | None = None) -> list[Mess
                 role=f.get("role", "?"),
                 anchor=f.get("anchor", ""),
                 text="",
+                # The bridge from a JSONL record to a message ordinal: marks are
+                # made against record uuids, but cited as mN.
+                line=int(f["line"]) if f.get("line", "").isdigit() else 0,
             )
             body = []
         elif line.startswith("| ") or line == "|":
@@ -305,6 +310,8 @@ class AgentRun:
     duration: str = ""
     edited: list[str] = field(default_factory=list)
     commands: list[str] = field(default_factory=list)
+    marks: list[Mark] = field(default_factory=list)
+    revoked: set[str] = field(default_factory=set)  # reconciled with the parent's
     path: pathlib.Path | None = None
 
 
@@ -327,6 +334,7 @@ class Meta:
     read: list[str] = field(default_factory=list)
     commands: list[str] = field(default_factory=list)
     agent_only: set[str] = field(default_factory=set)  # files no parent turn touched
+    marks: list[Mark] = field(default_factory=list)  # `chsum mark` calls, parent-only
     path: pathlib.Path | None = None
 
     @property
@@ -343,6 +351,191 @@ class Meta:
     @property
     def project_name(self) -> str:
         return pathlib.Path(self.project).name if self.project else "?"
+
+
+# ---------------------------------------------------------------------------
+# Marks
+# ---------------------------------------------------------------------------
+# `chsum mark <reason>` writes nothing at all. Run through Claude Code's `!`
+# prefix, the harness records the run for us: the sentinel below lands in the
+# transcript as a `<bash-stdout>` user record, at the point in the conversation
+# where it was typed, carrying the reason verbatim from argv. So there is no
+# injection into a file Claude Code is concurrently appending to, no second store
+# to keep in sync, and the mark inherits an mN and a durable ma_ anchor for free.
+#
+# Detection looks only at captured command output — a `<bash-stdout>` record from a
+# `!` run, or a Bash tool_result when Claude ran it. So a digest that quotes a mark
+# and gets pasted into a later session doesn't read back as a mark of that session.
+
+MARK_SENTINEL = "⚑ chsum-mark v1"
+# Line-anchored, allowing only the harness's own wrapper in front: unanchored, a
+# `grep chsum-mark chsum.py` in some future session would match the pattern below
+# in this file's own source and forge a mark out of it.
+_MARK_RE = re.compile(
+    r"^(?:<bash-stdout>)?⚑ chsum-mark v1(?P<fields>[^|]*)\|(?P<reason>.*)", re.MULTILINE
+)
+# The harness wraps captured output, and a `!` run's stderr tags follow stdout's in
+# the same record, so the reason ends at the first closing tag — not the last.
+_MARK_TAIL_RE = re.compile(r"</bash-\w+>.*$", re.DOTALL)
+_MARK_GREP = "chsum-mark"  # ASCII pre-filter: cheap, and survives any escaping
+
+
+@dataclass
+class Mark:
+    reason: str  # verbatim argv
+    rec: str = ""  # record uuid of the sentinel itself — what `--revoke` names
+    at: str = ""  # record uuid of the message marked; "" means "here"
+    line: int = 0  # 1-based JSONL line of the sentinel's own record
+    at_line: int = 0  # ditto for the marked record, once resolved
+    quote: str = ""  # first line of the marked message, verbatim
+    when: str = ""
+    agent: str = ""  # sidecar it came from; blank for the parent's own
+    n: int = 0  # message ordinal, only on the digest path
+    anchor: str = ""
+
+
+def _record_text(rec: dict) -> str:
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(p.get("text", "") for p in content
+                         if isinstance(p, dict) and p.get("type") == "text")
+    return ""
+
+
+def _tool_result_text(rec: dict) -> str:
+    """Captured output of a tool call — where a mark lands when Claude ran it,
+    rather than the user typing `! chsum mark`."""
+    content = (rec.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return ""
+    out = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "tool_result":
+            continue
+        body = part.get("content")
+        if isinstance(body, str):
+            out.append(body)
+        elif isinstance(body, list):
+            out += [p.get("text", "") for p in body
+                    if isinstance(p, dict) and p.get("type") == "text"]
+    return "\n".join(out)
+
+
+def scan_marks(path: pathlib.Path) -> list[Mark]:
+    """Live marks in one transcript."""
+    marks, revoked = _scan_marks_raw(path)
+    return _apply_revocations(marks, revoked)
+
+
+def _apply_revocations(marks: list[Mark], revoked: set[str]) -> list[Mark]:
+    if not revoked:
+        return marks
+    return [m for m in marks if not any(m.rec.startswith(r) for r in revoked if r)]
+
+
+def _scan_marks_raw(path: pathlib.Path) -> tuple[list[Mark], set[str]]:
+    """Marks and revocations in one file, kept apart so a parent and its sidecars
+    can be reconciled: either side may retract a mark the other made.
+
+    Its own pass rather than part of `extract_meta` because line numbers are the
+    only bridge back to mN, and `_records` doesn't carry them. Cost on the listing
+    path is one substring scan of the file — sessions with no marks stop there.
+    """
+    try:
+        data = path.read_text(errors="replace")
+    except OSError:
+        return [], set()
+    if _MARK_GREP not in data:
+        return [], set()
+    marks: list[Mark] = []
+    revoked: set[str] = set()
+    for lineno, raw in enumerate(data.splitlines(), start=1):
+        if _MARK_GREP not in raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict) or rec.get("type") != "user":
+            continue
+        text = _record_text(rec) if "<bash-stdout>" in raw else ""
+        for m in _MARK_RE.finditer(f"{text}\n{_tool_result_text(rec)}"):
+            fields = dict(t.split("=", 1) for t in m.group("fields").split() if "=" in t)
+            if fields.get("revoke"):
+                # A retraction is itself just another line of output: nothing was
+                # written to take back, so the record stays and the mark drops.
+                revoked.add(fields["revoke"])
+                continue
+            marks.append(Mark(reason=_MARK_TAIL_RE.sub("", m.group("reason")).strip(),
+                              rec=str(rec.get("uuid") or ""),
+                              at=fields.get("at", ""),
+                              line=lineno,
+                              when=str(rec.get("timestamp") or "")))
+    if any(m.at for m in marks):
+        _resolve_marked(data, marks)
+    if any(not m.at for m in marks):
+        _resolve_here(data, marks)
+    return marks, revoked
+
+
+def _text_at_line(lines: list[str], lineno: int) -> str:
+    """Whole text of the record on that line — what `--list --full` shows."""
+    if not lineno or lineno > len(lines):
+        return ""
+    try:
+        rec = json.loads(lines[lineno - 1])
+    except json.JSONDecodeError:
+        return ""
+    return _record_text(rec).strip() if isinstance(rec, dict) else ""
+
+
+def _resolve_here(data: str, marks: list[Mark]) -> None:
+    """Point a bare `chsum mark` at the message it followed.
+
+    Its own record is command output, which says nothing about what was being
+    marked — you marked what was on the screen. So the target is the last thing
+    said before it, skipping the mark's own plumbing.
+    """
+    said: list[tuple[int, str]] = []  # (line, first line of text)
+    for lineno, raw in enumerate(data.splitlines(), start=1):
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict) or rec.get("type") not in ("user", "assistant"):
+            continue
+        text = _record_text(rec).strip()
+        if not text or not is_real_prompt(text) or _is_mark_machinery(text):
+            continue
+        said.append((lineno, next((ln for ln in text.splitlines() if ln.strip()), "")))
+    for mk in marks:
+        if mk.at:
+            continue
+        prior = [s for s in said if s[0] < mk.line]
+        if prior:
+            mk.at_line, mk.quote = prior[-1]
+
+
+def _resolve_marked(data: str, marks: list[Mark]) -> None:
+    """Fill in where each `at=` mark points, from the record it names."""
+    want = {m.at for m in marks if m.at}
+    for lineno, raw in enumerate(data.splitlines(), start=1):
+        if not any(w in raw for w in want):
+            continue
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        uid = rec.get("uuid") if isinstance(rec, dict) else ""
+        if not isinstance(uid, str) or not uid:
+            continue
+        for mk in marks:
+            if mk.at and uid.startswith(mk.at) and not mk.at_line:
+                mk.at_line = lineno
+                text = _record_text(rec).strip()
+                mk.quote = next((ln for ln in text.splitlines() if ln.strip()), "")
 
 
 IDLE_GAP_SECONDS = 30 * 60
@@ -417,6 +610,9 @@ def extract_agent(side: pathlib.Path) -> AgentRun:
         stamps.sort()
         run.duration = _fmt_secs(active_seconds(stamps))
     run.edited, run.commands = edited, _dedupe(cmds)
+    run.marks, run.revoked = _scan_marks_raw(side)
+    for mk in run.marks:
+        mk.agent = run.id
     return run
 
 
@@ -462,6 +658,20 @@ def extract_meta(path: pathlib.Path) -> Meta:
     for run in meta.agents:
         run.edited = keep(run.edited)
     meta.agent_only = set(meta.edited) - set(keep(own_edits))
+
+    # Marks fold in like edits and commands do — a mark made by the agent you sent
+    # to do the work is a mark on the session. Revocations are pooled first, so
+    # either side can retract the other's: the agent is doing the session's work,
+    # not keeping its own books.
+    own_marks, revoked = _scan_marks_raw(path)
+    for run in meta.agents:
+        revoked |= run.revoked
+    for run in meta.agents:
+        run.marks = _apply_revocations(run.marks, revoked)
+    all_marks = _apply_revocations(own_marks, revoked)
+    all_marks += [mk for run in meta.agents for mk in run.marks]
+    # By when they were made, so a delegated mark sits where it happened.
+    meta.marks = sorted(all_marks, key=lambda mk: mk.when or "")
     return meta
 
 
@@ -577,6 +787,25 @@ def _clip(text: str, limit: int, hint: str = "read the anchor") -> str:
     return text[:limit].rstrip() + f"\n… [+{len(text) - limit} chars, {hint}]"
 
 
+def _dim(text: str) -> str:
+    """Grey for quoted transcript text, so a reason and the message it marks don't
+    read as one voice. Off unless stdout is a terminal: `!` runs get captured, and
+    an escape sequence stored in a transcript is there forever. FORCE_COLOR turns
+    it on anyway, NO_COLOR always wins."""
+    if os.environ.get("NO_COLOR"):
+        return text
+    if not (sys.stdout.isatty() or os.environ.get("FORCE_COLOR")):
+        return text
+    return f"\033[2m{text}\033[0m"
+
+
+def _clip_line(text: str, limit: int) -> str:
+    """Clip inside one line. `_clip`'s hint is its own line, which would break out
+    of a bold run or a blockquote — but the truncation still has to be visible."""
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit].rstrip() + " …"
+
+
 def _quote(text: str) -> str:
     """Blockquote transcript text. Functional, not decorative: a quoted message
     containing "## Summary" would otherwise forge a section of this document."""
@@ -595,6 +824,8 @@ def frontmatter(meta: Meta, ref: str) -> str:
     if meta.duration:
         lines.append(f"duration: {meta.duration}")
     lines += [f"prompts: {meta.prompts}", f"files_edited: {len(meta.edited)}"]
+    if meta.marks:
+        lines.append(f"marks: {len(meta.marks)}")
     if meta.agent_count:
         lines.append(f"subagents: {meta.agent_count}  # their edits are counted above")
     lines += ["generated_by: chsum (deterministic extraction, no model)", "---"]
@@ -700,6 +931,13 @@ def render_agent_digest(meta: Meta, parent_ref: str, run: AgentRun) -> str:
                  + (f" · {run.duration}" if run.duration else "")
                  + f" · spawned by `{parent_ref}`*\n")
 
+    if run.marks:
+        parts.append("## Notable\n")
+        parts.append("*Marked by this agent with `chsum mark`. Reasons are verbatim.*\n")
+        # No ordinals: sidecar messages have none, and no anchors to cite either.
+        # The agent id is redundant here — the whole digest is that agent.
+        parts += _render_marks(run.marks, [], show_agent=False) + [""]
+
     parts.append("## Task\n")
     task = next((m.text for m in msgs if m.role == "user"), "")
     parts.append(_quote(_clip(task, 500, _SIDECAR_HINT)) + "\n" if task
@@ -757,6 +995,14 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
     when = f"{meta.date} · {meta.duration}" if meta.duration else meta.date
     parts.append(f"*{when} · {meta.project_name}"
                  + (f" · `{meta.branch}`" if meta.branch else "") + "*\n")
+
+    if meta.marks:
+        # First, because someone chose these by hand mid-session — they outrank
+        # anything extraction picked out.
+        parts.append("## Notable\n")
+        parts.append("*Marked during the session with `chsum mark`. "
+                     "Reasons are verbatim.*\n")
+        parts += _render_marks(meta.marks, msgs) + [""]
 
     # The intent trail: verbatim, in order. This is the summary, uninvented.
     parts.append("## What I asked for\n")
@@ -833,6 +1079,52 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
     return "\n".join(parts).rstrip() + "\n"
 
 
+def _locate_mark(mark: Mark, msgs: list[Message]) -> None:
+    """Give a mark its mN and anchor only when a message starts on the very line
+    it points at.
+
+    Nothing looser survives contact: a read of a live transcript comes back sparse
+    — measured at 38 messages spanning ordinals up to m327 — so "the last message
+    starting before this line" attributes a mark to whatever survived the gap. One
+    mark landed on an `ok` three hundred messages away. Unplaced marks fall back to
+    their record id, and the quote carries the content either way.
+    """
+    target = mark.at_line or mark.line
+    # An agent mark's lines are its sidecar's, and claude-history has no per-agent
+    # ref to number them against — so it gets its agent id instead of an ordinal.
+    if not target or mark.agent:
+        return
+    for m in msgs:
+        if m.line == target:
+            mark.n, mark.anchor = m.n, m.anchor
+            return
+
+
+def _render_marks(marks: list[Mark], msgs: list[Message],
+                  show_agent: bool = True) -> list[str]:
+    out = []
+    for mk in marks:
+        _locate_mark(mk, msgs)
+        where = []
+        if mk.n:
+            where.append(f"m{mk.n}")
+        if mk.anchor:
+            where.append(f"`{mk.anchor}`")
+        if mk.agent and show_agent:
+            where.append(f"agent `{mk.agent}`")
+        head = f"- **{_clip_line(mk.reason, 300)}**"
+        if where:
+            head += f"  ({' · '.join(where)})"
+        elif mk.at:
+            head += f"  (record `{mk.at[:8]}`)"
+        elif mk.rec:
+            head += f"  (mark `{mk.rec[:8]}`)"
+        out.append(head)
+        if mk.quote:
+            out.append(f"  > {_clip_line(mk.quote, 160)}")
+    return out
+
+
 def _citable_anchors(all_msgs: list[Message], cited: list[Message]) -> list[tuple[int, str]]:
     """Anchors safe to publish: present, unique, one per message.
 
@@ -890,7 +1182,33 @@ def resolve_ref(args) -> str:
     return args.ref
 
 
+def _find_marks(args) -> int:
+    """Marks matching a query. Pure JSONL and plain substring matching — there are
+    few marks and they're short, so an index would buy nothing and cost exactness."""
+    q = (args.query or "").lower()
+    rows = []
+    for p in transcripts(local=not args.all):
+        meta = extract_meta(p)
+        for mk in meta.marks:
+            if q and q not in mk.reason.lower():
+                continue
+            rows.append((meta, mk))
+    if not rows:
+        print("no marks" + (f" matching {args.query!r}" if q else ""), file=sys.stderr)
+        return 1
+    rows.sort(key=lambda r: r[1].when or r[0].ended or "", reverse=True)
+    for meta, mk in rows[:args.top]:
+        print(f"{ch_ref_for_path(meta.path)}  {(mk.when or meta.ended or '')[:10]}  "
+              f"⚑ {mk.reason}")
+    print(f"\nRead one: `chsum context <ref>`", file=sys.stderr)
+    return 0
+
+
 def cmd_find(args) -> int:
+    if args.marks:
+        return _find_marks(args)
+    if not args.query:
+        raise SystemExit("find: need a query (or --marks to list marks)")
     if args.mode in ("hybrid", "semantic"):
         # Embedding search is tens of seconds warm, and several minutes the very
         # first time while the index builds. Say so rather than looking hung.
@@ -969,6 +1287,264 @@ def cmd_context(args) -> int:
     return 0
 
 
+def live_transcript() -> pathlib.Path:
+    """The conversation running right now — the opposite of `latest_transcript`,
+    which skips it. Falls back to the newest file in this project so `chsum mark`
+    still resolves something when the env var is missing."""
+    live = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if live:
+        path = PROJECTS_ROOT / project_dir_name(pathlib.Path.cwd()) / f"{live}.jsonl"
+        if path.exists():
+            return path
+    cands = sorted(transcripts(local=True), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not cands:
+        raise SystemExit("no conversation found for this project")
+    return cands[0]
+
+
+def _mark_target(path: pathlib.Path, spec: str) -> str:
+    """Resolve `--at` to a full record uuid: either a uuid prefix from
+    `chsum mark --recent`, or an mN, which needs claude-history to place it."""
+    if re.fullmatch(r"m\d+", spec):
+        ref = ch_ref_for_path(path)
+        want = int(spec[1:])
+        msg = next((m for m in read_messages(ref) if m.n == want and m.line), None)
+        if not msg:
+            raise SystemExit(
+                f"claude-history can't place {spec} in this transcript yet — its view of a "
+                "live session lags behind the file.\nPick from `chsum mark --recent 20` "
+                "and pass the record id instead."
+            )
+        line = msg.line
+    else:
+        line = 0
+    prefix = spec.lower()
+    hits = []
+    for lineno, raw in enumerate(path.read_text(errors="replace").splitlines(), start=1):
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        uid = rec.get("uuid") if isinstance(rec, dict) else ""
+        if not isinstance(uid, str) or not uid:
+            continue
+        if (line and lineno == line) or (not line and uid.startswith(prefix)):
+            hits.append(uid)
+    if not hits:
+        raise SystemExit(f"no record matching {spec!r} in {path.name}")
+    if len(hits) > 1:
+        raise SystemExit(f"{spec!r} matches {len(hits)} records — use more characters")
+    return hits[0]
+
+
+def _tool_lines(rec: dict) -> list[str]:
+    """One line per tool call in a record: what was done, not that something was."""
+    content = (rec.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return []
+    out = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "tool_use":
+            continue
+        name, inp = str(part.get("name") or "?"), part.get("input") or {}
+        detail = ""
+        for key in ("file_path", "command", "description", "pattern", "query", "path"):
+            if isinstance(inp.get(key), str) and inp[key].strip():
+                detail = inp[key].strip().splitlines()[0]
+                break
+        out.append(f"{name}: {detail}" if detail else name)
+    return out
+
+
+def _recent_actions(path: pathlib.Path, limit: int) -> list[tuple[int, dict, str, str]]:
+    """(line, record, label, full text) for the last `limit` things that happened:
+    messages either side typed, and every tool call, in order. `limit=0` is all.
+
+    The label is one line, for listing; the full text is what `--match` searches,
+    so a phrase buried in the middle of a long message is still findable.
+
+    Straight from the JSONL, not claude-history: this has to be right about what
+    just happened, and their read of a live transcript lags behind the file.
+    Tool *results* are left out — you mark the action, and a mark resolves to the
+    message that contains it either way.
+    """
+    out = []
+    for lineno, raw in enumerate(path.read_text(errors="replace").splitlines(), start=1):
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict) or rec.get("type") not in ("user", "assistant"):
+            continue
+        text = _record_text(rec).strip()
+        if text and is_real_prompt(text):
+            label = next((ln for ln in text.splitlines() if ln.strip()), "")
+            out.append((lineno, rec, label, text, "text"))
+        for line in _tool_lines(rec):
+            out.append((lineno, rec, line, line, "tool"))
+    return out[-limit:] if limit else out
+
+
+def _fold(text: str) -> str:
+    """Down to words and spaces, for matching a half-remembered phrase.
+
+    Nobody retypes `Currently **no** —` when they mean "currently no", so case,
+    markdown, and punctuation are all noise here. Only matching is folded; every
+    mark still quotes the original bytes.
+    """
+    return " ".join(re.sub(r"[^0-9a-z]+", " ", text.lower()).split())
+
+
+def _is_mark_machinery(text: str, kind: str = "text") -> bool:
+    """A `chsum mark` call or its output — the command's own footprint.
+
+    Excluded from matching because the tool_use record is written *before* the
+    command runs: without this, every `--match` finds itself, and past runs stay
+    in the haystack forever.
+
+    Invocations only, not talk about them. A command is machinery wherever `chsum
+    mark` appears in it (they get chained); a message is machinery only if it *is*
+    a `!` run or carries the sentinel. Otherwise a conversation about this feature
+    becomes unmarkable — which is how this was found.
+    """
+    if MARK_SENTINEL in text:
+        return True
+    if kind == "tool":
+        return bool(re.search(r"\bchsum\s+mark\b", text))
+    return bool(re.match(r"\s*<bash-input>\s*chsum\s+mark\b", text))
+
+
+def _match_target(path: pathlib.Path, needle: str) -> str:
+    """The one record whose text contains `needle`. Ambiguity is reported, never
+    resolved: asking to mark a phrase puts that phrase in your own prompt too, so
+    "newest wins" would routinely mark the request instead of its subject."""
+    want = _fold(needle)
+    hits, seen = [], set()
+    for lineno, rec, label, text, kind in _recent_actions(path, 0):
+        uid = str(rec.get("uuid") or "")
+        if _is_mark_machinery(text, kind) or want not in _fold(text) or uid in seen:
+            continue
+        seen.add(uid)
+        hits.append((uid, rec, label))
+    if not hits:
+        raise SystemExit(f"nothing in this conversation matches {needle!r}")
+    if len(hits) > 1:
+        print(f"{len(hits)} matches — mark one with --at, or give a longer string:",
+              file=sys.stderr)
+        for uid, rec, label in hits:
+            who = "you" if rec.get("type") == "user" else "claude"
+            when = str(rec.get("timestamp") or "")[11:16]
+            print(f"  {uid[:8]}  {when:<5}  {who:<6}  {label[:80]}", file=sys.stderr)
+        raise SystemExit(2)
+    return hits[0][0]
+
+
+def cmd_mark(args) -> int:
+    """Mark a moment as notable. Writes nothing: printing the sentinel is the
+    whole mechanism — see the Marks section above for why."""
+    path = pathlib.Path(args.file).expanduser().resolve() if args.file else live_transcript()
+    if not path.exists():
+        raise SystemExit(f"no such transcript: {path}")
+
+    if args.list:
+        marks = scan_marks(path)
+        if not marks:
+            print("nothing marked in this conversation", file=sys.stderr)
+            return 1
+        # Capped well under a wide terminal: this output is usually read back
+        # inside Claude Code, which re-wraps at its own width, and a fold it
+        # chooses ignores the indent.
+        cols = max(40, min(shutil.get_terminal_size((100, 24)).columns, 88))
+        if args.full:
+            # The stored quote is only the marked message's first line, so the rest
+            # comes back off disk here rather than being carried around for a view
+            # nobody usually asks for.
+            lines = path.read_text(errors="replace").splitlines()
+            for i, mk in enumerate(marks):
+                if i:
+                    print()
+                print(f"{mk.rec[:8]}  {mk.reason}")
+                body = _text_at_line(lines, mk.at_line) or mk.quote
+                first = True  # the ↳ opens the message, it doesn't bullet its paragraphs
+                for para in (body or "(nothing before it)").splitlines():
+                    if not para.strip():
+                        print()
+                        continue
+                    print(_dim("\n".join(textwrap.wrap(
+                        para, cols, initial_indent="  ↳ " if first else "    ",
+                        subsequent_indent="    "))))
+                    first = False
+            sys.stdout.flush()
+            print(f"\n{_plural(len(marks), 'mark')}.", file=sys.stderr)
+            return 0
+        # Two lines each: a reason and the message it marks are both prose, and on
+        # one line the long one eats the other.
+        # Width off the rendered strings, not the limit: the clip marker is two
+        # more characters, and sizing to the limit knocks those rows out of line.
+        rows = [(_clip_line(mk.reason, 60), mk.rec[:8],
+                 _clip_line(mk.quote, 96) or "(nothing before it)") for mk in marks]
+        width = max(len(r[0]) for r in rows)
+        # Wrapped here rather than left to the terminal: a quote that folds at
+        # column 0 reads as a new mark.
+        for i, (reason, rec, quote) in enumerate(rows):
+            if i:
+                print()
+            print(f"{reason:<{width}}  {rec}")
+            print(_dim("\n".join(textwrap.wrap(quote, cols, initial_indent="  ↳ ",
+                                               subsequent_indent="    "))))
+        # Flushed first, or the hint jumps the list: stdout is block-buffered when
+        # piped, stderr never is.
+        sys.stdout.flush()
+        print('\nDrop one: `chsum mark --revoke <id>`', file=sys.stderr)
+        return 0
+
+    if args.revoke:
+        known = {mk.rec: mk for mk in scan_marks(path)}
+        out = []
+        for spec in args.revoke:
+            hits = [uid for uid in known if uid.startswith(spec)]
+            if not hits:
+                raise SystemExit(f"no live mark {spec!r} — `chsum mark --list` shows them")
+            if len(hits) > 1:
+                raise SystemExit(f"{spec!r} matches {len(hits)} marks — use more characters")
+            out.append(f"{MARK_SENTINEL} revoke={hits[0]} | "
+                       f"dropped: {_clip_line(known[hits[0]].reason, 120)}")
+        print("\n".join(out))
+        if not os.environ.get("CLAUDECODE"):
+            print("warning: not running inside Claude Code, so nothing recorded this.",
+                  file=sys.stderr)
+        return 0
+
+    if args.recent is not None:
+        rows = _recent_actions(path, args.recent)
+        if not rows:
+            print("nothing recorded in this conversation yet", file=sys.stderr)
+            return 1
+        for lineno, rec, label, _, _kind in rows:
+            who = "you" if rec.get("type") == "user" else "claude"
+            when = str(rec.get("timestamp") or "")[11:16]
+            print(f"{str(rec.get('uuid') or '')[:8]}  {when:<5}  {who:<6}  {label[:88]}")
+        print("\nMessages and tool calls, oldest first; tool results are not listed.\n"
+              'Mark one: `chsum mark --at <id> "<reason>"`', file=sys.stderr)
+        return 0
+
+    reason = " ".join(args.reason).strip()
+    if not reason:
+        raise SystemExit('nothing to mark — try: chsum mark "why this matters"')
+    # One line, because the sentinel is parsed back out of a single record.
+    reason = " ".join(reason.split())
+    if args.at and args.match:
+        raise SystemExit("--at and --match name the same thing two ways; use one")
+    at = (_mark_target(path, args.at) if args.at
+          else _match_target(path, args.match) if args.match else "")
+
+    print(f"{MARK_SENTINEL}{f' at={at}' if at else ''} | {reason}")
+    if not os.environ.get("CLAUDECODE"):
+        print("warning: not running inside Claude Code, so nothing recorded this. "
+              "Run it as `! chsum mark …` in a session.", file=sys.stderr)
+    return 0
+
+
 def latest_transcript(local: bool = True, nth: int = 1) -> pathlib.Path:
     """Nth-most-recent conversation with activity, by last activity not filename.
 
@@ -1031,28 +1607,53 @@ def cmd_sessions(args) -> int:
     print(f"# Sessions — {scope}{window}")
     print(f"*{len(shown)} of {len(metas)} shown · {empty} with no activity*\n")
 
-    rows = []
+    # Two lines each, as `mark --list`: a title is prose, and in a column the long
+    # ones pushed every other field off the terminal.
+    cols = max(40, min(shutil.get_terminal_size((100, 24)).columns, 88))
+    # By last activity, as `journal`: a resumed session belongs to the day you
+    # last worked on it.
+    by_day: dict[str, list[tuple]] = defaultdict(list)
     for m in shown:
-        rows.append((
+        by_day[(m.ended or m.started or "")[:10] or "undated"].append((
             ch_ref_for_path(m.path),
-            (m.ended or m.started or "")[:10] or "??????????",
             m.duration or "-",
             str(m.prompts),
             str(len(m.edited)),
             str(m.agent_count) if m.agent_count else "-",
-            "" if _has_activity(m) else "empty",
-            m.title,
+            f"⚑{len(m.marks)}" if m.marks else "-",
+            m.title or "(untitled)",
         ))
-    heads = ("ref", "date", "dur", "prompts", "files", "agents", "", "title")
-    widths = [max(len(r[i]) for r in (*rows, heads)) for i in range(len(heads) - 1)]
-    fmt = lambda r: "  ".join(
-        [f"{c:<{w}}" for c, w in zip(r, widths)] + [r[-1]]
-    ).rstrip()
-    print(fmt(heads))
-    for r in rows:
-        print(fmt(r))
-    print("\nRead one: `chsum context <ref>`   Most recent real session: `chsum last`")
+    heads = ("", "dur", "prompts", "files", "agents", "marks")  # dates fill the ref column
+    # Widths across every day: columns that shift per group read as separate tables.
+    widths = [max(len(r[i]) for rs in by_day.values() for r in (*rs, heads))
+              for i in range(len(heads))]
+    row = lambda r: "  " + "  ".join(f"{c:<{w}}" for c, w in zip(r, widths)).rstrip()
+    gutter = 2 + widths[0] + 2  # past the ref column, where `dur` starts
+    for day_no, (day, rows) in enumerate(by_day.items()):
+        label = _pretty_day(day)
+        if day_no:
+            print(label)
+        else:  # headers once, on the first date's line
+            print(f"{label:<{gutter}}" + _dim(row(heads).strip()))
+        for r in rows:
+            print(row(r))
+            # Wrapped here, not by the terminal: a title folded at column 0 reads
+            # as the next session.
+            print(_dim("\n".join(textwrap.wrap(r[6], cols, initial_indent="    ↳ ",
+                                               subsequent_indent="      "))))
+        print()
+    sys.stdout.flush()
+    print("Read one: `chsum context <ref>`   Most recent real session: `chsum last`",
+          file=sys.stderr)
     return 0
+
+
+def _pretty_day(day: str) -> str:
+    """`2026-08-08` → `Sat 08 Aug 2026`. Left alone if it isn't a date."""
+    try:
+        return datetime.strptime(day, "%Y-%m-%d").strftime("%a %d %b %Y")
+    except ValueError:
+        return day
 
 
 def _has_activity(m: Meta) -> bool:
@@ -1102,12 +1703,7 @@ def cmd_journal(args) -> int:
           f"{_plural(total_files, 'file')} changed*\n")
 
     for day, sessions in by_day.items():
-        pretty = day
-        try:
-            pretty = datetime.strptime(day, "%Y-%m-%d").strftime("%a %d %b %Y")
-        except ValueError:
-            pass
-        print(f"## {pretty}\n")
+        print(f"## {_pretty_day(day)}\n")
         for m in sessions:
             bits = [b for b in (m.duration, m.project_name,
                                 f"`{m.branch}`" if m.branch else "",
@@ -1115,6 +1711,10 @@ def cmd_journal(args) -> int:
                                 if m.resumed and m.date != (m.ended or "")[:10] else "") if b]
             print(f"### {m.title}")
             print(f"*{' · '.join(bits)}*\n")
+            for mk in m.marks:
+                print(f"⚑ {mk.reason}")
+            if m.marks:
+                print()
             if m.edited:
                 print(f"Changed {len(m.edited)} file(s): "
                       + ", ".join(f"`{f}`" for f in m.edited[:6])
@@ -1171,9 +1771,11 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_last)
 
     p = sub.add_parser("find", help="search conversations")
-    p.add_argument("query")
+    p.add_argument("query", nargs="?")
     p.add_argument("--all", action="store_true", help="all workspaces (default: this one)")
     p.add_argument("--top", type=int, default=8)
+    p.add_argument("--marks", action="store_true",
+                   help="search what you marked with `chsum mark` (query optional)")
     for mode in ("hybrid", "semantic", "lexical", "exact"):
         p.add_argument(f"--{mode}", dest="mode", action="store_const", const=mode)
     p.set_defaults(mode="hybrid", func=cmd_find)
@@ -1188,6 +1790,31 @@ def main(argv=None) -> int:
     p.add_argument("ref", nargs="?")
     p.add_argument("--file")
     p.set_defaults(func=cmd_context)
+
+    p = sub.add_parser(
+        "mark", help="flag this moment as notable, for the digest to pick up",
+        description="Prints a marker. Nothing is written: run through Claude Code's "
+                    "`!` prefix, the harness records the run itself, so the mark lands "
+                    "in the transcript where you typed it.",
+    )
+    p.add_argument("reason", nargs="*", help="why this matters — quoted verbatim later")
+    p.add_argument("--at", metavar="ID",
+                   help="mark an earlier message: a record id from --recent, or mN")
+    p.add_argument("--match", metavar="TEXT",
+                   help="mark the one message containing TEXT; lists candidates if "
+                        "more than one matches")
+    p.add_argument("--recent", nargs="?", type=int, const=20, default=None, metavar="N",
+                   help="list the last N messages and tool calls (default 20), with "
+                        "the record ids --at takes")
+    p.add_argument("--list", action="store_true",
+                   help="marks made in this conversation, with the ids --revoke takes")
+    p.add_argument("--full", action="store_true",
+                   help="with --list: whole reason and whole marked message, unclipped")
+    p.add_argument("--revoke", nargs="+", metavar="ID",
+                   help="drop marks made earlier (they stay in the transcript, "
+                        "but stop counting)")
+    p.add_argument("--file", help="transcript path (default: the session you're in)")
+    p.set_defaults(func=cmd_mark)
 
     p = sub.add_parser("journal", help="chronological work log")
     p.add_argument("--since", default="7d", help="window, e.g. 7d, 24h, 2w")

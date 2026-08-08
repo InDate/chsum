@@ -74,22 +74,31 @@ chsum context <ch_ref>                         # reload artifact, for pasting in
 chsum context <ch_ref>/<agent-id>              # one subagent's own digest
 chsum journal --since 7d                       # work log for this project
 chsum journal --since 2w --all                 # across every project
+! chsum mark "this is the approach that worked"  # flag the moment as notable
+! chsum mark --recent 20                       # list recent messages, with ids
+! chsum mark --at 47dca7e9 "where it turned"   # mark an earlier message
+chsum find --marks                             # everything you've marked
 ```
 
 Bare `chsum` lists the project's sessions, newest activity first:
 
 ```
-ref                                  date        dur    prompts  files  agents         title
-ch_c120431a267b202aebf0b38f6c3c1b69  2026-08-06  5h38m  78       14     -              Plan 3D house model…
-ch_da4e99d42e5efab11ebdedc22fb65145  2026-08-05  3h03m  30       12     5              Set up cdp-tools server
-ch_b99f11b7c257dafc8b93f53480ba3804  2026-08-05  6s     1        0      -       empty  (untitled)
+Thu 06 Aug 2026                        dur    prompts  files  agents  marks
+  ch_c120431a267b202aebf0b38f6c3c1b69  5h38m  78       14     -       ⚑2
+    ↳ Plan 3D house model from floor plan photographs
+
+Wed 05 Aug 2026
+  ch_da4e99d42e5efab11ebdedc22fb65145  3h03m  30       12     5       -
+    ↳ Set up cdp-tools server
+  ch_b99f11b7c257dafc8b93f53480ba3804  6s     1        0      -       -
+    ↳ (untitled)
 ```
 
 Listing is the default because picking is the common case, and "most recent" is
-often a session you abandoned after one prompt. Those are flagged `empty` rather
-than hidden — knowing a session was a dead end is the answer to "where did that
-work go". Activity means a file edited, a notable command, an agent spawned, or a
-second prompt.
+often a session you abandoned after one prompt. Dead ends are listed, not hidden
+— that a session went nowhere is the answer to "where did that work go". The
+header counts them: *no activity* is no file, no notable command, no agent, and
+one prompt.
 
 `chsum last` is `chsum context` on the most recent session with activity, ordered
 by last activity so one you resumed yesterday beats one you started last week.
@@ -116,6 +125,86 @@ nobody wants to read.
 `<parent-ref>/<agent-id>` resolves to `<uuid>/subagents/agent-<id>.jsonl`. chsum's
 own scheme, not claude-history's — see *Notes on correctness*.
 
+### Marks
+
+`chsum mark` flags a moment while you're in it, so the digest says which part
+mattered — extraction can tell you what changed, not which of it was the point.
+
+```sh
+! chsum mark "the shrinkwrap approach, after two dead ends"
+```
+
+The `!` prefix is the mechanism, not decoration. chsum writes nothing: it prints
+a marker line, and Claude Code's own recording of the `!` run puts it in the
+transcript, at the point in the conversation where you typed it. So there is no
+second store to keep in sync, nothing injected into a file Claude Code is
+appending to, and the mark inherits an `mN` and a durable `ma_` anchor for free.
+Run outside a session it warns instead — there is nothing there to record it.
+
+To mark something further back, list recent messages and name one:
+
+```sh
+! chsum mark --recent 20
+47dca7e9  06:27  you     can we make the digest quote the anchor instead
+be74e21f  06:40  claude  That collides — two messages with identical text share one anchor
+a27a1c9c  06:41  claude  Edit: chsum.py
+0b2f4db2  06:42  claude  Bash: python3 -m pytest -x
+! chsum mark --at be74e21f "the anchor collision, explained properly"
+```
+
+Everything that happened, in order: both sides' messages *and* every tool call,
+so you can mark the edit or the command rather than the sentence near it. Tool
+results are left out — a mark resolves to the message containing the action
+either way.
+
+Ids come from the transcript itself rather than claude-history, which lags a
+live session by some minutes. `--at mN` works too, once it has caught up.
+
+Or name the message by something it said:
+
+```sh
+! chsum mark --match "worth knowing exactly where it dies" "the subagent gap"
+```
+
+Matching folds case, punctuation, and markdown away — `currently no` finds
+`Currently **no** —`, because nobody retypes the asterisks. Marks still quote the
+original bytes. If more than one message matches, chsum lists the candidates and
+marks nothing: asking to mark a phrase puts that phrase in your own prompt too,
+so "newest wins" would keep marking the request instead of its subject. `chsum
+mark`'s own calls and output are excluded from matching — its tool call is
+recorded before the command runs, so otherwise every search would find itself.
+
+Marks show up as **Notable** at the top of the digest, verbatim, with the message
+they point at; as a `⚑` count in the listing; inline in `journal`; and
+`chsum find --marks [query]` searches them across sessions.
+
+Marked something you'd rather not keep:
+
+```sh
+! chsum mark --list
+the subagent gap, stated plainly    dde43c3c
+  ↳ Currently **no** — and worth knowing exactly where it dies.
+
+Testing                             32e8b253
+  ↳ Left in place — it records the state that prompted the change.
+
+! chsum mark --list --full          # whole reason, whole marked message
+! chsum mark --revoke 32e8b253      # takes several ids at once
+```
+
+Each mark shows its reason, its id, and the message it marks. A bare `chsum mark`
+points at the message it followed — its own output record says nothing about what
+you were marking.
+
+A revocation is another line of output, same as a mark — nothing was written, so
+there is nothing to delete. Both records stay in the transcript; the mark simply
+stops counting everywhere marks are read.
+
+A subagent can mark too. Its marks land in its own sidecar and fold into the
+parent, like its edits and commands, tagged `agent <id>` instead of an `mN` —
+sidecars have no ordinals or anchors to cite. Revocations cross that boundary in
+both directions: the parent can drop a mark its agent made, and vice versa.
+
 ### Search modes
 
 `--hybrid` (default) and `--semantic` are best for conceptual recall but are slow:
@@ -128,6 +217,7 @@ and error strings, or `--exact` for exact tokens.
 | Section | Source |
 |---|---|
 | Frontmatter — ref, title, project, branch, start, duration, counts | computed |
+| **Notable** — what you flagged with `chsum mark`, verbatim | copied |
 | **What I asked for** — your prompts, verbatim, in order | copied |
 | **Files changed** / **Commands run** | parsed from tool calls |
 | **Delegated** — one line per subagent, with its address | parsed from sidecars |

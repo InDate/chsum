@@ -22,8 +22,37 @@ on as fact.
 | `chsum context <ref>/<agent-id>` | One subagent's own digest |
 | `chsum digest <ref>` | Same, written to a file (`--stdout` to print) |
 | `chsum journal --since 7d` | Chronological work log across sessions |
+| `chsum mark "<reason>"` | Flag this moment as notable, for the digest |
+| `chsum find --marks [query]` | What's been marked, across sessions |
 
 Scoped to the current project unless `--all`.
+
+## Marking
+
+`chsum mark` records nothing itself — it prints a marker, and the harness's own
+recording of the run is what lands it in the transcript. So it only works when
+run *inside* a session: as `! chsum mark "…"` typed by the user, or as a normal
+Bash tool call by you. Ask before marking on the user's behalf; a mark is their
+judgement about what mattered, and it outranks everything else in the digest.
+
+For something further back — "mark that bit about the sidecars":
+
+- `chsum mark --match "<phrase from it>" "<reason>"` — matching ignores case,
+  punctuation, and markdown. Several matches and it lists candidates instead of
+  guessing; pick one with `--at`.
+- `chsum mark --recent 20` lists the last 20 messages and tool calls with the
+  record ids `--at` takes.
+
+`<reason>` is free text, copied verbatim into the digest — write the note you'd
+want to read cold months later, not a label.
+
+`chsum mark --list` shows this conversation's marks with ids (`--full` for the
+whole marked message); `--revoke <id>` drops one. Revoking is additive too — both records stay in the transcript, the
+mark just stops counting. Never revoke a mark the user made without being asked.
+
+Marks made by a subagent fold into the parent session, tagged `agent <id>` rather
+than an `mN`. Worth telling an agent to mark what it finds: its digest is thin,
+and a mark survives into the parent's.
 
 ## Choosing
 
@@ -35,12 +64,12 @@ Scoped to the current project unless `--all`.
 
 ## Reading the output
 
-Listing marks dead-end sessions `empty` (no files, commands, or agents; ≤1
-prompt). Skip those.
+Skip dead-end sessions: `1` prompt, `0` files, no agents. The header counts them.
 
-A digest gives frontmatter, then the user's prompts verbatim in order (the intent
-trail — usually the most valuable part), files changed, commands run, delegated
-agents, and where it left off.
+A digest gives frontmatter, then **Notable** if anything was marked (hand-picked,
+so read it first), the user's prompts verbatim in order (the intent trail —
+usually the most valuable part), files changed, commands run, delegated agents,
+and where it left off.
 
 Three traps:
 
