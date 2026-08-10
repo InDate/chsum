@@ -514,6 +514,7 @@ def _resolve_here(data: str, marks: list[Mark], path: pathlib.Path | None = None
     said: list[tuple[str, int, pathlib.Path | None, str, str]] = []
     for src, agent in (mark_sources(path) if path else [(None, "")]):
         raw_text = data if src is None or src == path else src.read_text(errors="replace")
+        machinery = _Machinery()
         for lineno, raw in enumerate(raw_text.splitlines(), start=1):
             try:
                 rec = json.loads(raw)
@@ -522,7 +523,9 @@ def _resolve_here(data: str, marks: list[Mark], path: pathlib.Path | None = None
             if not isinstance(rec, dict) or rec.get("type") not in ("user", "assistant"):
                 continue
             text = _record_text(rec).strip()
-            if not text or not is_real_prompt(text) or _is_mark_machinery(text):
+            if not text or not is_real_prompt(text):
+                continue
+            if machinery.sees(text):
                 continue
             said.append((str(rec.get("timestamp") or ""), lineno, src, agent,
                          next((ln for ln in text.splitlines() if ln.strip()), "")))
@@ -1400,10 +1403,15 @@ def mark_sources(path: pathlib.Path) -> list[tuple[pathlib.Path, str]]:
                            for s in subagent_transcripts(path)]
 
 
-def _recent_actions(path: pathlib.Path, limit: int) -> list[tuple[int, dict, str, str, str, str]]:
+def _recent_actions(path: pathlib.Path, limit: int,
+                    skip_machinery: bool = False) -> list[tuple[int, dict, str, str, str, str]]:
     """(line, record, label, full text, kind, agent) for the last `limit` things
     that happened: messages either side typed, and every tool call, in order.
     `limit=0` is all. Sidecars are folded in, so a running agent's work is markable.
+
+    `skip_machinery` drops `chsum mark`'s own footprint — for `--match`, whose
+    haystack it would otherwise poison. `--recent` keeps it: that view is a plain
+    account of what happened, and a `!` run is a thing that happened.
 
     The label is one line, for listing; the full text is what `--match` searches,
     so a phrase buried in the middle of a long message is still findable.
@@ -1415,6 +1423,7 @@ def _recent_actions(path: pathlib.Path, limit: int) -> list[tuple[int, dict, str
     """
     out = []
     for src, agent in mark_sources(path):
+        machinery = _Machinery()
         for lineno, raw in enumerate(src.read_text(errors="replace").splitlines(), start=1):
             try:
                 rec = json.loads(raw)
@@ -1424,9 +1433,15 @@ def _recent_actions(path: pathlib.Path, limit: int) -> list[tuple[int, dict, str
                 continue
             text = _record_text(rec).strip()
             if text and is_real_prompt(text):
+                # Always asked, even when kept: the scan is stateful, and a record
+                # it never sees is one the next record's verdict is missing.
+                if machinery.sees(text) and skip_machinery:
+                    continue
                 label = next((ln for ln in text.splitlines() if ln.strip()), "")
                 out.append((lineno, rec, label, text, "text", agent))
             for line in _tool_lines(rec):
+                if skip_machinery and machinery.sees(line, "tool"):
+                    continue
                 out.append((lineno, rec, line, line, "tool", agent))
     # By timestamp, not file order: an agent's records are in a different file, so
     # file order interleaves nothing. Stable, so a record's tool calls stay with it.
@@ -1444,23 +1459,46 @@ def _fold(text: str) -> str:
     return " ".join(re.sub(r"[^0-9a-z]+", " ", text.lower()).split())
 
 
-def _is_mark_machinery(text: str, kind: str = "text") -> bool:
-    """A `chsum mark` call or its output — the command's own footprint.
+_MARK_INPUT_RE = re.compile(r"\s*<bash-input>\s*chsum\s+mark\b")
+_BASH_OUT_RE = re.compile(r"\s*<bash-(?:stdout|stderr)>")
+
+
+class _Machinery:
+    """`chsum mark`'s own footprint, tracked in file order.
 
     Excluded from matching because the tool_use record is written *before* the
     command runs: without this, every `--match` finds itself, and past runs stay
     in the haystack forever.
 
+    A `!` run lands as two records — the `<bash-input>`, then whatever it printed
+    — and only a *successful* mark's output carries the sentinel. A failure prints
+    plain prose quoting the phrase you searched for, so the next `--match` on that
+    phrase finds the complaint about not finding it. Captured output is therefore
+    judged by the command above it, not by what it says; that also covers the
+    ambiguity list, `--recent`, and `--list`, which quote other messages verbatim.
+
     Invocations only, not talk about them. A command is machinery wherever `chsum
     mark` appears in it (they get chained); a message is machinery only if it *is*
-    a `!` run or carries the sentinel. Otherwise a conversation about this feature
-    becomes unmarkable — which is how this was found.
+    a `!` run, that run's output, or carries the sentinel. Otherwise a conversation
+    about this feature becomes unmarkable — which is how this was found.
+
+    One instance per file, `sees` called once per record in file order: adjacency
+    is a fact about the file, and sorting by timestamp interleaves the sidecars.
     """
-    if MARK_SENTINEL in text:
-        return True
-    if kind == "tool":
-        return bool(re.search(r"\bchsum\s+mark\b", text))
-    return bool(re.match(r"\s*<bash-input>\s*chsum\s+mark\b", text))
+
+    def __init__(self) -> None:
+        self.after_mark = False
+
+    def sees(self, text: str, kind: str = "text") -> bool:
+        # Tool calls hang off a record rather than being one, so they carry no
+        # state: nothing is written between a tool_use and the record after it.
+        if kind == "tool":
+            return bool(re.search(r"\bchsum\s+mark\b", text))
+        if _BASH_OUT_RE.match(text):
+            was, self.after_mark = self.after_mark, False
+            return was or MARK_SENTINEL in text
+        self.after_mark = bool(_MARK_INPUT_RE.match(text))
+        return self.after_mark or MARK_SENTINEL in text
 
 
 def _match_target(path: pathlib.Path, needle: str) -> str:
@@ -1469,9 +1507,9 @@ def _match_target(path: pathlib.Path, needle: str) -> str:
     "newest wins" would routinely mark the request instead of its subject."""
     want = _fold(needle)
     hits, seen = [], set()
-    for lineno, rec, label, text, kind, agent in _recent_actions(path, 0):
+    for lineno, rec, label, text, kind, agent in _recent_actions(path, 0, skip_machinery=True):
         uid = str(rec.get("uuid") or "")
-        if _is_mark_machinery(text, kind) or want not in _fold(text) or uid in seen:
+        if want not in _fold(text) or uid in seen:
             continue
         seen.add(uid)
         hits.append((uid, rec, label, agent))
