@@ -54,6 +54,14 @@ Marks made by a subagent fold into the parent session, tagged `agent <id>` rathe
 than an `mN`. Worth telling an agent to mark what it finds: its digest is thin,
 and a mark survives into the parent's.
 
+`--match`, `--recent` and a bare `chsum mark` search the running agents' work too,
+so something an agent just said is markable while it is still running. Those get
+`agent <id>` for the same reason — a sidecar has no `mN`.
+
+The user can't type `! chsum mark` while addressing an agent — their text goes to
+the agent instead. So a moment worth keeping from an agent is marked either by the
+agent itself, or afterwards from the session with `--match "<phrase it said>"`.
+
 ## Choosing
 
 - Vague reference ("the one about the overlays") → `find`. Default hybrid search

@@ -57,6 +57,30 @@ and one symlink on `PATH`. `pipx install --editable .` while working on it.
 A real command rather than a shell alias, because an alias doesn't exist for
 scripts, hooks, or agents.
 
+### Marking while an agent is working
+
+`!` is not available while you are addressing an agent — what you type goes to the
+agent as a message, so there is no way to run the command yourself until you are
+back in the conversation. Two things do work:
+
+- Mark it afterwards, from the session: `chsum mark --match "<phrase the agent
+  said>"` searches the sidecars too, so the agent's own words are addressable.
+- Ask the agent to mark it as it goes. That is a Bash call, which prompts, and a
+  subagent has nobody watching to approve — so allow the command first, in
+  `~/.claude/settings.json` or a project's `.claude/settings.local.json`:
+
+```json
+{ "permissions": { "allow": ["Bash(chsum:*)"] } }
+```
+
+The whole command, not just `mark`: everything chsum does is read transcripts you
+already have, and `digest`'s file lands in `~/.claude/chsum/digests/`. Narrow it
+to `Bash(chsum mark:*)` if you'd rather approve the reading commands case by case.
+
+The plugin can't set this for you — permissions come from settings files, and a
+plugin that allowlisted its own shell command would be granting itself something
+you never agreed to.
+
 ## Usage
 
 ```sh

@@ -387,6 +387,7 @@ class Mark:
     at: str = ""  # record uuid of the message marked; "" means "here"
     line: int = 0  # 1-based JSONL line of the sentinel's own record
     at_line: int = 0  # ditto for the marked record, once resolved
+    at_path: pathlib.Path | None = None  # file `at_line` is a line of, if not the transcript
     quote: str = ""  # first line of the marked message, verbatim
     when: str = ""
     agent: str = ""  # sidecar it came from; blank for the parent's own
@@ -474,9 +475,16 @@ def _scan_marks_raw(path: pathlib.Path) -> tuple[list[Mark], set[str]]:
                               line=lineno,
                               when=str(rec.get("timestamp") or "")))
     if any(m.at for m in marks):
-        _resolve_marked(data, marks)
+        _resolve_marked(data, marks, path)
+        # A mark typed in the transcript can name a record in a sidecar: while an
+        # agent is running, that is the file the conversation is landing in.
+        for side, agent in mark_sources(path)[1:]:
+            missing = [m for m in marks if m.at and not m.at_line]
+            if not missing:
+                break
+            _resolve_marked(side.read_text(errors="replace"), missing, side, agent)
     if any(not m.at for m in marks):
-        _resolve_here(data, marks)
+        _resolve_here(data, marks, path)
     return marks, revoked
 
 
@@ -491,34 +499,49 @@ def _text_at_line(lines: list[str], lineno: int) -> str:
     return _record_text(rec).strip() if isinstance(rec, dict) else ""
 
 
-def _resolve_here(data: str, marks: list[Mark]) -> None:
+def _resolve_here(data: str, marks: list[Mark], path: pathlib.Path | None = None) -> None:
     """Point a bare `chsum mark` at the message it followed.
 
     Its own record is command output, which says nothing about what was being
     marked — you marked what was on the screen. So the target is the last thing
     said before it, skipping the mark's own plumbing.
+
+    "Before" is by timestamp once sidecars are in play: what was on screen while an
+    agent ran was written to the sidecar, and line numbers of two files don't
+    order against each other. Marks with no timestamp of their own fall back to
+    line order in the transcript, which is what they had before.
     """
-    said: list[tuple[int, str]] = []  # (line, first line of text)
-    for lineno, raw in enumerate(data.splitlines(), start=1):
-        try:
-            rec = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(rec, dict) or rec.get("type") not in ("user", "assistant"):
-            continue
-        text = _record_text(rec).strip()
-        if not text or not is_real_prompt(text) or _is_mark_machinery(text):
-            continue
-        said.append((lineno, next((ln for ln in text.splitlines() if ln.strip()), "")))
+    said: list[tuple[str, int, pathlib.Path | None, str, str]] = []
+    for src, agent in (mark_sources(path) if path else [(None, "")]):
+        raw_text = data if src is None or src == path else src.read_text(errors="replace")
+        for lineno, raw in enumerate(raw_text.splitlines(), start=1):
+            try:
+                rec = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(rec, dict) or rec.get("type") not in ("user", "assistant"):
+                continue
+            text = _record_text(rec).strip()
+            if not text or not is_real_prompt(text) or _is_mark_machinery(text):
+                continue
+            said.append((str(rec.get("timestamp") or ""), lineno, src, agent,
+                         next((ln for ln in text.splitlines() if ln.strip()), "")))
+    said.sort(key=lambda s: (s[0], s[1]))
     for mk in marks:
         if mk.at:
             continue
-        prior = [s for s in said if s[0] < mk.line]
+        if mk.when:
+            prior = [s for s in said if (s[0], s[1]) < (mk.when, mk.line)]
+        else:
+            prior = [s for s in said if s[2] in (None, path) and s[1] < mk.line]
         if prior:
-            mk.at_line, mk.quote = prior[-1]
+            _ts, mk.at_line, mk.at_path, agent, mk.quote = prior[-1]
+            if agent:
+                mk.agent = agent
 
 
-def _resolve_marked(data: str, marks: list[Mark]) -> None:
+def _resolve_marked(data: str, marks: list[Mark], src: pathlib.Path | None = None,
+                    agent: str = "") -> None:
     """Fill in where each `at=` mark points, from the record it names."""
     want = {m.at for m in marks if m.at}
     for lineno, raw in enumerate(data.splitlines(), start=1):
@@ -533,7 +556,11 @@ def _resolve_marked(data: str, marks: list[Mark]) -> None:
             continue
         for mk in marks:
             if mk.at and uid.startswith(mk.at) and not mk.at_line:
-                mk.at_line = lineno
+                mk.at_line, mk.at_path = lineno, src
+                if agent:
+                    # Lines of a sidecar, which has no mN: the id stands in for the
+                    # ordinal, exactly as it does for a mark an agent made itself.
+                    mk.agent = agent
                 text = _record_text(rec).strip()
                 mk.quote = next((ln for ln in text.splitlines() if ln.strip()), "")
 
@@ -1304,7 +1331,11 @@ def live_transcript() -> pathlib.Path:
 
 def _mark_target(path: pathlib.Path, spec: str) -> str:
     """Resolve `--at` to a full record uuid: either a uuid prefix from
-    `chsum mark --recent`, or an mN, which needs claude-history to place it."""
+    `chsum mark --recent`, or an mN, which needs claude-history to place it.
+
+    A uuid is looked for in the sidecars too, because `--recent` lists them; an mN
+    is the transcript's own numbering and stays parent-only.
+    """
     if re.fullmatch(r"m\d+", spec):
         ref = ch_ref_for_path(path)
         want = int(spec[1:])
@@ -1320,16 +1351,17 @@ def _mark_target(path: pathlib.Path, spec: str) -> str:
         line = 0
     prefix = spec.lower()
     hits = []
-    for lineno, raw in enumerate(path.read_text(errors="replace").splitlines(), start=1):
-        try:
-            rec = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        uid = rec.get("uuid") if isinstance(rec, dict) else ""
-        if not isinstance(uid, str) or not uid:
-            continue
-        if (line and lineno == line) or (not line and uid.startswith(prefix)):
-            hits.append(uid)
+    for src, _agent in ([(path, "")] if line else mark_sources(path)):
+        for lineno, raw in enumerate(src.read_text(errors="replace").splitlines(), start=1):
+            try:
+                rec = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            uid = rec.get("uuid") if isinstance(rec, dict) else ""
+            if not isinstance(uid, str) or not uid:
+                continue
+            if (line and lineno == line) or (not line and uid.startswith(prefix)):
+                hits.append(uid)
     if not hits:
         raise SystemExit(f"no record matching {spec!r} in {path.name}")
     if len(hits) > 1:
@@ -1356,9 +1388,22 @@ def _tool_lines(rec: dict) -> list[str]:
     return out
 
 
-def _recent_actions(path: pathlib.Path, limit: int) -> list[tuple[int, dict, str, str]]:
-    """(line, record, label, full text) for the last `limit` things that happened:
-    messages either side typed, and every tool call, in order. `limit=0` is all.
+def mark_sources(path: pathlib.Path) -> list[tuple[pathlib.Path, str]]:
+    """Every file a mark in this conversation can point into: the transcript, then
+    its sidecars, each with the agent id to label it by.
+
+    Delegated work is the session's work — while an agent is running, what is on
+    screen is being written to a sidecar, not the transcript, so a haystack of the
+    transcript alone can't see the thing you are asking to mark.
+    """
+    return [(path, "")] + [(s, s.stem.removeprefix("agent-"))
+                           for s in subagent_transcripts(path)]
+
+
+def _recent_actions(path: pathlib.Path, limit: int) -> list[tuple[int, dict, str, str, str, str]]:
+    """(line, record, label, full text, kind, agent) for the last `limit` things
+    that happened: messages either side typed, and every tool call, in order.
+    `limit=0` is all. Sidecars are folded in, so a running agent's work is markable.
 
     The label is one line, for listing; the full text is what `--match` searches,
     so a phrase buried in the middle of a long message is still findable.
@@ -1369,19 +1414,23 @@ def _recent_actions(path: pathlib.Path, limit: int) -> list[tuple[int, dict, str
     message that contains it either way.
     """
     out = []
-    for lineno, raw in enumerate(path.read_text(errors="replace").splitlines(), start=1):
-        try:
-            rec = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(rec, dict) or rec.get("type") not in ("user", "assistant"):
-            continue
-        text = _record_text(rec).strip()
-        if text and is_real_prompt(text):
-            label = next((ln for ln in text.splitlines() if ln.strip()), "")
-            out.append((lineno, rec, label, text, "text"))
-        for line in _tool_lines(rec):
-            out.append((lineno, rec, line, line, "tool"))
+    for src, agent in mark_sources(path):
+        for lineno, raw in enumerate(src.read_text(errors="replace").splitlines(), start=1):
+            try:
+                rec = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(rec, dict) or rec.get("type") not in ("user", "assistant"):
+                continue
+            text = _record_text(rec).strip()
+            if text and is_real_prompt(text):
+                label = next((ln for ln in text.splitlines() if ln.strip()), "")
+                out.append((lineno, rec, label, text, "text", agent))
+            for line in _tool_lines(rec):
+                out.append((lineno, rec, line, line, "tool", agent))
+    # By timestamp, not file order: an agent's records are in a different file, so
+    # file order interleaves nothing. Stable, so a record's tool calls stay with it.
+    out.sort(key=lambda r: str(r[1].get("timestamp") or ""))
     return out[-limit:] if limit else out
 
 
@@ -1420,21 +1469,22 @@ def _match_target(path: pathlib.Path, needle: str) -> str:
     "newest wins" would routinely mark the request instead of its subject."""
     want = _fold(needle)
     hits, seen = [], set()
-    for lineno, rec, label, text, kind in _recent_actions(path, 0):
+    for lineno, rec, label, text, kind, agent in _recent_actions(path, 0):
         uid = str(rec.get("uuid") or "")
         if _is_mark_machinery(text, kind) or want not in _fold(text) or uid in seen:
             continue
         seen.add(uid)
-        hits.append((uid, rec, label))
+        hits.append((uid, rec, label, agent))
     if not hits:
         raise SystemExit(f"nothing in this conversation matches {needle!r}")
     if len(hits) > 1:
         print(f"{len(hits)} matches — mark one with --at, or give a longer string:",
               file=sys.stderr)
-        for uid, rec, label in hits:
-            who = "you" if rec.get("type") == "user" else "claude"
+        for uid, rec, label, agent in hits:
+            who = f"agent {agent[:8]}" if agent else (
+                "you" if rec.get("type") == "user" else "claude")
             when = str(rec.get("timestamp") or "")[11:16]
-            print(f"  {uid[:8]}  {when:<5}  {who:<6}  {label[:80]}", file=sys.stderr)
+            print(f"  {uid[:8]}  {when:<5}  {who:<14}  {label[:80]}", file=sys.stderr)
         raise SystemExit(2)
     return hits[0][0]
 
@@ -1447,7 +1497,11 @@ def cmd_mark(args) -> int:
         raise SystemExit(f"no such transcript: {path}")
 
     if args.list:
-        marks = scan_marks(path)
+        # The session's marks, not the transcript's: an agent's are the session's
+        # too, and `--list` showing fewer than the digest counts reads as a bug in
+        # whichever one you check second. extract_meta already pools revocations
+        # across the boundary, so this is that one definition, not a second.
+        marks = extract_meta(path).marks
         if not marks:
             print("nothing marked in this conversation", file=sys.stderr)
             return 1
@@ -1459,12 +1513,17 @@ def cmd_mark(args) -> int:
             # The stored quote is only the marked message's first line, so the rest
             # comes back off disk here rather than being carried around for a view
             # nobody usually asks for.
-            lines = path.read_text(errors="replace").splitlines()
+            # Keyed by file: a mark can point into a sidecar, whose line numbers
+            # mean nothing in the transcript.
+            lines_of: dict[pathlib.Path, list[str]] = {}
             for i, mk in enumerate(marks):
                 if i:
                     print()
                 print(f"{mk.rec[:8]}  {mk.reason}")
-                body = _text_at_line(lines, mk.at_line) or mk.quote
+                src = mk.at_path or path
+                if src not in lines_of:
+                    lines_of[src] = src.read_text(errors="replace").splitlines()
+                body = _text_at_line(lines_of[src], mk.at_line) or mk.quote
                 first = True  # the ↳ opens the message, it doesn't bullet its paragraphs
                 for para in (body or "(nothing before it)").splitlines():
                     if not para.strip():
@@ -1481,7 +1540,10 @@ def cmd_mark(args) -> int:
         # one line the long one eats the other.
         # Width off the rendered strings, not the limit: the clip marker is two
         # more characters, and sizing to the limit knocks those rows out of line.
-        rows = [(_clip_line(mk.reason, 60), mk.rec[:8],
+        # Whose mark it is, in the id column: the reason rarely says, and a mark you
+        # don't remember making is one an agent made for you.
+        rows = [(_clip_line(mk.reason, 60),
+                 f"{mk.rec[:8]}  agent {mk.agent[:8]}" if mk.agent else mk.rec[:8],
                  _clip_line(mk.quote, 96) or "(nothing before it)") for mk in marks]
         width = max(len(r[0]) for r in rows)
         # Wrapped here rather than left to the terminal: a quote that folds at
@@ -1499,7 +1561,8 @@ def cmd_mark(args) -> int:
         return 0
 
     if args.revoke:
-        known = {mk.rec: mk for mk in scan_marks(path)}
+        # Agents' marks included: either side can retract the other's.
+        known = {mk.rec: mk for mk in extract_meta(path).marks}
         out = []
         for spec in args.revoke:
             hits = [uid for uid in known if uid.startswith(spec)]
@@ -1520,10 +1583,11 @@ def cmd_mark(args) -> int:
         if not rows:
             print("nothing recorded in this conversation yet", file=sys.stderr)
             return 1
-        for lineno, rec, label, _, _kind in rows:
-            who = "you" if rec.get("type") == "user" else "claude"
+        for lineno, rec, label, _, _kind, agent in rows:
+            who = f"agent {agent[:8]}" if agent else (
+                "you" if rec.get("type") == "user" else "claude")
             when = str(rec.get("timestamp") or "")[11:16]
-            print(f"{str(rec.get('uuid') or '')[:8]}  {when:<5}  {who:<6}  {label[:88]}")
+            print(f"{str(rec.get('uuid') or '')[:8]}  {when:<5}  {who:<14}  {label[:88]}")
         print("\nMessages and tool calls, oldest first; tool results are not listed.\n"
               'Mark one: `chsum mark --at <id> "<reason>"`', file=sys.stderr)
         return 0
