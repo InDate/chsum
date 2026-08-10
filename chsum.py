@@ -1594,6 +1594,14 @@ def cmd_mark(args) -> int:
 
     reason = " ".join(args.reason).strip()
     if not reason:
+        # Named separately from the bare case: `--match "<phrase>"` with no reason
+        # reads as complete, and the generic message sent one reader off diagnosing
+        # the match instead of the missing argument.
+        if args.match or args.at:
+            flag = "--match" if args.match else "--at"
+            raise SystemExit(
+                f'{flag} says which message to mark, not why — add a reason:\n'
+                f'  chsum mark {flag} "{(args.match or args.at)}" "why this matters"')
         raise SystemExit('nothing to mark — try: chsum mark "why this matters"')
     # One line, because the sentinel is parsed back out of a single record.
     reason = " ".join(reason.split())
