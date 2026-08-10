@@ -1471,16 +1471,15 @@ class _Machinery:
     in the haystack forever.
 
     A `!` run lands as two records — the `<bash-input>`, then whatever it printed
-    — and only a *successful* mark's output carries the sentinel. A failure prints
-    plain prose quoting the phrase you searched for, so the next `--match` on that
-    phrase finds the complaint about not finding it. Captured output is therefore
-    judged by the command above it, not by what it says; that also covers the
-    ambiguity list, `--recent`, and `--list`, which quote other messages verbatim.
+    — and only a *successful* mark's output carries the sentinel; a failure's
+    output quotes the phrase you searched for back at you. So captured output is
+    judged by the command above it, not by what it says. Same for the ambiguity
+    list, `--recent`, and `--list`, which quote other messages verbatim.
 
     Invocations only, not talk about them. A command is machinery wherever `chsum
     mark` appears in it (they get chained); a message is machinery only if it *is*
-    a `!` run, that run's output, or carries the sentinel. Otherwise a conversation
-    about this feature becomes unmarkable — which is how this was found.
+    a `!` run, that run's output, or carries the sentinel. Match on prose and a
+    conversation about this feature becomes unmarkable.
 
     One instance per file, `sees` called once per record in file order: adjacency
     is a fact about the file, and sorting by timestamp interleaves the sidecars.
