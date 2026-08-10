@@ -1640,14 +1640,14 @@ def cmd_sessions(args) -> int:
     """One line per conversation, newest first. Triage: which were real work.
 
     Empty ones are listed, not hidden — knowing a session was a dead end is the
-    answer to "where did that work go".
+    answer to "where did that work go". So is the one running right now: it is
+    tagged, not skipped, because a listing that silently omits today's work reads
+    as work that never happened. `last` still skips it — you are already in it.
     """
     cutoff = _parse_since(args.since) if args.since else None
     live = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     metas = []
     for p in transcripts(local=not args.all):
-        if p.stem == live:
-            continue
         if cutoff is not None and p.stat().st_mtime < cutoff:
             continue
         meta = extract_meta(p)
@@ -1678,6 +1678,10 @@ def cmd_sessions(args) -> int:
     # last worked on it.
     by_day: dict[str, list[tuple]] = defaultdict(list)
     for m in shown:
+        # Tagged, because its numbers are a snapshot: Claude Code is still
+        # appending, so counts and duration are behind by however much of the
+        # conversation has not been flushed yet.
+        here = " · this session (in progress)" if m.path.stem == live else ""
         by_day[(m.ended or m.started or "")[:10] or "undated"].append((
             ch_ref_for_path(m.path),
             m.duration or "-",
@@ -1685,7 +1689,7 @@ def cmd_sessions(args) -> int:
             str(len(m.edited)),
             str(m.agent_count) if m.agent_count else "-",
             f"⚑{len(m.marks)}" if m.marks else "-",
-            m.title or "(untitled)",
+            (m.title or "(untitled)") + here,
         ))
     heads = ("", "dur", "prompts", "files", "agents", "marks")  # dates fill the ref column
     # Widths across every day: columns that shift per group read as separate tables.
