@@ -102,6 +102,9 @@ chsum journal --since 2w --all                 # across every project
 ! chsum mark --recent 20                       # list recent messages, with ids
 ! chsum mark --at 47dca7e9 "where it turned"   # mark an earlier message
 chsum find --marks                             # everything you've marked
+chsum name "what it actually was"              # rename the session you're in
+chsum name <ch_ref> "marks: design + build"    # rename a past one
+chsum name --list                              # everything you've renamed
 ```
 
 Bare `chsum` lists the project's sessions, newest activity first:
@@ -130,6 +133,34 @@ Run from inside Claude Code, the session doing the running is excluded.
 
 Everything scopes to the current project; `--all` widens. Digests land in
 `~/.claude/chsum/digests/<uuid>.md` (`--out` to change).
+
+### Names
+
+Sessions are titled by Claude Code, from the first thing you said — so a session
+that started as one question and became a day's work is filed under the question.
+`chsum name` fixes that:
+
+```sh
+chsum name "marks: design + build"                 # the session you're in
+chsum name ch_3654a13c "marks: design + build"     # one from last week
+```
+
+Your name wins everywhere chsum shows a title — listing, digest, journal — and is
+flagged `✎` in the listing, because whose reading of the session it is matters.
+
+It also lands in `/resume`. Claude Code's title is an `ai-title` record it appends
+to the transcript as the conversation grows, dozens per session, last one wins;
+`chsum name` appends one more of exactly that shape. Never a rewrite of a line
+already written — the one thing chsum adds to a transcript, and it is added the
+way Claude Code adds it.
+
+That is why the name is also kept in `~/.claude/chsum/names.json`: rename a
+session that is still running and Claude Code will title it again ten minutes
+later. chsum keeps yours; `/resume` may drift back.
+
+`chsum name --list` shows what you've renamed, `--clear` undoes one — putting
+Claude Code's own title back as another appended record, so `/resume` reverts too.
+`--no-resume` renames in chsum only and leaves the transcript alone.
 
 ### Subagents
 

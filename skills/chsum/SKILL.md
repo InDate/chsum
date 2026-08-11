@@ -24,8 +24,22 @@ on as fact.
 | `chsum journal --since 7d` | Chronological work log across sessions |
 | `chsum mark "<reason>"` | Flag this moment as notable, for the digest |
 | `chsum find --marks [query]` | What's been marked, across sessions |
+| `chsum name "<title>"` | Rename this session; lead with a `ch_` ref to rename a past one |
 
 Scoped to the current project unless `--all`.
+
+## Naming
+
+Claude Code titles a session from its opening question, which is often not what it
+turned into. `chsum name "<title>"` renames the current one, `chsum name <ref>
+"<title>"` an earlier one; the title is quoted verbatim, never summarised. It
+shows in every chsum view (flagged `✎`) and in `/resume`. `--list` shows what's
+renamed, `--clear` puts Claude Code's title back.
+
+A title is the user's account of their own work — propose one, don't rename on
+their behalf unless asked. Renaming the running session is the weakest case:
+Claude Code re-titles it as the conversation grows, so `/resume` may drift back
+even though chsum keeps yours.
 
 ## Marking
 

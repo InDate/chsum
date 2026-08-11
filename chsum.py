@@ -318,7 +318,9 @@ class AgentRun:
 @dataclass
 class Meta:
     uuid: str = ""
-    title: str = "(untitled)"
+    title: str = "(untitled)"  # what to call it: your name if there is one
+    ai_title: str = ""  # what Claude Code called it, kept so `--clear` can say
+    renamed: bool = False
     project: str = ""
     branch: str = ""
     started: str = ""
@@ -351,6 +353,102 @@ class Meta:
     @property
     def project_name(self) -> str:
         return pathlib.Path(self.project).name if self.project else "?"
+
+
+# ---------------------------------------------------------------------------
+# Names
+# ---------------------------------------------------------------------------
+# What a session is called is Claude Code's `ai-title` record, and it appends a
+# refined one all session long — dozens per conversation, last wins. So `chsum
+# name` does two things, because neither alone holds:
+#
+#   1. Records the name in chsum's own store, keyed by uuid. Authoritative here:
+#      a live session's next `ai-title` would otherwise overwrite you within the
+#      minute.
+#   2. Appends one more `ai-title` record to the transcript, so /resume and every
+#      other reader of the JSONL show the name too.
+#
+# (2) is the one exception to "chsum writes nothing to a transcript", and it is
+# an *append* of a record type Claude Code appends constantly — never a rewrite
+# of a line already written, so a concurrent flush has nothing to collide with.
+# Neither step invents anything: the title is argv, verbatim.
+
+NAMES_PATH = DIGEST_DIR.parent / "names.json"
+
+_names_cache: tuple[float, dict[str, str]] | None = None
+
+
+def _load_store() -> dict[str, dict]:
+    """Raw store: uuid → {"title", "was"}. `was` is what Claude Code called it at
+    the moment you renamed, kept so `--clear` can put that record back — otherwise
+    the appended title outlives the name and /resume never reverts."""
+    global _names_cache
+    try:
+        stamp = NAMES_PATH.stat().st_mtime
+    except OSError:
+        return {}
+    if _names_cache and _names_cache[0] == stamp:
+        return _names_cache[1]
+    try:
+        data = json.loads(NAMES_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    store = {}
+    for uuid, val in data.items():
+        entry = val if isinstance(val, dict) else {"title": val}
+        if isinstance(entry.get("title"), str) and entry["title"]:
+            store[uuid] = entry
+    _names_cache = (stamp, store)
+    return store
+
+
+def load_names() -> dict[str, str]:
+    """uuid → your name for it. Cached on mtime: the listing path asks once per
+    session, and 195 re-reads of the same file is the whole cost of `journal`."""
+    return {uuid: entry["title"] for uuid, entry in _load_store().items()}
+
+
+def save_name(uuid: str, title: str | None, was: str = "") -> None:
+    """Write-then-rename, so two sessions renaming at once can't leave a torn
+    file — the store is the only place a name survives Claude Code's next title."""
+    global _names_cache
+    store = dict(_load_store())
+    if title is None:
+        store.pop(uuid, None)
+    else:
+        # `was` is only the *first* rename's title: renaming twice must still
+        # revert to Claude Code's, not to your previous attempt.
+        was = store.get(uuid, {}).get("was", was)
+        store[uuid] = {"title": title, "was": was}
+    NAMES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = NAMES_PATH.with_name(NAMES_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(store, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(NAMES_PATH)
+    _names_cache = None
+
+
+def append_ai_title(path: pathlib.Path, title: str) -> None:
+    """One more `ai-title` record, byte-identical in shape to Claude Code's own.
+
+    Written as a single append of a complete line. The leading newline guard is
+    for the live transcript: reading it mid-flush can find the last line without
+    its terminator, and appending onto that would fuse two records into one
+    unparseable line.
+    """
+    rec = json.dumps({"type": "ai-title", "aiTitle": title, "sessionId": path.stem},
+                     ensure_ascii=False)
+    lead = ""
+    try:
+        if path.stat().st_size:
+            with path.open("rb") as fh:
+                fh.seek(-1, os.SEEK_END)
+                lead = "" if fh.read(1) == b"\n" else "\n"
+    except OSError:
+        pass
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(f"{lead}{rec}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +751,7 @@ def extract_meta(path: pathlib.Path) -> Meta:
         if rec.get("timestamp"):
             stamps.append(rec["timestamp"])
         if rec.get("type") == "ai-title" and rec.get("aiTitle"):
-            meta.title = rec["aiTitle"]  # refined over the session; last wins
+            meta.ai_title = rec["aiTitle"]  # refined over the session; last wins
         if not meta.project and rec.get("cwd"):
             meta.project = rec["cwd"]
         if rec.get("gitBranch"):
@@ -663,6 +761,11 @@ def extract_meta(path: pathlib.Path) -> Meta:
             meta.spawned += _collect_tools(rec, edited, read, cmds)
         if rec.get("type") == "user" and _is_typed_prompt(rec):
             meta.prompts += 1
+    # Yours wins over Claude Code's, and over any later `ai-title` it appends —
+    # that is the point of keeping a store as well as appending one.
+    named = load_names().get(meta.uuid, "")
+    meta.renamed = bool(named)
+    meta.title = named or meta.ai_title or "(untitled)"
     own_edits = set(edited)
 
     # Fold subagent tool use into the parent: a session that delegated everything
@@ -1654,6 +1757,121 @@ def cmd_mark(args) -> int:
     return 0
 
 
+def path_for_ref(ref: str) -> pathlib.Path:
+    """A ref (or a uuid, or a prefix of either) to its transcript.
+
+    Matched against locally derived refs rather than asked of claude-history: the
+    refs `chsum sessions` printed came from the same function, so a paste from the
+    listing resolves here by construction, and renaming costs no subprocess.
+    """
+    want = ref.strip()
+    hits = [p for p in transcripts()
+            if ch_ref_for_path(p).startswith(want) or p.stem.startswith(want)]
+    if not hits:
+        raise SystemExit(f"no conversation matching {ref!r} — see `chsum sessions`")
+    if len(hits) > 1:
+        # Clipped, and titles read only for what's shown: `ch_` alone matches the
+        # whole corpus, and 200 extract_meta calls to say "be more specific" is
+        # both a wall of text and a pause.
+        rows = "\n".join(f"  {ch_ref_for_path(p)}  {extract_meta(p).title}"
+                         for p in hits[:8])
+        more = f"\n  … and {len(hits) - 8} more" if len(hits) > 8 else ""
+        raise SystemExit(f"{ref!r} matches {len(hits)} conversations:\n{rows}{more}")
+    return hits[0]
+
+
+def _name_target(args) -> pathlib.Path:
+    if args.file:
+        path = pathlib.Path(args.file).expanduser().resolve()
+        if not path.exists():
+            raise SystemExit(f"no such transcript: {path}")
+        return path
+    return path_for_ref(args.ref) if args.ref else live_transcript()
+
+
+def cmd_name(args) -> int:
+    """Rename a conversation to what it actually was.
+
+    The ref is optional and leads: `chsum name ch_… "…"` renames that one, a bare
+    `chsum name "…"` renames the session you're in. Told apart by the `ch_` prefix
+    rather than by a flag, because the ref you have was copied from the listing
+    one line above.
+    """
+    words = list(args.words)
+    args.ref = None
+    if words and words[0].startswith("ch_"):
+        # A ref with no title asks what that one is called, exactly as a bare
+        # `chsum name` asks about this one. It can't be read as "rename this
+        # session to ch_…" — nobody titles a session with a ref.
+        args.ref = words.pop(0)
+
+    if args.list:
+        names = load_names()
+        if not names:
+            print("nothing renamed yet", file=sys.stderr)
+            return 1
+        for uuid, title in names.items():
+            path = _path_for_uuid(uuid)
+            print(f"{ch_ref_for_path(path) if path else uuid}  {title}")
+        sys.stdout.flush()  # or the hint lands above what it is a hint about
+        print("\nUndo one: `chsum name <ref> --clear`", file=sys.stderr)
+        return 0
+
+    path = _name_target(args)
+    meta = extract_meta(path)
+    ref = ch_ref_for_path(path)
+
+    if args.clear:
+        if not meta.renamed:
+            print(f"{ref} was never renamed", file=sys.stderr)
+            return 1
+        was = _load_store().get(path.stem, {}).get("was", "")
+        save_name(path.stem, None)
+        # Reverting the store is not enough: the ai-title we appended is the last
+        # one in the file, so /resume would keep showing a name chsum no longer
+        # knows. Put Claude Code's own title back the same way — appended, never
+        # deleted, so both records stay and the later one wins.
+        if was and not args.no_resume:
+            try:
+                append_ai_title(path, was)
+            except OSError:
+                pass
+        print(f"{ref}\n  cleared · {was or meta.ai_title or '(untitled)'}")
+        return 0
+
+    title = " ".join(words).strip()
+    if not title:
+        which = f"{args.ref} " if args.ref else ""
+        print(f"{ref}\n  {meta.title}"
+              f"{' · renamed by you' if meta.renamed else ''}")
+        sys.stdout.flush()  # or the hint lands above what it is a hint about
+        print(f'\n{"Rename it again" if meta.renamed else "Rename it"}: '
+              f'`chsum name {which}"what it actually was"`'
+              + (f'   Back to Claude Code\'s: `chsum name {which}--clear`'
+                 if meta.renamed else ""),
+              file=sys.stderr)
+        return 0
+
+    save_name(path.stem, title, was=meta.ai_title)
+    print(f"{ref}\n  was  {meta.ai_title or '(untitled)'}\n  now  {title}")
+    if args.no_resume:
+        return 0
+    try:
+        append_ai_title(path, title)
+    except OSError as e:
+        print(f"warning: renamed here, but the transcript is unwritable, so "
+              f"/resume keeps its own title ({e})", file=sys.stderr)
+        return 0
+    if path == live_transcript():
+        # Only the store holds for a live session: Claude Code goes on appending
+        # its own ai-title as the conversation grows, and the last one is what
+        # /resume reads.
+        print("note: this session is still running, so Claude Code will title it "
+              "again later — chsum keeps your name, /resume may not.",
+              file=sys.stderr)
+    return 0
+
+
 def latest_transcript(local: bool = True, nth: int = 1) -> pathlib.Path:
     """Nth-most-recent conversation with activity, by last activity not filename.
 
@@ -1734,7 +1952,9 @@ def cmd_sessions(args) -> int:
             str(len(m.edited)),
             str(m.agent_count) if m.agent_count else "-",
             f"⚑{len(m.marks)}" if m.marks else "-",
-            (m.title or "(untitled)") + here,
+            # Marked, because provenance differs: one is Claude Code's reading of
+            # the session, the other is yours.
+            ("✎ " if m.renamed else "") + (m.title or "(untitled)") + here,
         ))
     heads = ("", "dur", "prompts", "files", "agents", "marks")  # dates fill the ref column
     # Widths across every day: columns that shift per group read as separate tables.
@@ -1928,6 +2148,23 @@ def main(argv=None) -> int:
                         "but stop counting)")
     p.add_argument("--file", help="transcript path (default: the session you're in)")
     p.set_defaults(func=cmd_mark)
+
+    p = sub.add_parser(
+        "name", help="rename a conversation to what it actually was",
+        description="Records the name in chsum's own store and appends one "
+                    "`ai-title` record to the transcript, so /resume shows it too. "
+                    "Nothing is invented: the title is your argv, verbatim.",
+    )
+    p.add_argument("words", nargs="*", metavar="[ch_REF] TITLE",
+                   help="the title, quoted verbatim; lead with a ch_... ref to "
+                        "rename a past conversation instead of this one")
+    p.add_argument("--clear", action="store_true",
+                   help="drop your name, back to Claude Code's")
+    p.add_argument("--list", action="store_true", help="every conversation you renamed")
+    p.add_argument("--no-resume", action="store_true",
+                   help="rename in chsum only — leave the transcript, and /resume, alone")
+    p.add_argument("--file", help="transcript path (default: the session you're in)")
+    p.set_defaults(func=cmd_name)
 
     p = sub.add_parser("journal", help="chronological work log")
     p.add_argument("--since", default="7d", help="window, e.g. 7d, 24h, 2w")
