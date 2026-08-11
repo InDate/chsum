@@ -3,8 +3,9 @@
 
 DETERMINISTIC: every line of output is copied verbatim from a transcript or
 computed from it. Digests feed back into future sessions, where an invented
-claim would become ground truth. Prose generation waits behind the `Summariser`
-seam at the bottom.
+claim would become ground truth. Prose generation lives behind the `Summariser`
+seam at the bottom; its one caller is `last --here`, and its output prints
+beneath the verbatim record, labelled model-written.
 
 Commands: sessions (default), last, find, digest, context, mark, journal.
 """
@@ -20,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -911,6 +913,15 @@ def _bullets(items: list[str], limit: int) -> list[str]:
     return out
 
 
+def _timed_bullets(pairs: list[tuple[str, str]], limit: int) -> list[str]:
+    """Same shape as `_bullets`, stamped: `pairs` is (when, text), the overflow
+    line hand-built because `_bullets` itself has no room for a time column."""
+    out = [f"- {_hhmm(when)}  `{text}`" for when, text in pairs[:limit]]
+    if len(pairs) > limit:
+        out.append(f"- …and {len(pairs) - limit} more")
+    return out
+
+
 def _clip(text: str, limit: int, hint: str = "read the anchor") -> str:
     # The hint is a parameter because agent digests have no anchors — pointing at
     # one invites the reader to invent a ref that claude-history will reject.
@@ -920,14 +931,21 @@ def _clip(text: str, limit: int, hint: str = "read the anchor") -> str:
     return text[:limit].rstrip() + f"\n… [+{len(text) - limit} chars, {hint}]"
 
 
-def _dim(text: str) -> str:
-    """Grey for quoted transcript text, so a reason and the message it marks don't
-    read as one voice. Off unless stdout is a terminal: `!` runs get captured, and
-    an escape sequence stored in a transcript is there forever. FORCE_COLOR turns
+def _colour_ok(stream=None) -> bool:
+    """Shared gate for every ANSI-colouring helper below. Off unless the given
+    stream (stdout by default) is a terminal: `!` runs get captured, and an
+    escape sequence stored in a transcript is there forever. FORCE_COLOR turns
     it on anyway, NO_COLOR always wins."""
     if os.environ.get("NO_COLOR"):
-        return text
-    if not (sys.stdout.isatty() or os.environ.get("FORCE_COLOR")):
+        return False
+    stream = sys.stdout if stream is None else stream
+    return bool(stream.isatty() or os.environ.get("FORCE_COLOR"))
+
+
+def _dim(text: str) -> str:
+    """Grey for quoted transcript text, so a reason and the message it marks don't
+    read as one voice."""
+    if not _colour_ok():
         return text
     return f"\033[2m{text}\033[0m"
 
@@ -944,6 +962,97 @@ def _quote(text: str) -> str:
     containing "## Summary" would otherwise forge a section of this document."""
     return "\n".join(f"> {line}" if line.strip() else ">"
                      for line in text.strip().splitlines())
+
+
+_MODEL_WRITTEN_HEADING = "What happened, in order — model-written"
+
+_MD_QUOTE_RE = re.compile(r"^> ?(.*)$")
+_MD_HEADING_RE = re.compile(r"^(#{1,2}) (.*)$")
+_MD_ITALIC_LINE_RE = re.compile(r"^\*(.+)\*$")
+_MD_BULLET_RE = re.compile(r"^- (.*)$")
+# A bullet whose entire content is one code span, optionally led by an HH:MM
+# time — the `_bullets`/`_timed_bullets` shape — gets coloured whole instead of
+# fighting a wrap boundary that might land inside the backticks.
+_MD_BULLET_CODE_RE = re.compile(r"^(?:(\d\d:\d\d)  )?`([^`]+)`$")
+_MD_INLINE_CODE_RE = re.compile(r"`([^`]+)`")
+_MD_INLINE_BOLD_RE = re.compile(r"\*\*([^*]+)\*\*")
+
+
+def _md_inline(segment: str) -> str:
+    """`code`/`**bold**` styling for one already-wrapped segment. The regexes
+    only see this segment, so a pair split across a wrap boundary just leaves
+    its marker literal on both sides — total, never raises (see `_md_ansi`)."""
+    segment = _MD_INLINE_CODE_RE.sub(lambda m: f"\033[36m{m.group(1)}\033[0m", segment)
+    segment = _MD_INLINE_BOLD_RE.sub(lambda m: f"\033[1m{m.group(1)}\033[0m", segment)
+    return segment
+
+
+def _md_ansi(text: str) -> str:
+    """Presentation-only markdown→ANSI for catch-up on a tty (see `_colour_ok`)
+    — the piped/captured document stays exact markdown, byte-identical. Line-based
+    and deliberately simple: this renders quoted transcript text, which can
+    contain anything, so an unmatched line just passes through unchanged and the
+    function can never raise.
+
+    Quote lines are checked first and exclusively — a quoted `## Summary` must
+    stay inside the dim blockquote treatment, not become a heading, the same
+    forgery `_quote` itself guards against.
+
+    Every wrappable line is wrapped as plain text first and coloured second,
+    never the reverse: an ANSI escape inflates `len()`, so `textwrap` handed
+    already-coloured text would measure the wrong width and wrap on the wrong
+    column (or split an escape in half). Headings are the one exception — short
+    by construction, so they're never wrapped at all."""
+    cols = max(40, min(shutil.get_terminal_size((100, 24)).columns, 88))
+    out = []
+    for line in text.split("\n"):
+        if not line.strip():
+            out.append(line)
+            continue
+        m = _MD_QUOTE_RE.match(line)
+        if m:
+            # The bar rides every continuation, initial and subsequent alike —
+            # a folded quote that lost it on line two would read as prose.
+            content = m.group(1)
+            if not content.strip():
+                out.append("\033[2m│\033[0m")
+                continue
+            wrapped = textwrap.wrap(content, cols, initial_indent="│ ",
+                                     subsequent_indent="│ ") or ["│ "]
+            out.extend(f"\033[2m{wl}\033[0m" for wl in wrapped)
+            continue
+        m = _MD_HEADING_RE.match(line)
+        if m:
+            rest = m.group(2)
+            colour = "\033[1;33m" if rest == _MODEL_WRITTEN_HEADING else "\033[1m"
+            out.append(f"{colour}{rest}\033[0m")
+            continue
+        m = _MD_ITALIC_LINE_RE.match(line)
+        if m:
+            wrapped = textwrap.wrap(m.group(1), cols) or [""]
+            out.extend(f"\033[2m{wl}\033[0m" for wl in wrapped)
+            continue
+        m = _MD_BULLET_RE.match(line)
+        if m:
+            content = m.group(1)
+            cm = _MD_BULLET_CODE_RE.match(content)
+            if cm:
+                prefix = "- " + (cm.group(1) + "  " if cm.group(1) else "")
+                indent = " " * len(prefix)
+                wrapped = textwrap.wrap(cm.group(2), cols, initial_indent=prefix,
+                                         subsequent_indent=indent) or [prefix]
+                out.extend(f"{wl[:len(prefix)]}\033[36m{wl[len(prefix):]}\033[0m"
+                           for wl in wrapped)
+                continue
+            # Any other bullet: two-space hanging indent so continuations align
+            # under the text, not under the "- " marker.
+            wrapped = textwrap.wrap(content, cols, initial_indent="- ",
+                                     subsequent_indent="  ") or ["- "]
+            out.extend(wl[:2] + _md_inline(wl[2:]) for wl in wrapped)
+            continue
+        wrapped = textwrap.wrap(line, cols) or [line]
+        out.extend(_md_inline(wl) for wl in wrapped)
+    return "\n".join(out)
 
 
 def frontmatter(meta: Meta, ref: str) -> str:
@@ -1923,7 +2032,423 @@ def latest_transcript(local: bool = True, nth: int = 1) -> pathlib.Path:
                      if seen else f"no conversations found in {where}")
 
 
+# ---------------------------------------------------------------------------
+# Catch-up: `last --here`
+# ---------------------------------------------------------------------------
+# The running session, since the last thing you typed — for glancing at a second
+# terminal while Claude works. Raw JSONL throughout: claude-history's read of a
+# live transcript lags the file, and this view exists to be current. It is still
+# a snapshot — Claude Code flushes behind the screen, so the newest work may not
+# have landed yet.
+
+
+@dataclass
+class _Event:
+    when: str  # ISO timestamp, verbatim
+    agent: str  # sidecar id; "" for the parent transcript
+    kind: str  # said / ran / edit / output / spawn / tool
+    text: str
+
+
+def _typed_text(rec: dict) -> str:
+    """Only the parts you typed. The harness rides `<system-reminder>` blocks in
+    the same record as a prompt, and `_record_text` would quote them with it."""
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, str):
+        texts = [content]
+    elif isinstance(content, list):
+        texts = [p.get("text", "") for p in content
+                 if isinstance(p, dict) and p.get("type") == "text"]
+    else:
+        return ""
+    return "\n".join(t for t in texts if is_real_prompt(t)).strip()
+
+
+def _last_prompt(path: pathlib.Path) -> tuple[int, dict] | None:
+    """Line and record of the last thing you typed — the catch-up anchor.
+
+    `<bash-…>` records are excluded: a `!` run is something you did, not something
+    you said, and anchoring to one would catch up from its own footprint.
+    """
+    found = None
+    for lineno, raw in enumerate(path.read_text(errors="replace").splitlines(), start=1):
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict) or rec.get("type") != "user":
+            continue
+        text = _typed_text(rec)
+        if text and not text.startswith("<bash-"):
+            found = (lineno, rec)
+    return found
+
+
+def _tool_event(part: dict) -> tuple[str, str]:
+    """(kind, text) for one tool_use block."""
+    name, inp = str(part.get("name") or "?"), part.get("input") or {}
+    if name == "Bash" and isinstance(inp.get("command"), str):
+        return "ran", _clip_line(inp["command"], 200)
+    if name in _FILE_TOOLS and isinstance(inp.get("file_path"), str):
+        # The edited text rides along verbatim: it is what the summariser reads
+        # function names out of, instead of chsum parsing code.
+        bits = [inp["file_path"]]
+        for key, label, lim in (("old_string", "was", 400), ("new_string", "now", 900),
+                                ("content", "now", 900)):
+            if isinstance(inp.get(key), str) and inp[key].strip():
+                bits.append(f"--- {label} ---\n{_clip(inp[key], lim, 'clipped')}")
+        return "edit", "\n".join(bits)
+    if name in _AGENT_TOOLS:
+        desc, prompt = str(inp.get("description") or ""), str(inp.get("prompt") or "")
+        return "spawn", _clip_line(f"{desc}: {prompt}" if desc else prompt, 400)
+    detail = next((inp[k].strip().splitlines()[0]
+                   for k in ("file_path", "command", "description", "pattern", "query", "path")
+                   if isinstance(inp.get(k), str) and inp[k].strip()), "")
+    return "tool", f"{name}: {detail}" if detail else name
+
+
+def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str) -> list[_Event]:
+    """Everything after your prompt, transcript and sidecars merged by timestamp.
+
+    Sidecars filter by time, not line — two files' line numbers don't order
+    against each other, and an agent spawned before the prompt may still be
+    working after it. Bash tool_use ids are tracked from the top of each file so
+    a result landing after the prompt still resolves to its command.
+    """
+    events: list[_Event] = []
+    for src, agent in mark_sources(path):
+        pending: set[str] = set()
+        for lineno, raw in enumerate(src.read_text(errors="replace").splitlines(), start=1):
+            try:
+                rec = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(rec, dict) or rec.get("type") not in ("user", "assistant"):
+                continue
+            ts = str(rec.get("timestamp") or "")
+            live = (lineno > anchor_line) if src == path else (ts > anchor_ts)
+            content = (rec.get("message") or {}).get("content")
+            if isinstance(content, str) and live and rec["type"] == "assistant":
+                if content.strip() and not notice_kind(content):
+                    events.append(_Event(ts, agent, "said", _clip(content, 600, "clipped")))
+                continue
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text" and live and rec["type"] == "assistant":
+                    t = part.get("text", "").strip()
+                    if t and not notice_kind(t):
+                        events.append(_Event(ts, agent, "said", _clip(t, 600, "clipped")))
+                elif part.get("type") == "tool_use":
+                    if part.get("name") == "Bash":
+                        pending.add(str(part.get("id") or ""))
+                    if live:
+                        events.append(_Event(ts, agent, *_tool_event(part)))
+                elif (part.get("type") == "tool_result" and live
+                        and part.get("tool_use_id") in pending):
+                    # Bash results only: they carry verdicts (tests, builds). Read
+                    # results are file dumps. The tail, because that's where the
+                    # verdict line is.
+                    body = part.get("content")
+                    if isinstance(body, list):
+                        body = "\n".join(b.get("text", "") for b in body
+                                         if isinstance(b, dict) and b.get("type") == "text")
+                    if isinstance(body, str) and body.strip():
+                        out = body.strip()
+                        head = f"[tail of {len(out)} chars] " if len(out) > 400 else ""
+                        events.append(_Event(ts, agent, "output", head + out[-400:]))
+    # Stable, so a record's own blocks stay in the order they were emitted.
+    events.sort(key=lambda e: e.when)
+    return events
+
+
+def _catchup_material(prompt_ts: str, prompt_text: str, events: list[_Event],
+                      omitted: int = 0) -> str:
+    """The extract a summariser sees: the prompt, then one entry per event.
+    Verbatim throughout — the model's only source, so nothing outside it can
+    leak into the timeline."""
+    lines = [f"USER PROMPT ({prompt_ts}):", prompt_text, "",
+             "EVENTS since, oldest first ('agent <id>' = inside a subagent):"]
+    if omitted:
+        lines.append(f"[{omitted} events omitted from the middle for length]")
+    for e in events:
+        who = f" agent {e.agent[:8]}" if e.agent else ""
+        # Local clock, not the raw UTC slice: the human-facing sections above use
+        # `_hhmm` (local), and a model copying a time out of this extract has to
+        # land on the same clock as the header beside it.
+        head = f"[{_hhmmss(e.when)}]{who} {e.kind}:"
+        if "\n" in e.text:
+            lines.append(head)
+            lines += ["  " + ln for ln in e.text.splitlines()]
+        else:
+            lines.append(f"{head} {e.text}")
+    return "\n".join(lines)
+
+
+def _hhmm(ts: str) -> str:
+    t = _parse_ts(ts)
+    return t.astimezone().strftime("%H:%M") if t else "??:??"
+
+
+def _hhmmss(ts: str) -> str:
+    """Local clock, seconds included — the extract's per-event stamps, so a time
+    the model copies out of it agrees with `_hhmm`'s local-clock headers beside
+    it instead of the raw UTC the JSONL stores."""
+    t = _parse_ts(ts)
+    return t.astimezone().strftime("%H:%M:%S") if t else "??:??:??"
+
+
+def _ago(ts: str, mtime: float) -> str:
+    """Coarse age for the picker (`8s ago` … `3w ago`). `ts` is the conversation's
+    own clock (`last_activity`) when it has one; empty string falls back to
+    `mtime`, same fallback its caller already needs for `_pick_transcript`."""
+    t = _parse_ts(ts) if ts else None
+    secs = max(0.0, time.time() - (t.timestamp() if t else mtime))
+    for n, unit in ((60, "s"), (60, "m"), (24, "h"), (7, "d")):
+        if secs < n:
+            return f"{int(secs)}{unit} ago"
+        secs /= n
+    return f"{int(secs)}w ago"
+
+
+def _pick_transcript() -> pathlib.Path:
+    """`last --here`'s picker — used only here. `live_transcript` itself stays
+    untouched: `mark` and `name` depend on its silent newest-file fallback and
+    must keep that behaviour exactly.
+
+    A picker only makes sense at an interactive terminal: `CLAUDE_CODE_SESSION_ID`
+    already answers the question unambiguously, and a script or `!` run blocking
+    on `input()` is a hang, not a feature. Anything non-interactive — no tty on
+    stdin, or stderr not a tty to draw the list on — falls through to
+    `live_transcript()` byte-for-byte.
+    """
+    if os.environ.get("CLAUDE_CODE_SESSION_ID", "") or not (
+        sys.stdin.isatty() and sys.stderr.isatty()
+    ):
+        return live_transcript()
+    cands = transcripts(local=True)
+    if not cands:
+        return live_transcript()  # let its own "no conversation" error fire
+
+    def recency(p: pathlib.Path) -> tuple[str, float]:
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        return (last_activity(p), mtime)
+
+    # Same key `latest_transcript` sorts by, ascending instead of reverse: oldest
+    # first, newest last — the newest sits at the bottom, beside the prompt.
+    ranked = sorted(cands, key=recency)[-8:]
+    rows = []
+    for p in ranked:
+        m = extract_meta(p)
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        age = _ago(last_activity(p), mtime)
+        title = ("✎ " if m.renamed else "") + (m.title or "(untitled)")
+        rows.append((age, m.duration or "-", title))
+    default = len(ranked)  # newest = last row = the one Enter picks
+    idx_w, age_w, dur_w = len(str(default)), max(len(r[0]) for r in rows), \
+        max(len(r[1]) for r in rows)
+    # This function only runs at a tty by construction (see docstring), but
+    # NO_COLOR must still win — and it's stderr being drawn to here, not
+    # stdout, so `_colour_ok` needs telling which stream to ask.
+    bold, dim, reset = ("\033[1m", "\033[2m", "\033[0m") if _colour_ok(sys.stderr) else ("", "", "")
+    # Capped, same pattern as `cmd_sessions`: an unclipped title wraps at the
+    # terminal's own column 0 and reads as a second row, not a folded one.
+    cols = max(40, min(shutil.get_terminal_size((100, 24)).columns, 88))
+    title_w = max(10, cols - (idx_w + age_w + dur_w + 8))
+    for i, (age, dur, title) in enumerate(rows, start=1):
+        idx = f"{bold}{i:>{idx_w}}{reset}"
+        age_c = f"{dim}{age:<{age_w}}{reset}"
+        dur_c = f"{dim}{dur:<{dur_w}}{reset}"
+        print(f"  {idx}  {age_c}  {dur_c}  {_clip_line(title, title_w)}", file=sys.stderr)
+    # Prompt written ourselves, not passed to input(), so it can't leak to stdout
+    # (stdout is the document — see the module docstring).
+    print(f"which session? [{bold}{default}{reset}]: ", end="", file=sys.stderr, flush=True)
+    try:
+        raw = input().strip()
+    except EOFError:
+        raw = ""
+    if not raw:
+        return ranked[default - 1]
+    if raw.isdigit() and 1 <= int(raw) <= len(ranked):
+        return ranked[int(raw) - 1]
+    raise SystemExit(f"not a session number: {raw!r}")
+
+
+_CATCHUP_HINT = "the transcript has the rest"
+
+
+def _status(msg: str) -> None:
+    """A transient one-line stderr narration of which phase catch-up is in.
+    Gated on the tty, not just "not captured": stdout is the document — it has
+    to come out byte-identical whether piped, redirected, or run via `!` — so
+    the only safe place for progress chatter is stderr, and only when a human
+    is actually watching it flicker. Dim, like `_dim`'s quoted text — secondary,
+    not the record — but the tty check above already implies `_colour_ok`
+    except for NO_COLOR, so this only needs to check that."""
+    if sys.stderr.isatty():
+        text = f"\033[2m{msg}\033[0m" if _colour_ok(sys.stderr) else msg
+        sys.stderr.write(f"\r{text}\033[K")
+        sys.stderr.flush()
+
+
+def _clear_status() -> None:
+    if sys.stderr.isatty():
+        sys.stderr.write("\r\033[K")
+        sys.stderr.flush()
+
+
+class _Ticker:
+    """Elapsed-time status while `HaikuSummariser.timeline` sits inside a
+    blocking `subprocess.run`. There's no real progress to report — a daemon
+    thread that reprints "still going" every couple of seconds is the
+    cheapest honest liveness signal short of rewriting the backend around
+    Popen (and feeding it 40KB of stdin without deadlocking)."""
+
+    def __init__(self, label: str):
+        self._label = label
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        start = time.monotonic()
+        while not self._stop.wait(2):
+            _status(f"… {self._label} ({int(time.monotonic() - start)}s)")
+
+    def __enter__(self) -> "_Ticker":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1)
+        _clear_status()
+
+
+def cmd_catchup(args) -> int:
+    # Colour is presentation only, and only for a human watching a tty: bytes
+    # piped or captured must stay exact markdown, so this checks once and the
+    # print sites below just call it.
+    def out(text: str, **kw) -> None:
+        print(_md_ansi(text) if _colour_ok() else text, **kw)
+
+    # Pick before the status line starts: `_status` writes `\r...\033[K` to
+    # stderr, which would garble the picker's own rendering there.
+    path = _pick_transcript()
+    _status("reading the live transcript…")
+    meta = extract_meta(path)
+    anchor = _last_prompt(path)
+    if not anchor:
+        _clear_status()
+        raise SystemExit("nothing typed in this conversation yet — no prompt to catch up from")
+    anchor_line, anchor_rec = anchor
+    prompt_text = _typed_text(anchor_rec)
+    anchor_ts = str(anchor_rec.get("timestamp") or "")
+
+    # Header and your own prompt need nothing but the anchor, so they print
+    # before the (slower) event walk — the first thing on screen is what you
+    # typed, not silence.
+    _clear_status()
+    header = [f"# Catch-up — {meta.title}"]
+    bits = [meta.project_name, f"your prompt at {_hhmm(anchor_ts)}",
+            f"snapshot at {datetime.now().astimezone().strftime('%H:%M')} — "
+            "the transcript trails the live screen"]
+    header.append(f"*{' · '.join(bits)}*\n")
+    header.append(f"## You said ({_hhmm(anchor_ts)})\n")
+    header.append(_quote(_clip(prompt_text, 500, _CATCHUP_HINT)) + "\n")
+    out("\n".join(header), flush=True)
+
+    _status("reading the live transcript…")
+    events = _events_since(path, anchor_line, anchor_ts)
+    _status(f"{_plural(len(events), 'event')} since {_hhmm(anchor_ts)}")
+
+    if not events:
+        _clear_status()
+        out("*Nothing recorded since — either it just started, or the "
+            "transcript hasn't caught up yet.*", flush=True)
+        return 0
+
+    edited, cmds, agents_seen = [], [], []
+    cmd_times: dict[str, str] = {}  # first occurrence's time — a rerun keeps its earliest stamp
+    for e in events:
+        if e.kind == "edit":
+            edited.append(e.text.splitlines()[0])
+        elif e.kind == "ran" and _is_notable_command(e.text):
+            cmds.append(e.text)
+            cmd_times.setdefault(e.text, e.when)
+        if e.agent and e.agent not in agents_seen:
+            agents_seen.append(e.agent)
+    keep = lambda fs: _dedupe(_relpath(f, meta.project) for f in fs if _is_project_file(f))
+    edited, cmds = keep(edited), _dedupe(cmds)
+
+    span = ""
+    if events and anchor_ts:
+        a, b = _parse_ts(anchor_ts), _parse_ts(events[-1].when)
+        if a and b:
+            span = _fmt_secs(max(0, int((b - a).total_seconds())))
+
+    since = [f"## Since then — {_plural(len(events), 'event')}"
+             + (f" over {span}" if span else "") + "\n"]
+    if edited:
+        since.append("Files changed:")
+        since += _bullets(edited, 12) + [""]
+    if cmds:
+        since.append("Commands:")
+        since += _timed_bullets([(cmd_times[c], c) for c in cmds], 8) + [""]
+    if agents_seen:
+        desc = {r.id: r.description for r in meta.agents}
+        since.append("Agents at work:")
+        since += [f"- `{a}`" + (f"  {desc[a]}" if desc.get(a) else "") for a in agents_seen]
+        since.append("")
+
+    said = [e for e in events if e.kind == "said"]
+    if said:
+        last = said[-1]
+        who = f" (agent {last.agent[:8]})" if last.agent else ""
+        since.append(f"## Last thing Claude said{who} ({_hhmm(last.when)})\n")
+        since.append(_quote(last.text) + "\n")
+
+    _clear_status()
+    out("\n".join(since), flush=True)
+
+    material = _catchup_material(anchor_ts, prompt_text, events)
+    omitted, kept = 0, list(events)
+    while len(material) > 40_000 and len(kept) > 12:
+        # Drop from the early middle: the opening shows what was set up, the tail
+        # is what you're catching up to.
+        kept.pop(len(kept) // 3)
+        omitted += 1
+        material = _catchup_material(anchor_ts, prompt_text, kept, omitted)
+
+    # Last, beneath everything verbatim, so a wrong sentence sits next to the
+    # quotes and computed lists that would contradict it.
+    timeline = [f"## {_MODEL_WRITTEN_HEADING}\n",
+                "*The one non-verbatim section chsum prints: written by "
+                f"`claude -p --model {HaikuSummariser.model}` from a verbatim extract "
+                "of the events above. Where it and the transcript disagree, the "
+                "transcript wins."
+                + (f" Extract clipped: {omitted} events omitted." if omitted else "")
+                + "*\n"]
+    try:
+        with _Ticker("haiku is writing the timeline"):
+            timeline.append(HaikuSummariser().timeline(material))
+    except SummariserError as e:
+        # _Ticker.__exit__ already cleared the status line on the way out.
+        timeline.append(f"*Timeline unavailable — {e}. Everything above is still verbatim.*")
+    out("\n".join(timeline).rstrip())
+    return 0
+
+
 def cmd_last(args) -> int:
+    if args.here:
+        return cmd_catchup(args)
     args.file = str(latest_transcript(local=not args.all, nth=args.nth))
     args.ref = None
     return cmd_context(args)
@@ -2114,21 +2639,76 @@ def cmd_journal(args) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Summariser seam — deliberately empty for now
+# Summariser seam
 # ---------------------------------------------------------------------------
 
 
-class Summariser:
-    """Where prose generation plugs in. Nothing above needs a model, and nothing
-    above should change when one arrives.
+class SummariserError(RuntimeError):
+    pass
 
-    A backend gets the extracted material (intent trail, last exchange), never the
-    raw transcript, and its output is additive — layered on top of the verbatim
-    record so a wrong sentence can be checked against the quotes beneath it.
+
+class Summariser:
+    """Where prose generation plugs in. The deterministic record never needs a
+    model; a backend gets extracted material (never a raw transcript), and its
+    output is additive — printed beneath the verbatim record, labelled
+    model-written, so a wrong sentence can be checked against the quotes above.
     """
 
-    def summarise(self, meta: Meta, msgs: list[Message]) -> str:
+    def timeline(self, material: str) -> str:
         raise NotImplementedError("no summariser backend configured")
+
+
+_TIMELINE_PROMPT = """\
+Below is a verbatim extract from a Claude Code session that is still running:
+the user's last prompt, then every recorded event since — assistant messages,
+tool calls, file edits (with the edited text), commands and the tail of their
+output, subagent activity — oldest first.
+
+Write a factual timeline of what has happened since the prompt, as a markdown
+bullet list, oldest first. Hard rules:
+- State only what the extract shows. If it is not in the extract, it does not
+  go in the timeline.
+- Name files, and the functions or methods the edited text shows being
+  changed. Copy identifiers exactly.
+- Report outcomes only as recorded ("pytest printed 4 passed"), never as a
+  judgement ("successfully", "correctly", "works").
+- Start each bullet with the HH:MM time of the first event it covers, copied
+  from the extract (drop the seconds).
+- No opinions, no advice, no guesses about intent, no closing summary.
+- Merge steps that serve one change into one bullet; 5-15 bullets total.
+- Do not use any tools; answer from the extract alone.
+Reply with only the bullet list.
+"""
+
+
+class HaikuSummariser(Summariser):
+    """Shells out to `claude -p --model haiku`: no SDK (`dependencies` stays
+    empty), no key handling — the user's existing Claude Code auth signs the
+    call. Run from chsum's own state dir, because a print-mode run records a
+    session of its own, and run from the project it would list as a session of
+    *that* project.
+    """
+
+    model = "haiku"
+
+    def timeline(self, material: str) -> str:
+        exe = shutil.which("claude")
+        if not exe:
+            raise SummariserError("claude CLI not on PATH")
+        cwd = DIGEST_DIR.parent
+        cwd.mkdir(parents=True, exist_ok=True)
+        try:
+            proc = subprocess.run(
+                [exe, "-p", "--model", self.model],
+                input=f"{_TIMELINE_PROMPT}\n{material}",
+                capture_output=True, text=True, timeout=240, cwd=cwd,
+            )
+        except subprocess.TimeoutExpired:
+            raise SummariserError("claude -p timed out after 240s") from None
+        if proc.returncode != 0 or not proc.stdout.strip():
+            err = (proc.stderr or proc.stdout).strip().splitlines()
+            raise SummariserError(err[0][:200] if err else "claude -p printed nothing")
+        return proc.stdout.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -2140,7 +2720,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="chsum",
         description="Work logs and reload-ready context from Claude Code conversations. "
-                    "Fully deterministic: no model, nothing invented.",
+                    "Deterministic: nothing invented. The one model-written section "
+                    "(`last --here`'s timeline) is labelled as such.",
     )
     ap.add_argument("--out", type=pathlib.Path, default=DIGEST_DIR,
                     help=f"digest directory (default: {DIGEST_DIR})")
@@ -2157,6 +2738,9 @@ def main(argv=None) -> int:
     p.add_argument("-n", "--nth", type=int, default=1, metavar="N",
                    help="Nth most recent instead of the last (default: 1)")
     p.add_argument("--all", action="store_true", help="all projects (default: this one)")
+    p.add_argument("--here", action="store_true",
+                   help="the session running right now: what has happened since "
+                        "your last prompt, ending in a model-written timeline")
     p.set_defaults(func=cmd_last)
 
     p = sub.add_parser("find", help="search conversations")
