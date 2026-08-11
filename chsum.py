@@ -230,6 +230,17 @@ def is_real_prompt(text: str) -> bool:
     return not any(m in t for m in _NOISE_MARKERS)
 
 
+def is_typed_prompt(text: str) -> bool:
+    """`is_real_prompt`, minus `!` runs: `<bash-input>` and its captured output
+    land in the user role but are something you did, not something you said.
+    Everywhere prompts are counted or quoted uses this; the mark paths stay on
+    `is_real_prompt`, because a `!` run must remain visible there — it is how
+    marks are typed at all. Without this, a session holding nothing but a
+    `chsum last` run reads as two prompts, `last` picks it over the real work,
+    and the next digest quotes a digest."""
+    return is_real_prompt(text) and not text.lstrip().startswith("<bash-")
+
+
 # Steering turns that carry no standalone meaning. Measured on the corpus: ~31% of
 # prompts in conversational sessions are these, and listed in a trail they read as
 # noise ("yes", "ok, do that"). They're counted rather than shown.
@@ -848,7 +859,8 @@ def _relpath(path: str, project: str) -> str:
 
 def _is_typed_prompt(rec: dict) -> bool:
     """A user record carrying text the human actually wrote. Most user-role records
-    are tool_results; the rest is harness scaffolding (interrupts, notifications)."""
+    are tool_results; the rest is harness scaffolding (interrupts, notifications)
+    and `!` runs (see `is_typed_prompt`)."""
     content = (rec.get("message") or {}).get("content")
     if isinstance(content, str):
         texts = [content]
@@ -857,7 +869,7 @@ def _is_typed_prompt(rec: dict) -> bool:
                  if isinstance(p, dict) and p.get("type") == "text"]
     else:
         return False
-    return any(is_real_prompt(t) for t in texts)
+    return any(is_typed_prompt(t) for t in texts)
 
 
 def _dedupe(items) -> list[str]:
@@ -1228,7 +1240,7 @@ def render_agent_digest(meta: Meta, parent_ref: str, run: AgentRun) -> str:
 
 def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
                   prompt_clip: int = 300, max_prompts: int = 25) -> str:
-    typed = [m for m in msgs if m.role == "user" and is_real_prompt(m.text)]
+    typed = [m for m in msgs if m.role == "user" and is_typed_prompt(m.text)]
     prompts = [m for m in typed if is_substantive(m.text)]
     steering = len(typed) - len(prompts)
     parts = [frontmatter(meta, ref), ""]
@@ -1390,7 +1402,7 @@ def _last_exchange(msgs: list[Message]) -> list[Message]:
     """Final real user prompt and the final assistant reply — the 'where was I' signal."""
     out = []
     for m in reversed(msgs):
-        if m.role == "user" and is_real_prompt(m.text):
+        if m.role == "user" and is_typed_prompt(m.text):
             out.append(m)
             break
     final, _ = last_said(msgs)
@@ -2067,8 +2079,8 @@ def _typed_text(rec: dict) -> str:
 def _last_prompt(path: pathlib.Path) -> tuple[int, dict] | None:
     """Line and record of the last thing you typed — the catch-up anchor.
 
-    `<bash-…>` records are excluded: a `!` run is something you did, not something
-    you said, and anchoring to one would catch up from its own footprint.
+    `<bash-…>` records are excluded (`is_typed_prompt`): anchoring to a `!` run
+    would catch up from its own footprint.
     """
     found = None
     for lineno, raw in enumerate(path.read_text(errors="replace").splitlines(), start=1):
@@ -2079,7 +2091,7 @@ def _last_prompt(path: pathlib.Path) -> tuple[int, dict] | None:
         if not isinstance(rec, dict) or rec.get("type") != "user":
             continue
         text = _typed_text(rec)
-        if text and not text.startswith("<bash-"):
+        if text and is_typed_prompt(text):
             found = (lineno, rec)
     return found
 
