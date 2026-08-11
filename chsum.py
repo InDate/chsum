@@ -2089,6 +2089,21 @@ def cmd_journal(args) -> int:
                 print(f"⚑ {mk.reason}")
             if m.marks:
                 print()
+            # Same five-then-count as the listing. A week's log is mostly a
+            # question of what got worked on, and "2 agents" doesn't answer it.
+            for run in m.agents[:5]:
+                bits = [b for b in (run.duration,
+                                    f"{_plural(len(run.edited), 'file')}"
+                                    if run.edited else "",
+                                    f"{_plural(len(run.commands), 'command')}"
+                                    if run.commands and not run.edited else "") if b]
+                print(f"↳ {run.description or run.id}"
+                      + (f" ({', '.join(bits)})" if bits else ""))
+            if m.agent_count > len(m.agents[:5]):
+                # agent_count can exceed the sidecars there are names for.
+                print(f"↳ …and {m.agent_count - len(m.agents[:5])} more")
+            if m.agent_count:
+                print()
             if m.edited:
                 print(f"Changed {len(m.edited)} file(s): "
                       + ", ".join(f"`{f}`" for f in m.edited[:6])

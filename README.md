@@ -174,7 +174,9 @@ Claude Code's own title back as another appended record, so `/resume` reverts to
 
 A subagent's edits and commands fold into its parent's totals — otherwise a
 session that delegated everything reads as no activity. Files no parent turn
-touched are marked `(agent)`. Each agent gets a line in **Delegated**, and an
+touched are marked `(agent)`. Each agent gets a line in **Delegated**, and its
+task shows in the listing and in `journal` too — five deep, then a count, since
+"3 agents" says nothing about a session that delegated its work. Each has an
 address:
 
 ```sh
