@@ -15,7 +15,7 @@ on as fact.
 
 | Command | For |
 |---|---|
-| `chsum` | List this project's sessions (default). `-n 5`, `--since 7d`, `--all` |
+| `chsum` | List this project's five most recent sessions (default). `-n 25`, `--since 7d`, `--all` |
 | `chsum last` | Digest of the most recent session with activity. `-n 2` for the one before |
 | `chsum find "<query>"` | Find a session by content. `--lexical` for identifiers/filenames/errors |
 | `chsum context <ref>` | Full digest, for reloading into the conversation |

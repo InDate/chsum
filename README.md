@@ -84,8 +84,8 @@ you never agreed to.
 ## Usage
 
 ```sh
-chsum                                          # every session in this project, one line each
-chsum -n 5                                     # just the five most recent
+chsum                                          # the five most recent in this project
+chsum -n 25                                    # more of them; 0 for all
 chsum --since 7d                               # only the last week
 chsum --all                                    # across every project
 chsum last                                     # most recent real session, as context
@@ -115,8 +115,10 @@ Thu 06 Aug 2026                        dur    prompts  files  agents  marks
     ↳ Plan 3D house model from floor plan photographs
 
 Wed 05 Aug 2026
-  ch_da4e99d42e5efab11ebdedc22fb65145  3h03m  30       12     5       -
+  ch_da4e99d42e5efab11ebdedc22fb65145  3h03m  30       12     2       -
     ↳ Set up cdp-tools server
+      a43c4ff4401ca693e  Weed noise from the test suite
+      a81d77b6cba4a46b3  Fix standby setpoint tracking
   ch_b99f11b7c257dafc8b93f53480ba3804  6s     1        0      -       -
     ↳ (untitled)
 ```
@@ -126,6 +128,12 @@ often a session you abandoned after one prompt. Dead ends are listed, not hidden
 — that a session went nowhere is the answer to "where did that work go". The
 header counts them: *no activity* is no file, no notable command, no agent, and
 one prompt.
+
+Subagents are named, not just counted, because "3 agents" says nothing about a
+session that delegated its work — and the id is the one `chsum context
+<ref>/<id>` takes. Five deep, then a count. Five sessions too, by default: the
+listing is usually read into a context window, and `-n 0 --all` is the whole
+corpus.
 
 `chsum last` is `chsum context` on the most recent session with activity, ordered
 by last activity so one you resumed yesterday beats one you started last week.

@@ -1975,6 +1975,14 @@ def cmd_sessions(args) -> int:
         # appending, so counts and duration are behind by however much of the
         # conversation has not been flushed yet.
         here = " · this session (in progress)" if m.path.stem == live else ""
+        # Named, not just counted: "3 agents" is the least useful thing to say
+        # about a session that delegated its work. Ids in full — `chsum context
+        # <ref>/<id>` matches exactly, so a clipped one wouldn't resolve.
+        delegated = [f"{r.id}  {_clip_line(r.description, cols - len(r.id) - 8)}"
+                     if r.description else r.id for r in m.agents[:5]]
+        if m.agent_count > len(delegated):
+            # agent_count can exceed the sidecars we can name (Meta.agent_count).
+            delegated.append(f"…and {m.agent_count - len(delegated)} more")
         by_day[(m.ended or m.started or "")[:10] or "undated"].append((
             ch_ref_for_path(m.path),
             m.duration or "-",
@@ -1985,6 +1993,7 @@ def cmd_sessions(args) -> int:
             # Marked, because provenance differs: one is Claude Code's reading of
             # the session, the other is yours.
             ("✎ " if m.renamed else "") + (m.title or "(untitled)") + here,
+            delegated,  # past the width calculation, which stops at `heads`
         ))
     heads = ("", "dur", "prompts", "files", "agents", "marks")  # dates fill the ref column
     # Widths across every day: columns that shift per group read as separate tables.
@@ -2004,6 +2013,8 @@ def cmd_sessions(args) -> int:
             # as the next session.
             print(_dim("\n".join(textwrap.wrap(r[6], cols, initial_indent="    ↳ ",
                                                subsequent_indent="      "))))
+            for line in r[7]:
+                print(_dim(f"      {line}"))
         print()
     sys.stdout.flush()
     print("Read one: `chsum context <ref>`   Most recent real session: `chsum last`",
@@ -2121,8 +2132,8 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd")
 
     p = sub.add_parser("sessions", help="one line per conversation in this project (the default)")
-    p.add_argument("-n", "--limit", type=int, default=25, metavar="N",
-                   help="how many to list, 0 for all (default: 25)")
+    p.add_argument("-n", "--limit", type=int, default=5, metavar="N",
+                   help="how many to list, 0 for all (default: 5)")
     p.add_argument("--since", default=None, help="window, e.g. 7d, 24h, 2w (default: all time)")
     p.add_argument("--all", action="store_true", help="all projects (default: this one)")
     p.set_defaults(func=cmd_sessions)
