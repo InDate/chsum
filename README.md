@@ -146,7 +146,9 @@ Run from inside Claude Code, the session doing the running is excluded.
 `chsum last --here` is the opposite case: the session that's excluded above,
 caught mid-run. Run it from a second terminal while Claude works. It anchors on
 the last thing you typed, then shows everything since — files changed, commands
-run, agents at work — each verbatim or computed, same as the rest of chsum. It
+run, agents at work, and what went wrong — each verbatim or computed, same as
+the rest of chsum. Failures get their own section, quoted from the actual error
+text, because that is usually what you came back to find out. It
 ends in the one section chsum prints that isn't: a timeline written by `claude -p
 --model haiku` from a verbatim extract of those events, printed beneath the
 verbatim record and labelled model-written, so a wrong sentence can be checked
@@ -158,8 +160,96 @@ running, so it lists the project's recent sessions and asks — newest at the
 bottom, next to the prompt, and Enter takes that one. Inside the session itself,
 or piped, there's no prompt to show: it just picks.
 
+The timeline is written by several small, independent `claude -p` calls, not
+one big one — the events are split into chunks (at your own turn boundaries
+for `recap`, by size alone here) and each chunk gets its own call, run in
+parallel, none of them seeing another's material or output. `--dry-run` makes
+no model call: you get the verbatim record as usual, then a breakdown of what
+each chunk would cost, by where its tokens come from (edits, command output,
+what Claude said) and the largest single events. Character counts are
+measured off the exact text that would be piped in; the token figures are
+chars/4, hence the `~`. It also states the fixed cost of the call itself —
+`claude -p` sends its own system prompt and tool definitions unless told not
+to, so chsum strips them (`--tools ""`, `--setting-sources ""`) and supplies
+its own short instructions via `--system-prompt`, which brings that fixed
+cost down to ~158 tokens *per call*, counted once for every chunk that
+actually runs.
+
+```sh
+chsum last --here --dry-run                    # what would this cost, and why
+```
+
+After a real run, the terminal gets one line of what it actually cost, summed
+across every chunk call — total input, cache reads and cache writes
+separately, output, elapsed, and how the estimate compared. Measured from the
+calls' own accounting, not guessed. It goes to stderr like the rest of the
+progress chatter, so a piped document is untouched:
+
+```
+haiku: 5,974 in (5,042 cache read) · 4,866 out · 56.0s · extract estimated ~3,211, harness ~2,763
+```
+
 Everything scopes to the current project; `--all` widens. Digests land in
 `~/.claude/chsum/digests/<uuid>.md` (`--out` to change).
+
+### Recap
+
+`chsum recap` is the same document over a range you choose. At a terminal it's
+an arrow-key picker: choose a session, press enter, then move to where you want
+to start and press enter — everything from there to the cursor highlights as you
+move down. A second enter sets the end and shows what the call will cost, and a
+third runs it. Escape steps back; escape at the session list exits. Your turns
+are shown in full, never truncated, with what happened after each one on its own
+line:
+
+```
+ 33  19:25  can we add all the activity between each of my replies - 3 tools,
+            15 edits, 3 agents. and can we make it interactive, so I can push
+            arrows up and down to select a session
+            ↳ 3 edits · 6 cmds · 2 tools
+ 34  19:28  Hmm, finsih what you were doing first
+            ↳ 5 edits · 8 cmds · 1 failure
+```
+
+Piping still works — the wizard draws on the terminal while the document goes to
+stdout. `--no-tui` uses typed prompts instead:
+
+```sh
+chsum recap                                    # pick session, then start and end
+chsum recap --from 3 --to 10                   # same window, no prompts
+chsum recap ch_3654a13c --from 3 --to 10       # a specific session
+chsum recap --from 3 --to 10 --dry-run         # what it would cost, no model call
+```
+
+A turn is something you typed *or* an answer you gave the question tool — those
+are marked `?` in the list, because a decision made by menu choice is still a
+turn that steered the session.
+
+A recap spans several of your turns, so its timeline is sliced onto them: each
+turn quoted verbatim, and beneath it the bullets covering what happened before
+you spoke again.
+
+```
+### You said (21:43)
+
+> ok
+
+- **21:45** Created a new `is_typed_prompt()` helper that filters out
+  `<bash-…>` records, and updated five call sites to use it.
+- **21:47** Tested the fix against the live airtouch session; chsum now
+  reports `prompts: 0` for the dead 2-second session and skips it.
+
+### You said (21:50)
+
+> commit the work
+```
+
+Placement isn't guessed here: each turn's events are their own chunk (or
+chunks, if the gap was large), summarised by a call that sees only that
+turn's own material, so its bullets slot straight under the turn they follow
+— there's nothing to place after the fact, and nothing to get wrong by
+copying a time out of the extract. The verbatim sections above still settle
+any disagreement between a bullet and what actually happened.
 
 ### Names
 

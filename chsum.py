@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """chsum — Claude Code conversations as work logs and reload-ready context.
 
-DETERMINISTIC: every line of output is copied verbatim from a transcript or
-computed from it. Digests feed back into future sessions, where an invented
-claim would become ground truth. Prose generation lives behind the `Summariser`
-seam at the bottom; its one caller is `last --here`, and its output prints
-beneath the verbatim record, labelled model-written.
+Every line of output is copied verbatim or computed, never invented. Prose
+generation lives behind the `Summariser` seam and prints beneath the verbatim
+record, labelled model-written.
 
 Commands: sessions (default), last, find, digest, context, mark, journal.
 """
@@ -13,6 +11,10 @@ Commands: sessions (default), last, find, digest, context, mark, journal.
 from __future__ import annotations
 
 import argparse
+import bisect
+import concurrent.futures
+import contextlib
+import curses
 import json
 import os
 import pathlib
@@ -23,7 +25,7 @@ import sys
 import textwrap
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -35,10 +37,8 @@ DIGEST_DIR = pathlib.Path.home() / ".claude" / "chsum" / "digests"
 # ---------------------------------------------------------------------------
 # ch_ ref derivation
 # ---------------------------------------------------------------------------
-# Reimplements claude-history's AgentConversationRef::from_parts
-# (src/agent/refs.rs:31-54): length-prefixed 128-bit FNV-1a over
-# ["agent-v1", project_dir_name, session_filename]. Their versioned internal, so
-# anything derived is verified against the uuid they report before it's trusted.
+# Reimplements claude-history's AgentConversationRef::from_parts (refs.rs:31-54):
+# length-prefixed 128-bit FNV-1a over ["agent-v1", project_dir_name, session_filename].
 
 _FNV_OFFSET = 0x6C62272E07BB014262B821756295C58D
 _FNV_PRIME = 0x0000000001000000000000000000013B
@@ -68,10 +68,8 @@ def project_dir_name(cwd: pathlib.Path) -> str:
 
 
 def transcripts(local: bool = False) -> list[pathlib.Path]:
-    """Addressable conversations only: two levels, no agent-* sidecars.
-
-    Mirrors claude-history's discover_agent_keys (src/agent/service.rs:477-486).
-    """
+    """Addressable conversations only: two levels, no agent-* sidecars
+    (mirrors claude-history's discover_agent_keys, service.rs:477-486)."""
     if not PROJECTS_ROOT.is_dir():
         return []
     out = [p for p in PROJECTS_ROOT.glob("*/*.jsonl") if not p.name.startswith("agent-")]
@@ -133,11 +131,8 @@ def search(query: str, *, local: bool, mode: str, top: int) -> list[Hit]:
 
 
 def last_message_number(ref: str) -> int:
-    """Highest message ordinal — the upper bound for a full read.
-
-    outline has two shapes: `seg m1..m38` for long conversations, bare `m1 role=…`
-    lines for short ones. Handle both, or short ones silently read as empty.
-    """
+    """Highest message ordinal, the upper bound for a full read. Handles both
+    `outline` shapes (segmented and bare), or short conversations read as empty."""
     end = 0
     for line in _history("agent", "outline", ref, "--no-budget").splitlines():
         if line.startswith("seg "):
@@ -166,10 +161,8 @@ class Message:
 
 
 def read_messages(ref: str, start: int = 1, end: int | None = None) -> list[Message]:
-    """Parse `agent read` output into messages with their mN and ma_ anchor.
-
-    claude-history is the text source because it has already stripped tool sludge.
-    """
+    """Parses `agent read` output (already stripped of tool sludge) into
+    messages with their mN ordinal and ma_ anchor."""
     end = end or last_message_number(ref)
     if not end:
         return []
@@ -183,16 +176,13 @@ def read_messages(ref: str, start: int = 1, end: int | None = None) -> list[Mess
                 cur.text = "\n".join(body).strip()
                 msgs.append(cur)
             f = _fields(line)
-            # The ordinal is a bare positional token ("message m17 role=..."),
-            # not a key=value pair, so it has to be read off directly.
+            # Bare positional token ("message m17 ..."), not key=value — read off directly.
             m = re.match(r"message\s+m(\d+)", line)
             cur = Message(
                 n=int(m.group(1)) if m else 0,
                 role=f.get("role", "?"),
                 anchor=f.get("anchor", ""),
                 text="",
-                # The bridge from a JSONL record to a message ordinal: marks are
-                # made against record uuids, but cited as mN.
                 line=int(f["line"]) if f.get("line", "").isdigit() else 0,
             )
             body = []
@@ -207,8 +197,7 @@ def read_messages(ref: str, start: int = 1, end: int | None = None) -> list[Mess
 # ---------------------------------------------------------------------------
 # Noise filtering
 # ---------------------------------------------------------------------------
-# Harness scaffolding that appears in the user role but isn't something the user
-# typed. Measured across the corpus: interrupts and task-notifications dominate.
+# Harness scaffolding in the user role that isn't something the user typed.
 
 _NOISE_MARKERS = (
     "[Request interrupted",
@@ -231,19 +220,13 @@ def is_real_prompt(text: str) -> bool:
 
 
 def is_typed_prompt(text: str) -> bool:
-    """`is_real_prompt`, minus `!` runs: `<bash-input>` and its captured output
-    land in the user role but are something you did, not something you said.
-    Everywhere prompts are counted or quoted uses this; the mark paths stay on
-    `is_real_prompt`, because a `!` run must remain visible there — it is how
-    marks are typed at all. Without this, a session holding nothing but a
-    `chsum last` run reads as two prompts, `last` picks it over the real work,
-    and the next digest quotes a digest."""
+    """`is_real_prompt`, minus `!` runs — something you did, not something you
+    said. Mark paths stay on `is_real_prompt`, since marks are typed via `!`."""
     return is_real_prompt(text) and not text.lstrip().startswith("<bash-")
 
 
-# Steering turns that carry no standalone meaning. Measured on the corpus: ~31% of
-# prompts in conversational sessions are these, and listed in a trail they read as
-# noise ("yes", "ok, do that"). They're counted rather than shown.
+# Steering turns with no standalone meaning ("yes", "ok, do that") — counted,
+# not shown in the trail.
 _ACK_RE = re.compile(
     r"^(y(es|ep|eah|up)?|no(pe)?|ok(ay)?|sure|thanks|ta|cool|nice|good|great|perfect|"
     r"do (it|that)|go ahead|carry on|continue|next|yes please|please do|"
@@ -254,19 +237,14 @@ _ACK_RE = re.compile(
 
 
 def is_substantive(text: str) -> bool:
-    """Does this prompt say anything on its own?
-
-    "yes" read cold months later carries nothing — its meaning lived in the message
-    it answered. Filtered from the trail, but counted, so it isn't silently erased.
-    """
+    """Does this prompt say anything on its own? Filtered from the trail but
+    still counted, not silently erased."""
     t = text.strip()
     return len(t) >= 12 and not _ACK_RE.match(t)
 
 
-# Harness-generated last words. They occupy the assistant's final turn but say
-# nothing about the work, so "where I left off" would otherwise report the manner
-# of death instead of the state. Matched, not guessed: each is a fixed string the
-# harness emits.
+# Harness-generated last words — matched (fixed strings), not guessed, so
+# "where I left off" reports state, not how the session ended.
 _NOTICE_RES = [re.compile(p, re.IGNORECASE) for p in (
     r"^you'?ve hit your (session|usage) limit",
     r"^(claude )?(usage|session) limit reached",
@@ -285,11 +263,8 @@ def notice_kind(text: str) -> str:
 
 
 def last_said(msgs: list[Message]) -> tuple[Message | None, str]:
-    """Last assistant message with content, plus any notice that came after it.
-
-    Both are returned because both are true and neither substitutes for the other:
-    the notice says how the session ended, the message says where the work was.
-    """
+    """Last assistant message with content, plus any trailing notice — the
+    notice says how the session ended, the message says where the work was."""
     notice = ""
     for m in reversed(msgs):
         if m.role != "assistant" or not m.text.strip():
@@ -354,9 +329,7 @@ class Meta:
 
     @property
     def agent_count(self) -> int:
-        """Sidecars can be missing (older sessions, pruned) or outnumber the
-        visible Agent calls (an agent that spawned its own), so trust whichever
-        is larger."""
+        """Sidecars can be missing or outnumber visible Agent calls, so take the larger."""
         return max(self.spawned, len(self.agents))
 
     @property
@@ -371,20 +344,10 @@ class Meta:
 # ---------------------------------------------------------------------------
 # Names
 # ---------------------------------------------------------------------------
-# What a session is called is Claude Code's `ai-title` record, and it appends a
-# refined one all session long — dozens per conversation, last wins. So `chsum
-# name` does two things, because neither alone holds:
-#
-#   1. Records the name in chsum's own store, keyed by uuid. Authoritative here:
-#      a live session's next `ai-title` would otherwise overwrite you within the
-#      minute.
-#   2. Appends one more `ai-title` record to the transcript, so /resume and every
-#      other reader of the JSONL show the name too.
-#
-# (2) is the one exception to "chsum writes nothing to a transcript", and it is
-# an *append* of a record type Claude Code appends constantly — never a rewrite
-# of a line already written, so a concurrent flush has nothing to collide with.
-# Neither step invents anything: the title is argv, verbatim.
+# `chsum name` both records the name in chsum's own store (authoritative, since
+# Claude Code's own `ai-title` would otherwise overwrite it) and appends one more
+# `ai-title` record so /resume shows it too — the one exception to writing
+# nothing to a transcript.
 
 NAMES_PATH = DIGEST_DIR.parent / "names.json"
 
@@ -392,9 +355,8 @@ _names_cache: tuple[float, dict[str, str]] | None = None
 
 
 def _load_store() -> dict[str, dict]:
-    """Raw store: uuid → {"title", "was"}. `was` is what Claude Code called it at
-    the moment you renamed, kept so `--clear` can put that record back — otherwise
-    the appended title outlives the name and /resume never reverts."""
+    """Raw store: uuid → {"title", "was"}. `was` is Claude Code's title at
+    rename time, so `--clear` can restore it."""
     global _names_cache
     try:
         stamp = NAMES_PATH.stat().st_mtime
@@ -418,8 +380,7 @@ def _load_store() -> dict[str, dict]:
 
 
 def load_names() -> dict[str, str]:
-    """uuid → your name for it. Cached on mtime: the listing path asks once per
-    session, and 195 re-reads of the same file is the whole cost of `journal`."""
+    """uuid → your name for it. Cached on mtime — the listing path asks once per session."""
     return {uuid: entry["title"] for uuid, entry in _load_store().items()}
 
 
@@ -443,13 +404,10 @@ def save_name(uuid: str, title: str | None, was: str = "") -> None:
 
 
 def append_ai_title(path: pathlib.Path, title: str) -> None:
-    """One more `ai-title` record, byte-identical in shape to Claude Code's own.
-
-    Written as a single append of a complete line. The leading newline guard is
-    for the live transcript: reading it mid-flush can find the last line without
-    its terminator, and appending onto that would fuse two records into one
-    unparseable line.
-    """
+    """One more `ai-title` record, byte-identical in shape to Claude Code's own,
+    written as a single append. Guards a missing trailing newline: a live
+    transcript read mid-flush can lack one, and appending onto it would fuse
+    two records into one unparseable line."""
     rec = json.dumps({"type": "ai-title", "aiTitle": title, "sessionId": path.stem},
                      ensure_ascii=False)
     lead = ""
@@ -467,26 +425,17 @@ def append_ai_title(path: pathlib.Path, title: str) -> None:
 # ---------------------------------------------------------------------------
 # Marks
 # ---------------------------------------------------------------------------
-# `chsum mark <reason>` writes nothing at all. Run through Claude Code's `!`
-# prefix, the harness records the run for us: the sentinel below lands in the
-# transcript as a `<bash-stdout>` user record, at the point in the conversation
-# where it was typed, carrying the reason verbatim from argv. So there is no
-# injection into a file Claude Code is concurrently appending to, no second store
-# to keep in sync, and the mark inherits an mN and a durable ma_ anchor for free.
-#
-# Detection looks only at captured command output — a `<bash-stdout>` record from a
-# `!` run, or a Bash tool_result when Claude ran it. So a digest that quotes a mark
-# and gets pasted into a later session doesn't read back as a mark of that session.
+# `chsum mark <reason>` writes nothing: run via `!`, Claude Code's own recording
+# of the run is what plants the sentinel in the transcript, with an mN and
+# ma_ anchor for free. Detection reads only captured command output, so a
+# quoted mark pasted into a later session doesn't read back as a mark of it.
 
 MARK_SENTINEL = "⚑ chsum-mark v1"
-# Line-anchored, allowing only the harness's own wrapper in front: unanchored, a
-# `grep chsum-mark chsum.py` in some future session would match the pattern below
-# in this file's own source and forge a mark out of it.
+# Line-anchored: unanchored, this line's own text would match and forge a mark.
 _MARK_RE = re.compile(
     r"^(?:<bash-stdout>)?⚑ chsum-mark v1(?P<fields>[^|]*)\|(?P<reason>.*)", re.MULTILINE
 )
-# The harness wraps captured output, and a `!` run's stderr tags follow stdout's in
-# the same record, so the reason ends at the first closing tag — not the last.
+# Ends at the first closing tag, not the last — stderr's tag follows stdout's in the same record.
 _MARK_TAIL_RE = re.compile(r"</bash-\w+>.*$", re.DOTALL)
 _MARK_GREP = "chsum-mark"  # ASCII pre-filter: cheap, and survives any escaping
 
@@ -549,12 +498,9 @@ def _apply_revocations(marks: list[Mark], revoked: set[str]) -> list[Mark]:
 
 def _scan_marks_raw(path: pathlib.Path) -> tuple[list[Mark], set[str]]:
     """Marks and revocations in one file, kept apart so a parent and its sidecars
-    can be reconciled: either side may retract a mark the other made.
-
-    Its own pass rather than part of `extract_meta` because line numbers are the
-    only bridge back to mN, and `_records` doesn't carry them. Cost on the listing
-    path is one substring scan of the file — sessions with no marks stop there.
-    """
+    can be reconciled: either side may retract a mark the other made. Its own
+    pass rather than part of `extract_meta` because line numbers are the only
+    bridge back to mN, and `_records` doesn't carry them."""
     try:
         data = path.read_text(errors="replace")
     except OSError:
@@ -576,8 +522,7 @@ def _scan_marks_raw(path: pathlib.Path) -> tuple[list[Mark], set[str]]:
         for m in _MARK_RE.finditer(f"{text}\n{_tool_result_text(rec)}"):
             fields = dict(t.split("=", 1) for t in m.group("fields").split() if "=" in t)
             if fields.get("revoke"):
-                # A retraction is itself just another line of output: nothing was
-                # written to take back, so the record stays and the mark drops.
+                # Nothing was written to take back, so the record stays and the mark drops.
                 revoked.add(fields["revoke"])
                 continue
             marks.append(Mark(reason=_MARK_TAIL_RE.sub("", m.group("reason")).strip(),
@@ -611,17 +556,10 @@ def _text_at_line(lines: list[str], lineno: int) -> str:
 
 
 def _resolve_here(data: str, marks: list[Mark], path: pathlib.Path | None = None) -> None:
-    """Point a bare `chsum mark` at the message it followed.
-
-    Its own record is command output, which says nothing about what was being
-    marked — you marked what was on the screen. So the target is the last thing
-    said before it, skipping the mark's own plumbing.
-
-    "Before" is by timestamp once sidecars are in play: what was on screen while an
-    agent ran was written to the sidecar, and line numbers of two files don't
-    order against each other. Marks with no timestamp of their own fall back to
-    line order in the transcript, which is what they had before.
-    """
+    """Point a bare `chsum mark` at the last real thing said before it (its own
+    record is command output, not a target), skipping its own plumbing. Ordered
+    by timestamp once sidecars are in play, since two files' line numbers don't
+    order against each other; falls back to line order otherwise."""
     said: list[tuple[str, int, pathlib.Path | None, str, str]] = []
     for src, agent in (mark_sources(path) if path else [(None, "")]):
         raw_text = data if src is None or src == path else src.read_text(errors="replace")
@@ -690,8 +628,8 @@ def _parse_ts(s: str) -> datetime | None:
 
 
 def active_seconds(stamps: list[str]) -> int:
-    """Time worked, not wall-clock. Sessions resume days later, so first→last
-    overstates badly (one reads as 92h). Gaps over IDLE_GAP_SECONDS are excluded."""
+    """Time worked, not wall-clock — sessions resume days later, so first→last
+    overstates badly. Gaps over IDLE_GAP_SECONDS are excluded."""
     times = sorted(t for t in (_parse_ts(s) for s in stamps) if t)
     total = 0
     for a, b in zip(times, times[1:]):
@@ -774,15 +712,13 @@ def extract_meta(path: pathlib.Path) -> Meta:
             meta.spawned += _collect_tools(rec, edited, read, cmds)
         if rec.get("type") == "user" and _is_typed_prompt(rec):
             meta.prompts += 1
-    # Yours wins over Claude Code's, and over any later `ai-title` it appends —
-    # that is the point of keeping a store as well as appending one.
+    # Yours wins over Claude Code's own later `ai-title` appends.
     named = load_names().get(meta.uuid, "")
     meta.renamed = bool(named)
     meta.title = named or meta.ai_title or "(untitled)"
     own_edits = set(edited)
 
-    # Fold subagent tool use into the parent: a session that delegated everything
-    # would otherwise read as no activity. Prompts stay parent-only.
+    # Fold subagent tool use into the parent; prompts stay parent-only.
     meta.agents = [extract_agent(s) for s in subagent_transcripts(path)]
     for run in meta.agents:
         edited.extend(run.edited)
@@ -805,10 +741,8 @@ def extract_meta(path: pathlib.Path) -> Meta:
         run.edited = keep(run.edited)
     meta.agent_only = set(meta.edited) - set(keep(own_edits))
 
-    # Marks fold in like edits and commands do — a mark made by the agent you sent
-    # to do the work is a mark on the session. Revocations are pooled first, so
-    # either side can retract the other's: the agent is doing the session's work,
-    # not keeping its own books.
+    # Marks fold in like edits and commands do. Revocations pool first, so either
+    # side can retract the other's.
     own_marks, revoked = _scan_marks_raw(path)
     for run in meta.agents:
         revoked |= run.revoked
@@ -826,8 +760,7 @@ _NON_PROJECT_PREFIXES = ("/tmp/", "/private/tmp/", "/var/folders/")
 _NON_PROJECT_PARTS = ("/scratchpad/", "/.claude/plans/", "/.claude/projects/")
 
 
-# Look-only commands. One session logged 118, nearly all greps — they bury the
-# few that did something.
+# Look-only commands — they bury the few that did something.
 _INSPECTION_CMDS = {
     "ls", "cat", "head", "tail", "grep", "rg", "find", "echo", "wc", "which",
     "pwd", "cd", "file", "stat", "du", "df", "tree", "sed", "awk", "jq", "sort",
@@ -944,10 +877,8 @@ def _clip(text: str, limit: int, hint: str = "read the anchor") -> str:
 
 
 def _colour_ok(stream=None) -> bool:
-    """Shared gate for every ANSI-colouring helper below. Off unless the given
-    stream (stdout by default) is a terminal: `!` runs get captured, and an
-    escape sequence stored in a transcript is there forever. FORCE_COLOR turns
-    it on anyway, NO_COLOR always wins."""
+    """Off unless the given stream is a terminal — a captured `!` run would store
+    escape sequences in the transcript forever. FORCE_COLOR overrides; NO_COLOR always wins."""
     if os.environ.get("NO_COLOR"):
         return False
     stream = sys.stdout if stream is None else stream
@@ -979,7 +910,7 @@ def _quote(text: str) -> str:
 _MODEL_WRITTEN_HEADING = "What happened, in order — model-written"
 
 _MD_QUOTE_RE = re.compile(r"^> ?(.*)$")
-_MD_HEADING_RE = re.compile(r"^(#{1,2}) (.*)$")
+_MD_HEADING_RE = re.compile(r"^(#{1,3}) (.*)$")
 _MD_ITALIC_LINE_RE = re.compile(r"^\*(.+)\*$")
 _MD_BULLET_RE = re.compile(r"^- (.*)$")
 # A bullet whose entire content is one code span, optionally led by an HH:MM
@@ -1000,23 +931,17 @@ def _md_inline(segment: str) -> str:
 
 
 def _md_ansi(text: str) -> str:
-    """Presentation-only markdown→ANSI for catch-up on a tty (see `_colour_ok`)
-    — the piped/captured document stays exact markdown, byte-identical. Line-based
-    and deliberately simple: this renders quoted transcript text, which can
-    contain anything, so an unmatched line just passes through unchanged and the
-    function can never raise.
-
-    Quote lines are checked first and exclusively — a quoted `## Summary` must
-    stay inside the dim blockquote treatment, not become a heading, the same
-    forgery `_quote` itself guards against.
-
-    Every wrappable line is wrapped as plain text first and coloured second,
-    never the reverse: an ANSI escape inflates `len()`, so `textwrap` handed
-    already-coloured text would measure the wrong width and wrap on the wrong
-    column (or split an escape in half). Headings are the one exception — short
-    by construction, so they're never wrapped at all."""
+    """Presentation-only markdown→ANSI for catch-up on a tty; the piped/captured
+    document stays exact markdown. Line-based: an unmatched line passes through
+    unchanged, so it can never raise on transcript text. Quote lines are matched
+    first and exclusively, the same forgery guard as `_quote`. Lines are wrapped
+    as plain text before colouring, since an ANSI escape would throw off
+    `textwrap`'s width math."""
     cols = max(40, min(shutil.get_terminal_size((100, 24)).columns, 88))
     out = []
+    # Whose words the current blockquote is, tracked from the section heading
+    # above it (quoting is identical markup either way). Green for yours, dim for Claude's.
+    mine = False
     for line in text.split("\n"):
         if not line.strip():
             out.append(line)
@@ -1025,17 +950,21 @@ def _md_ansi(text: str) -> str:
         if m:
             # The bar rides every continuation, initial and subsequent alike —
             # a folded quote that lost it on line two would read as prose.
+            colour = "\033[32m" if mine else "\033[2m"
             content = m.group(1)
             if not content.strip():
-                out.append("\033[2m│\033[0m")
+                out.append(f"{colour}│\033[0m")
                 continue
             wrapped = textwrap.wrap(content, cols, initial_indent="│ ",
                                      subsequent_indent="│ ") or ["│ "]
-            out.extend(f"\033[2m{wl}\033[0m" for wl in wrapped)
+            out.extend(f"{colour}{wl}\033[0m" for wl in wrapped)
             continue
         m = _MD_HEADING_RE.match(line)
         if m:
             rest = m.group(2)
+            # A quoted heading never reaches here (`_MD_QUOTE_RE` is checked
+            # first and exclusively), so this can't be forged by transcript text.
+            mine = rest.startswith(("You said", "Then you said", "You answered"))
             colour = "\033[1;33m" if rest == _MODEL_WRITTEN_HEADING else "\033[1m"
             out.append(f"{colour}{rest}\033[0m")
             continue
@@ -1087,12 +1016,9 @@ def frontmatter(meta: Meta, ref: str) -> str:
 
 
 def messages_from_jsonl(path: pathlib.Path) -> list[Message]:
-    """Text messages straight from a transcript file. Sidecars only.
-
-    claude-history has no per-agent ref — `--subagents` inlines agent messages into
-    the parent read untagged — so these are parsed here. Anchors stay empty: `ma_`
-    values are claude-history's to mint, and a fabricated one is worse than none.
-    """
+    """Text messages straight from a transcript file. Sidecars only — claude-history
+    has no per-agent ref. Anchors stay empty: `ma_` values are claude-history's
+    to mint, and a fabricated one is worse than none."""
     msgs: list[Message] = []
     for rec in _records(path):
         role = rec.get("type")
@@ -1121,11 +1047,7 @@ _MEATY_CHARS = 400
 
 
 def _last_meaty(msgs: list[Message], exclude=None) -> "Message | None":
-    """Last turn long enough to carry a result. None if `exclude` already is one.
-
-    Speech wins over thinking; thinking is the fallback because an agent killed
-    mid-run may never have said anything substantial out loud.
-    """
+    """Last turn long enough to carry a result. None if `exclude` already is one."""
     if exclude is not None and len(exclude.text.strip()) >= _MEATY_CHARS:
         return None
     for m in reversed(msgs):
@@ -1138,11 +1060,8 @@ def _last_meaty(msgs: list[Message], exclude=None) -> "Message | None":
 
 
 def last_command_output(path: pathlib.Path, tail: int = 700) -> tuple[str, str]:
-    """Last Bash command in a transcript and the tail of what it printed.
-
-    An agent that dies mid-run leaves its state in test output, not in speech.
-    Verbatim, and the tail rather than the head: the verdict line is at the end.
-    """
+    """Last Bash command in a transcript and the tail of what it printed, verbatim
+    — an agent that dies mid-run leaves its state in test output, not in speech."""
     pending: dict[str, str] = {}
     cmd = out = ""
     for rec in _records(path):
@@ -1214,9 +1133,7 @@ def render_agent_digest(meta: Meta, parent_ref: str, run: AgentRun) -> str:
     parts.append(_quote(_clip(final.text, 900, _SIDECAR_HINT)) + "\n" if final
                  else "*Nothing recorded.*\n")
 
-    # An agent killed mid-run often ends on tool narration ("let me read X"), which
-    # says nothing about what it found. The last long turn usually does, and it is
-    # still verbatim — a different message, not a summary of one.
+    # A killed agent often ends on tool narration; the last long turn usually says more.
     meaty = _last_meaty(msgs, exclude=final)
     if meaty:
         what = ("Its last reasoning block (thinking, not spoken)"
@@ -1334,18 +1251,10 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
 
 
 def _locate_mark(mark: Mark, msgs: list[Message]) -> None:
-    """Give a mark its mN and anchor only when a message starts on the very line
-    it points at.
-
-    Nothing looser survives contact: a read of a live transcript comes back sparse
-    — measured at 38 messages spanning ordinals up to m327 — so "the last message
-    starting before this line" attributes a mark to whatever survived the gap. One
-    mark landed on an `ok` three hundred messages away. Unplaced marks fall back to
-    their record id, and the quote carries the content either way.
-    """
+    """Give a mark its mN and anchor only on an exact line match; unplaced marks
+    fall back to their record id, and the quote carries the content either way."""
     target = mark.at_line or mark.line
-    # An agent mark's lines are its sidecar's, and claude-history has no per-agent
-    # ref to number them against — so it gets its agent id instead of an ordinal.
+    # A sidecar has no per-agent ref to number lines against, so it gets its agent id instead.
     if not target or mark.agent:
         return
     for m in msgs:
@@ -1380,12 +1289,7 @@ def _render_marks(marks: list[Mark], msgs: list[Message],
 
 
 def _citable_anchors(all_msgs: list[Message], cited: list[Message]) -> list[tuple[int, str]]:
-    """Anchors safe to publish: present, unique, one per message.
-
-    They are content-addressed, so byte-identical messages share one and
-    `read --anchor` fails with ambiguous-ref (measured: "[Request interrupted by
-    user]" collides). Dropped rather than emitted — mN alone still works.
-    """
+    """Anchors safe to publish: present, unique, one per message."""
     counts: dict[str, int] = {}
     for m in all_msgs:
         if m.anchor:
@@ -1558,11 +1462,8 @@ def live_transcript() -> pathlib.Path:
 
 def _mark_target(path: pathlib.Path, spec: str) -> str:
     """Resolve `--at` to a full record uuid: either a uuid prefix from
-    `chsum mark --recent`, or an mN, which needs claude-history to place it.
-
-    A uuid is looked for in the sidecars too, because `--recent` lists them; an mN
-    is the transcript's own numbering and stays parent-only.
-    """
+    `chsum mark --recent` (looked for in sidecars too, since `--recent` lists
+    them), or an mN, which needs claude-history to place it and stays parent-only."""
     if re.fullmatch(r"m\d+", spec):
         ref = ch_ref_for_path(path)
         want = int(spec[1:])
@@ -1617,12 +1518,8 @@ def _tool_lines(rec: dict) -> list[str]:
 
 def mark_sources(path: pathlib.Path) -> list[tuple[pathlib.Path, str]]:
     """Every file a mark in this conversation can point into: the transcript, then
-    its sidecars, each with the agent id to label it by.
-
-    Delegated work is the session's work — while an agent is running, what is on
-    screen is being written to a sidecar, not the transcript, so a haystack of the
-    transcript alone can't see the thing you are asking to mark.
-    """
+    its sidecars, each with the agent id to label it by — a running agent's screen
+    is being written to its sidecar, not the transcript."""
     return [(path, "")] + [(s, s.stem.removeprefix("agent-"))
                            for s in subagent_transcripts(path)]
 
@@ -1631,20 +1528,10 @@ def _recent_actions(path: pathlib.Path, limit: int,
                     skip_machinery: bool = False) -> list[tuple[int, dict, str, str, str, str]]:
     """(line, record, label, full text, kind, agent) for the last `limit` things
     that happened: messages either side typed, and every tool call, in order.
-    `limit=0` is all. Sidecars are folded in, so a running agent's work is markable.
-
-    `skip_machinery` drops `chsum mark`'s own footprint — for `--match`, whose
-    haystack it would otherwise poison. `--recent` keeps it: that view is a plain
-    account of what happened, and a `!` run is a thing that happened.
-
-    The label is one line, for listing; the full text is what `--match` searches,
-    so a phrase buried in the middle of a long message is still findable.
-
-    Straight from the JSONL, not claude-history: this has to be right about what
-    just happened, and their read of a live transcript lags behind the file.
-    Tool *results* are left out — you mark the action, and a mark resolves to the
-    message that contains it either way.
-    """
+    `limit=0` is all, sidecars folded in. `skip_machinery` drops `chsum mark`'s
+    own footprint (for `--match`; `--recent` keeps it since a `!` run happened
+    too). Read straight from the JSONL, not claude-history, whose view of a live
+    transcript lags behind the file."""
     out = []
     for src, agent in mark_sources(path):
         machinery = _Machinery()
@@ -1674,12 +1561,9 @@ def _recent_actions(path: pathlib.Path, limit: int,
 
 
 def _fold(text: str) -> str:
-    """Down to words and spaces, for matching a half-remembered phrase.
-
-    Nobody retypes `Currently **no** —` when they mean "currently no", so case,
-    markdown, and punctuation are all noise here. Only matching is folded; every
-    mark still quotes the original bytes.
-    """
+    """Down to words and spaces for matching a half-remembered phrase; case,
+    markdown, and punctuation are noise here. Only matching is folded — marks
+    still quote the original bytes."""
     return " ".join(re.sub(r"[^0-9a-z]+", " ", text.lower()).split())
 
 
@@ -1688,26 +1572,11 @@ _BASH_OUT_RE = re.compile(r"\s*<bash-(?:stdout|stderr)>")
 
 
 class _Machinery:
-    """`chsum mark`'s own footprint, tracked in file order.
-
-    Excluded from matching because the tool_use record is written *before* the
-    command runs: without this, every `--match` finds itself, and past runs stay
-    in the haystack forever.
-
-    A `!` run lands as two records — the `<bash-input>`, then whatever it printed
-    — and only a *successful* mark's output carries the sentinel; a failure's
-    output quotes the phrase you searched for back at you. So captured output is
-    judged by the command above it, not by what it says. Same for the ambiguity
-    list, `--recent`, and `--list`, which quote other messages verbatim.
-
-    Invocations only, not talk about them. A command is machinery wherever `chsum
-    mark` appears in it (they get chained); a message is machinery only if it *is*
-    a `!` run, that run's output, or carries the sentinel. Match on prose and a
-    conversation about this feature becomes unmarkable.
-
-    One instance per file, `sees` called once per record in file order: adjacency
-    is a fact about the file, and sorting by timestamp interleaves the sidecars.
-    """
+    """`chsum mark`'s own footprint, tracked in file order — excluded from
+    matching (a tool_use record is written before the command runs, so without
+    this every `--match` finds itself). Invocations only, not talk about them,
+    or a conversation about this feature becomes unmarkable. One instance per
+    file: adjacency is a fact about the file, and timestamp sort interleaves sidecars."""
 
     def __init__(self) -> None:
         self.after_mark = False
@@ -1758,24 +1627,15 @@ def cmd_mark(args) -> int:
         raise SystemExit(f"no such transcript: {path}")
 
     if args.list:
-        # The session's marks, not the transcript's: an agent's are the session's
-        # too, and `--list` showing fewer than the digest counts reads as a bug in
-        # whichever one you check second. extract_meta already pools revocations
-        # across the boundary, so this is that one definition, not a second.
+        # The session's marks (agents' folded in too), same pooled definition extract_meta uses.
         marks = extract_meta(path).marks
         if not marks:
             print("nothing marked in this conversation", file=sys.stderr)
             return 1
-        # Capped well under a wide terminal: this output is usually read back
-        # inside Claude Code, which re-wraps at its own width, and a fold it
-        # chooses ignores the indent.
         cols = max(40, min(shutil.get_terminal_size((100, 24)).columns, 88))
         if args.full:
-            # The stored quote is only the marked message's first line, so the rest
-            # comes back off disk here rather than being carried around for a view
-            # nobody usually asks for.
-            # Keyed by file: a mark can point into a sidecar, whose line numbers
-            # mean nothing in the transcript.
+            # The stored quote is only the marked message's first line; the rest comes back off disk.
+            # Keyed by file: a mark can point into a sidecar, whose line numbers mean nothing here.
             lines_of: dict[pathlib.Path, list[str]] = {}
             for i, mk in enumerate(marks):
                 if i:
@@ -1797,12 +1657,7 @@ def cmd_mark(args) -> int:
             sys.stdout.flush()
             print(f"\n{_plural(len(marks), 'mark')}.", file=sys.stderr)
             return 0
-        # Two lines each: a reason and the message it marks are both prose, and on
-        # one line the long one eats the other.
-        # Width off the rendered strings, not the limit: the clip marker is two
-        # more characters, and sizing to the limit knocks those rows out of line.
-        # Whose mark it is, in the id column: the reason rarely says, and a mark you
-        # don't remember making is one an agent made for you.
+        # Two lines each: a reason and the message it marks are both prose.
         rows = [(_clip_line(mk.reason, 60),
                  f"{mk.rec[:8]}  agent {mk.agent[:8]}" if mk.agent else mk.rec[:8],
                  _clip_line(mk.quote, 96) or "(nothing before it)") for mk in marks]
@@ -1879,12 +1734,9 @@ def cmd_mark(args) -> int:
 
 
 def path_for_ref(ref: str) -> pathlib.Path:
-    """A ref (or a uuid, or a prefix of either) to its transcript.
-
-    Matched against locally derived refs rather than asked of claude-history: the
-    refs `chsum sessions` printed came from the same function, so a paste from the
-    listing resolves here by construction, and renaming costs no subprocess.
-    """
+    """A ref (or a uuid, or a prefix of either) to its transcript. Matched against
+    locally derived refs rather than asked of claude-history, so a paste from the
+    listing resolves by construction, at no subprocess cost."""
     want = ref.strip()
     hits = [p for p in transcripts()
             if ch_ref_for_path(p).startswith(want) or p.stem.startswith(want)]
@@ -1911,13 +1763,8 @@ def _name_target(args) -> pathlib.Path:
 
 
 def cmd_name(args) -> int:
-    """Rename a conversation to what it actually was.
-
-    The ref is optional and leads: `chsum name ch_… "…"` renames that one, a bare
-    `chsum name "…"` renames the session you're in. Told apart by the `ch_` prefix
-    rather than by a flag, because the ref you have was copied from the listing
-    one line above.
-    """
+    """Rename a conversation. `chsum name ch_… "…"` renames that one; a bare
+    `chsum name "…"` renames the session you're in — told apart by the `ch_` prefix, not a flag."""
     words = list(args.words)
     args.ref = None
     if words and words[0].startswith("ch_"):
@@ -1948,10 +1795,8 @@ def cmd_name(args) -> int:
             return 1
         was = _load_store().get(path.stem, {}).get("was", "")
         save_name(path.stem, None)
-        # Reverting the store is not enough: the ai-title we appended is the last
-        # one in the file, so /resume would keep showing a name chsum no longer
-        # knows. Put Claude Code's own title back the same way — appended, never
-        # deleted, so both records stay and the later one wins.
+        # Put Claude Code's title back the same way — appended, never deleted — or
+        # /resume keeps showing the name chsum just forgot.
         if was and not args.no_resume:
             try:
                 append_ai_title(path, was)
@@ -1994,17 +1839,11 @@ def cmd_name(args) -> int:
 
 
 def last_activity(path: pathlib.Path) -> str:
-    """The conversation's own last timestamp, read from the tail of the file.
-
-    Not `st_mtime`: anything that touches a transcript without writing to it — a
-    backup, an indexer — rewrites the mtime, and `last` then returns whatever was
-    touched most recently. Measured once with four transcripts stamped to the same
-    minute and `last` two days behind `sessions`, which orders by this instead.
-
-    Tail-read rather than `extract_meta`, which parses every record: `--all` is
-    225 transcripts here, 5.4s to parse and 0.05s to tail. Returns "" if the last
-    records carry no timestamp; the caller falls back to mtime for those.
-    """
+    """The conversation's own last timestamp, read from the tail of the file. Not
+    `st_mtime` — anything that touches a transcript without writing to it (a
+    backup, an indexer) rewrites that. Tail-read rather than `extract_meta`,
+    which parses every record. Returns "" if the last records carry no
+    timestamp; the caller falls back to mtime for those."""
     try:
         size = path.stat().st_size
         with path.open("rb") as fh:
@@ -2018,10 +1857,7 @@ def last_activity(path: pathlib.Path) -> str:
 
 def latest_transcript(local: bool = True, nth: int = 1) -> pathlib.Path:
     """Nth-most-recent conversation with activity, by last activity not filename.
-
-    Sessions that went nowhere are skipped (`chsum sessions` lists those), as is
-    the session doing the running when invoked from inside Claude Code.
-    """
+    Sessions that went nowhere are skipped, as is the one currently running."""
     live = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     cands = [p for p in transcripts(local=local) if p.stem != live]
     # Same ordering key as `sessions`, so the two agree on which one is last.
@@ -2047,19 +1883,51 @@ def latest_transcript(local: bool = True, nth: int = 1) -> pathlib.Path:
 # ---------------------------------------------------------------------------
 # Catch-up: `last --here`
 # ---------------------------------------------------------------------------
-# The running session, since the last thing you typed — for glancing at a second
-# terminal while Claude works. Raw JSONL throughout: claude-history's read of a
-# live transcript lags the file, and this view exists to be current. It is still
-# a snapshot — Claude Code flushes behind the screen, so the newest work may not
-# have landed yet.
+# The running session, since the last thing you typed. Raw JSONL throughout —
+# claude-history's read of a live transcript lags the file, and this view
+# exists to be current.
 
 
 @dataclass
 class _Event:
     when: str  # ISO timestamp, verbatim
     agent: str  # sidecar id; "" for the parent transcript
-    kind: str  # said / ran / edit / output / spawn / tool
+    kind: str  # said / ran / edit / output / failed / spawn / tool
     text: str
+
+
+# `is_error` also flags a tool use *you* declined — not a failure of the work.
+_DECLINED_RE = re.compile(r"^the user (doesn'?t|does not) want to proceed",
+                          re.IGNORECASE)
+# Second signal for what `is_error` misses: a traceback whose command still
+# exited 0. Anchored to line start, so output *quoting* an error isn't caught.
+_FAIL_RES = [re.compile(p, re.MULTILINE) for p in (
+    r"^Traceback \(most recent call last\):",
+    r"^\w*(Error|Exception): \S",
+)]
+
+
+def _fail_excerpt(out: str) -> str:
+    """400 chars from the first error line rather than the tail — a command that
+    carries on after a traceback would otherwise have the tail quote whatever
+    ran successfully afterwards."""
+    hits = [m.start() for r in _FAIL_RES for m in [r.search(out)] if m]
+    start = min(hits) if hits else max(0, len(out) - 400)
+    head = f"[from {start} chars in] " if start else ""
+    return head + out[start:start + 400] + ("…" if len(out) - start > 400 else "")
+
+
+def _failed(body: str, is_error: bool) -> bool:
+    """Whether a Bash result records something going wrong. `is_error` is taken
+    as given; the text signal only counts in the last 500 chars, since a command
+    that *died* ends at its error while one that merely printed error text as
+    data carries on past it — unanchored, it forges the same way `scan_marks` guards against."""
+    if _DECLINED_RE.match(body.strip()):
+        return False
+    if is_error:
+        return True
+    tail = body[-500:]
+    return any(r.search(tail) for r in _FAIL_RES)
 
 
 def _typed_text(rec: dict) -> str:
@@ -2078,10 +1946,7 @@ def _typed_text(rec: dict) -> str:
 
 def _last_prompt(path: pathlib.Path) -> tuple[int, dict] | None:
     """Line and record of the last thing you typed — the catch-up anchor.
-
-    `<bash-…>` records are excluded (`is_typed_prompt`): anchoring to a `!` run
-    would catch up from its own footprint.
-    """
+    `<bash-…>` records are excluded, or anchoring could catch up from its own footprint."""
     found = None
     for lineno, raw in enumerate(path.read_text(errors="replace").splitlines(), start=1):
         try:
@@ -2102,11 +1967,12 @@ def _tool_event(part: dict) -> tuple[str, str]:
     if name == "Bash" and isinstance(inp.get("command"), str):
         return "ran", _clip_line(inp["command"], 200)
     if name in _FILE_TOOLS and isinstance(inp.get("file_path"), str):
-        # The edited text rides along verbatim: it is what the summariser reads
-        # function names out of, instead of chsum parsing code.
+        # Edited text rides along verbatim — what the summariser reads function
+        # names out of, instead of chsum parsing code. `content` (a Write) is
+        # capped lower since it's a whole file, not a change.
         bits = [inp["file_path"]]
-        for key, label, lim in (("old_string", "was", 400), ("new_string", "now", 900),
-                                ("content", "now", 900)):
+        for key, label, lim in (("old_string", "was", 1500), ("new_string", "now", 4000),
+                                ("content", "now", 2000)):
             if isinstance(inp.get(key), str) and inp[key].strip():
                 bits.append(f"--- {label} ---\n{_clip(inp[key], lim, 'clipped')}")
         return "edit", "\n".join(bits)
@@ -2119,17 +1985,18 @@ def _tool_event(part: dict) -> tuple[str, str]:
     return "tool", f"{name}: {detail}" if detail else name
 
 
-def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str) -> list[_Event]:
-    """Everything after your prompt, transcript and sidecars merged by timestamp.
-
-    Sidecars filter by time, not line — two files' line numbers don't order
-    against each other, and an agent spawned before the prompt may still be
-    working after it. Bash tool_use ids are tracked from the top of each file so
-    a result landing after the prompt still resolves to its command.
-    """
+def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
+                  until_ts: str = "") -> list[_Event]:
+    """Everything after your prompt, transcript and sidecars merged by timestamp
+    (two files' line numbers don't order against each other). `until_ts` closes
+    the window at the far end for `recap`, which picks both ends rather than
+    running to now — a timestamp even for the parent, since the far end has to
+    cut sidecars too."""
     events: list[_Event] = []
     for src, agent in mark_sources(path):
-        pending: set[str] = set()
+        # id -> the command, not just its id: a failure has to be able to name
+        # what failed, and by the time the result lands the tool_use is gone.
+        pending: dict[str, str] = {}
         for lineno, raw in enumerate(src.read_text(errors="replace").splitlines(), start=1):
             try:
                 rec = json.loads(raw)
@@ -2139,6 +2006,8 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str) -> list[
                 continue
             ts = str(rec.get("timestamp") or "")
             live = (lineno > anchor_line) if src == path else (ts > anchor_ts)
+            if until_ts and ts and ts > until_ts:
+                live = False
             content = (rec.get("message") or {}).get("content")
             if isinstance(content, str) and live and rec["type"] == "assistant":
                 if content.strip() and not notice_kind(content):
@@ -2155,7 +2024,12 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str) -> list[
                         events.append(_Event(ts, agent, "said", _clip(t, 600, "clipped")))
                 elif part.get("type") == "tool_use":
                     if part.get("name") == "Bash":
-                        pending.add(str(part.get("id") or ""))
+                        cmd = (part.get("input") or {}).get("command")
+                        # First line, not a flattened clip: a heredoc script
+                        # squashed onto one line is 200 chars of its own source,
+                        # where `python3 - <<'PY'` identifies it at a glance.
+                        pending[str(part.get("id") or "")] = _clip_line(
+                            cmd.strip().splitlines()[0], 120) if isinstance(cmd, str) and cmd.strip() else ""
                     if live:
                         events.append(_Event(ts, agent, *_tool_event(part)))
                 elif (part.get("type") == "tool_result" and live
@@ -2170,33 +2044,357 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str) -> list[
                     if isinstance(body, str) and body.strip():
                         out = body.strip()
                         head = f"[tail of {len(out)} chars] " if len(out) > 400 else ""
-                        events.append(_Event(ts, agent, "output", head + out[-400:]))
+                        # A failure carries its command with it. The pairing is
+                        # the point: "it broke" is no use without what broke.
+                        if _failed(out, bool(part.get("is_error"))):
+                            cmd = pending.get(part["tool_use_id"], "")
+                            events.append(_Event(ts, agent, "failed",
+                                                 f"{cmd}\n{_fail_excerpt(out)}"))
+                        else:
+                            events.append(_Event(ts, agent, "output", head + out[-400:]))
     # Stable, so a record's own blocks stay in the order they were emitted.
     events.sort(key=lambda e: e.when)
     return events
 
 
-def _catchup_material(prompt_ts: str, prompt_text: str, events: list[_Event],
-                      omitted: int = 0) -> str:
-    """The extract a summariser sees: the prompt, then one entry per event.
-    Verbatim throughout — the model's only source, so nothing outside it can
-    leak into the timeline."""
-    lines = [f"USER PROMPT ({prompt_ts}):", prompt_text, "",
-             "EVENTS since, oldest first ('agent <id>' = inside a subagent):"]
-    if omitted:
-        lines.append(f"[{omitted} events omitted from the middle for length]")
+def _event_block(e: _Event) -> str:
+    """One event as it appears in the extract. Factored out so `--dry-run` can
+    size each event by the exact text that would be sent, rather than measuring
+    `e.text` and re-deriving the framing around it."""
+    who = f" agent {e.agent[:8]}" if e.agent else ""
+    # Local clock, not the raw UTC slice: the human-facing sections above use
+    # `_hhmm` (local), and a model copying a time out of this extract has to
+    # land on the same clock as the header beside it.
+    head = f"[{_hhmmss(e.when)}]{who} {e.kind}:"
+    if "\n" in e.text:
+        return "\n".join([head] + ["  " + ln for ln in e.text.splitlines()])
+    return f"{head} {e.text}"
+
+
+@dataclass
+class _Turn:
+    """One thing you contributed: a typed prompt, or an answer to the question
+    tool — both count, or a range picked from prompts alone would skip a
+    decision made by menu choice."""
+    line: int
+    when: str
+    kind: str  # "said" | "answered"
+    text: str
+
+
+def _answered(rec: dict) -> str:
+    """Your answers to the question tool, `Q → A` per line, or "". Read from the
+    structured `toolUseResult.answers` field, never the "Your questions have
+    been answered" prose in the message body."""
+    tur = rec.get("toolUseResult")
+    if not isinstance(tur, dict):
+        return ""
+    answers = tur.get("answers")
+    if not isinstance(answers, dict) or not answers:
+        return ""
+    return "\n".join(f"{q} → {a}" for q, a in answers.items()
+                     if isinstance(q, str) and isinstance(a, str))
+
+
+def _your_turns(path: pathlib.Path) -> list[_Turn]:
+    """Every turn of yours in a transcript, in order, for `recap`'s range picker."""
+    turns = []
+    for lineno, raw in enumerate(path.read_text(errors="replace").splitlines(), start=1):
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict) or rec.get("type") != "user":
+            continue
+        ts = str(rec.get("timestamp") or "")
+        text = _typed_text(rec)
+        if isinstance(text, str) and is_typed_prompt(text):
+            turns.append(_Turn(lineno, ts, "said", text.strip()))
+            continue
+        answered = _answered(rec)
+        if answered:
+            turns.append(_Turn(lineno, ts, "answered", answered))
+    return turns
+
+
+def _turn_activity(path: pathlib.Path, turns: list[_Turn]) -> list[str]:
+    """What happened after each of your turns, one summary per turn. One pass,
+    events bucketed to the turn they followed — a per-turn walk would re-read
+    the file once per turn. Counts only: the picker is a place to choose from, not to read."""
+    if not turns:
+        return []
+    events = _events_since(path, 0, "")
+    stamps = [t.when for t in turns]
+    tally: list[Counter] = [Counter() for _ in turns]
+    agents: list[set] = [set() for _ in turns]
     for e in events:
-        who = f" agent {e.agent[:8]}" if e.agent else ""
-        # Local clock, not the raw UTC slice: the human-facing sections above use
-        # `_hhmm` (local), and a model copying a time out of this extract has to
-        # land on the same clock as the header beside it.
-        head = f"[{_hhmmss(e.when)}]{who} {e.kind}:"
-        if "\n" in e.text:
-            lines.append(head)
-            lines += ["  " + ln for ln in e.text.splitlines()]
+        # The turn this event followed: rightmost turn at or before it.
+        i = bisect.bisect_right(stamps, e.when) - 1
+        if i < 0:
+            continue
+        tally[i][e.kind] += 1
+        if e.agent:
+            agents[i].add(e.agent)
+    out = []
+    for counts, seen in zip(tally, agents):
+        bits = []
+        for kind, word in (("edit", "edit"), ("ran", "cmd"), ("tool", "tool"),
+                           ("failed", "failure")):
+            if counts[kind]:
+                bits.append(_plural(counts[kind], word))
+        if seen:
+            bits.append(_plural(len(seen), "agent"))
+        out.append(" · ".join(bits))
+    return out
+
+
+# Sized to keep a chunk call cheap against the harness floor without
+# fragmenting into so many calls that their fixed overhead dominates.
+_CHUNK_MAX_CHARS = 8_000
+
+
+def _chunk_material(events: list[_Event]) -> str:
+    """What one chunk call sees: only its own events, oldest first, nothing
+    else — no other chunk's material or output, and no prompt text repeated
+    across every chunk. Isolation by construction: a thread handed this string
+    has no way to see what any other chunk produced."""
+    return "\n".join(_event_block(e) for e in events)
+
+
+def _split_to_fit(bucket: list[_Event], max_chars: int) -> list[list[_Event]]:
+    """One bucket, split evenly by event count into as many pieces as it takes
+    to bring each under `max_chars` (by size, not by dropping). Even splitting
+    rather than repeatedly peeling off a chunk-sized head: peeling leaves one
+    shrinking remainder that has to be measured and split again, where an even
+    split sizes every piece in one pass."""
+    size = sum(len(_event_block(e)) for e in bucket)
+    if size <= max_chars or len(bucket) <= 1:
+        return [bucket]
+    pieces = min(len(bucket), -(-size // max_chars))  # ceil(size / max_chars)
+    step = -(-len(bucket) // pieces)  # ceil(len(bucket) / pieces)
+    return [bucket[i:i + step] for i in range(0, len(bucket), step)]
+
+
+def _chunk_activity(chunk: list[_Event]) -> bool:
+    """Whether a chunk becomes a call at all — a chunk holding only "you" events
+    (a turn's own words) is a quiet gap, not something to summarise. Both the
+    live call path and `_cost_rows` skip on this same test, so a dry run prices
+    exactly what a real run would spend."""
+    return any(e.kind != "you" for e in chunk)
+
+
+def _chunk_events(events: list[_Event], boundaries: list[str],
+                  max_chars: int) -> list[list[_Event]]:
+    """Events split into chunks for independent digest calls, in chronological
+    order. Every event lands in exactly one returned chunk — never dropped to
+    fit. `boundaries` (turn timestamps) are bucketed onto first, so a chunk
+    never straddles a turn gap; empty `boundaries` (catchup's single gap) is
+    one bucket split by size alone. Oversized buckets split further via `_split_to_fit`."""
+    if not events:
+        return []
+    if boundaries:
+        stamps = sorted(boundaries)
+        buckets: list[list[_Event]] = [[] for _ in stamps]
+        for e in events:
+            # Shouldn't occur before the first boundary, but lands in the first bucket if it does.
+            i = max(0, bisect.bisect_right(stamps, e.when) - 1)
+            buckets[i].append(e)
+    else:
+        buckets = [events]
+    chunks: list[list[_Event]] = []
+    for bucket in buckets:
+        if bucket:
+            chunks.extend(_split_to_fit(bucket, max_chars))
+    return chunks
+
+
+_KIND_LABELS = {"said": "what Claude said", "edit": "file edits",
+                "ran": "commands run", "output": "command output",
+                "failed": "failures (command + error)", "you": "your own turns",
+                "spawn": "subagents spawned", "tool": "other tool calls"}
+
+
+def _failures_section(events: list[_Event]) -> list[str]:
+    """What went wrong, computed and quoted verbatim — never the summariser's
+    job, so it doesn't ride on a model's discretion."""
+    failures = [e for e in events if e.kind == "failed"]
+    if not failures:
+        return []
+    out = [f"## What went wrong — {_plural(len(failures), 'failure')}\n"]
+    for e in failures[:6]:
+        cmd, _, body = e.text.partition("\n")
+        who = f" (agent {e.agent[:8]})" if e.agent else ""
+        head = f"- {_hhmm(e.when)}{who}"
+        out.append(f"{head}  `{cmd}`" if cmd else head)
+        # 600, above `_fail_excerpt`'s own 400-char bound: clipping twice cuts a
+        # marked excerpt a second time and prints "[+1 chars]" at the seam.
+        out.append(_quote(_clip(body, 600, _CATCHUP_HINT)) + "\n")
+    if len(failures) > 6:
+        out.append(f"*… and {_plural(len(failures) - 6, 'more failure')}.*\n")
+    return out
+
+
+# Slicing the timeline onto your turns
+# ---------------------------------------------------------------------------
+# Each bullet is placed under the turn it followed. The boundary is known
+# before any call is made: each turn's `.when` is a `_chunk_events` boundary,
+# so a chunk maps 1:1 to a turn gap and needs no placement guess afterward.
+
+# A numbered list counts too — falling back to a flat timeline over a `1.` costs
+# the whole feature to save one alternation.
+_BULLET_START_RE = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+\S")
+
+
+def _timeline_bullets(text: str) -> tuple[list[str], list[str]]:
+    """(whatever preceded the first bullet, one entry per bullet). Continuation
+    lines ride with the bullet above them, or a wrapped line gets placed by a
+    clock that isn't its own."""
+    preamble: list[str] = []
+    bullets: list[str] = []
+    for line in text.splitlines():
+        if _BULLET_START_RE.match(line):
+            bullets.append(line.rstrip())
+        elif not line.strip():
+            continue
+        elif bullets:
+            bullets[-1] += "\n" + line.rstrip()
         else:
-            lines.append(f"{head} {e.text}")
-    return "\n".join(lines)
+            preamble.append(line.rstrip())
+    return preamble, bullets
+
+
+def _chunk_bullets(text: str) -> list[str]:
+    """One chunk digest's bullets. Falls back to the preamble when a reply has
+    no bullet markers at all, rather than dropping the model's only output for
+    that chunk silently."""
+    preamble, bullets = _timeline_bullets(text)
+    return bullets or preamble
+
+
+def _spine(turns: list[_Turn]) -> list[str]:
+    """Your turns inside the window, listed flat — where the recap goes when the
+    timeline isn't being sliced onto them."""
+    out = [f"### Then you said ({_plural(len(turns), 'turn')})\n"]
+    for t in turns:
+        tag = "answered" if t.kind == "answered" else "said"
+        out.append(f"- **{_hhmm(t.when)}** ({tag}) "
+                   + _clip_line(t.text.replace("\n", " · "), 150))
+    return out + [""]
+
+
+def _interleaved(turns: list[_Turn], buckets: list[list[str]],
+                 preamble: list[str]) -> list[str]:
+    """Your turns verbatim, each followed by the bullets placed under it.
+    `buckets` is one entry per turn — the chunk boundary *is* the turn boundary,
+    so there is nothing to place here. A bucket may instead hold a single
+    failure notice rather than real bullets; either way it prints as the
+    turn's activity. Headings use the `You said`/`You answered` wording
+    `_md_ansi` keys its green-for-yours colour off."""
+    out: list[str] = []
+    if preamble:
+        out += preamble + [""]
+    for i, (turn, bullets) in enumerate(zip(turns, buckets)):
+        verb = "You answered" if turn.kind == "answered" else "You said"
+        out.append(f"### {verb} ({_hhmm(turn.when)})\n")
+        # Your own words — clipped high (2,000) since a turn can be a paste.
+        out.append(_quote(_clip(turn.text, 2000, _CATCHUP_HINT)) + "\n")
+        # The last turn is the window's far edge, so nothing follows it by construction.
+        empty = ("*The window ends here.*" if i == len(turns) - 1
+                 else "*Nothing in the timeline fell in this gap.*")
+        out += bullets or [empty]
+        out.append("")
+    return out
+
+
+def _cost_rows(events: list[_Event], boundaries: list[str]):
+    """`events` chunked exactly as a live run would, then sized off exactly what
+    each chunk's call would send. Shared by `_dry_run_report` and the wizard's
+    cost step so the two can't drift into quoting different numbers.
+
+    Returns `(rows, by_kind)`: `rows` is one `(chunk, material_chars, called)`
+    per chunk, `called` from `_chunk_activity` so "chunks called" matches what
+    a real run would spend. `by_kind` aggregates only the called chunks."""
+    chunks = _chunk_events(events, boundaries, _CHUNK_MAX_CHARS)
+    by_kind: dict[str, list[int]] = {}
+    rows: list[tuple[list[_Event], int, bool]] = []
+    for chunk in chunks:
+        called = _chunk_activity(chunk)
+        chars = 0
+        if called:
+            for e in chunk:
+                row = by_kind.setdefault(e.kind, [0, 0])
+                row[0] += 1
+                row[1] += len(_event_block(e))
+            chars = len(_chunk_material(chunk))
+        rows.append((chunk, chars, called))
+    return rows, by_kind
+
+
+def _dry_run_report(events: list[_Event], boundaries: list[str],
+                    cmd: str = "last --here") -> str:
+    """`--dry-run`'s answer to "what is this going to cost, and why". Prices it
+    the way a live run actually spends it, via `_cost_rows`, so totals reconcile
+    to what a real run would send rather than approximating it. Characters are
+    the computed fact; tokens carry `~` since `_est_tokens` is chars/4."""
+    rows, by_kind = _cost_rows(events, boundaries)
+    called = [(chunk, chars) for chunk, chars, ok in rows if ok]
+    n_called, n_total = len(called), len(rows)
+
+    prompt_chars = len(_CHUNK_PROMPT) * n_called
+    material_chars = sum(chars for _, chars in called)
+    total_chars = prompt_chars + material_chars
+    pct = lambda n: f"{round(100 * n / total_chars)}%" if total_chars else "0%"
+    size = lambda n: f"{n:,} chars · {_fmt_tokens(round(n / 4))} tokens · {pct(n)}"
+
+    out = ["## Dry run — nothing was sent\n",
+           "*No model call was made. Every figure below is measured off the exact "
+           f"text `{cmd}` would split into chunks and pipe to "
+           f"`claude -p --model {HaikuSummariser.model}`, one call per chunk.*\n"]
+    skipped = n_total - n_called
+    out.append(f"{_plural(n_called, 'call')} would be made"
+               + (f" ({_plural(skipped, 'chunk')} skipped — nothing in them but "
+                  "your own turns)" if skipped else "") + ".\n")
+    if called:
+        sizes = sorted(c for _, c in called)
+        mid = sizes[len(sizes) // 2]
+        out.append("Chunk sizes: " + (
+            f"min {size(sizes[0])}, median {size(mid)}, max {size(sizes[-1])}."
+            if len(sizes) > 1 else f"{size(sizes[0])}.") + "\n")
+
+    out.append("Where the tokens come from:")
+    kind_rows = [(_KIND_LABELS.get(k, k), v[1], v[0]) for k, v in by_kind.items()]
+    kind_rows.sort(key=lambda r: -r[1])
+    out.append(f"- instructions (the chunk prompt) — {size(len(_CHUNK_PROMPT))} "
+               f"× {n_called} = {size(prompt_chars)}")
+    for label, chars, n in kind_rows:
+        out.append(f"- {label} — {_plural(n, 'event')} · {size(chars)}")
+    framing = material_chars - sum(v[1] for v in by_kind.values())
+    out.append(f"- extract framing (headers, newlines) — {size(max(0, framing))}")
+
+    blocks = [(e, _event_block(e)) for chunk, _, ok in rows if ok for e in chunk]
+    biggest = sorted(blocks, key=lambda p: -len(p[1]))[:3]
+    if biggest and len(biggest[0][1]) > 500:
+        out.append("\nBiggest single events:")
+        # Two lines, not one: an edit's block leads with the timestamp and puts
+        # the file path underneath it, so a head-line-only row names nothing.
+        out += [f"- {_fmt_tokens(_est_tokens(b))} tokens — "
+                + _clip_line(" ".join(ln.strip() for ln in b.splitlines()[:2]), 70)
+                for _, b in biggest]
+
+    # Rounded per chunk, same order `_render_window` sums in — a single total
+    # rounding would drift from what `_usage_note` calls "extract estimated".
+    est = n_called * _est_tokens(_CHUNK_PROMPT) + sum(round(c / 4) for _, c in called)
+    floor_total = _HARNESS_FLOOR * n_called
+    out.append("\nTotal:")
+    out.append(f"- extract across {_plural(n_called, 'call')} — {total_chars:,} chars · "
+               f"{_fmt_tokens(est)} tokens")
+    # Stated separately, never summed silently — a harness measurement, not a property of this extract.
+    out.append(f"- `claude -p` floor — ~{_HARNESS_FLOOR:,} tokens × {n_called} "
+               f"(measured {_HARNESS_FLOOR_WHEN}, not re-measured for this run) "
+               f"= {_fmt_tokens(floor_total)}")
+    out.append(f"- **so roughly {_fmt_tokens(est + floor_total)} input tokens across "
+               f"{_plural(n_called, 'call')}**")
+    return "\n".join(out)
 
 
 def _hhmm(ts: str) -> str:
@@ -2225,18 +2423,13 @@ def _ago(ts: str, mtime: float) -> str:
     return f"{int(secs)}w ago"
 
 
-def _pick_transcript() -> pathlib.Path:
-    """`last --here`'s picker — used only here. `live_transcript` itself stays
-    untouched: `mark` and `name` depend on its silent newest-file fallback and
-    must keep that behaviour exactly.
-
-    A picker only makes sense at an interactive terminal: `CLAUDE_CODE_SESSION_ID`
-    already answers the question unambiguously, and a script or `!` run blocking
-    on `input()` is a hang, not a feature. Anything non-interactive — no tty on
-    stdin, or stderr not a tty to draw the list on — falls through to
-    `live_transcript()` byte-for-byte.
-    """
-    if os.environ.get("CLAUDE_CODE_SESSION_ID", "") or not (
+def _pick_transcript(live_only: bool = True) -> pathlib.Path:
+    """`last --here`'s picker — used only here; `live_transcript` itself stays
+    untouched since `mark`/`name` depend on its silent newest-file fallback.
+    Non-interactive (no tty on stdin or stderr) falls through to
+    `live_transcript()` byte-for-byte, since blocking on `input()` would hang a script."""
+    # `live_only=False` (recap) always asks: the session you're in is rarely the one you want.
+    if (live_only and os.environ.get("CLAUDE_CODE_SESSION_ID", "")) or not (
         sys.stdin.isatty() and sys.stderr.isatty()
     ):
         return live_transcript()
@@ -2251,8 +2444,7 @@ def _pick_transcript() -> pathlib.Path:
             mtime = 0.0
         return (last_activity(p), mtime)
 
-    # Same key `latest_transcript` sorts by, ascending instead of reverse: oldest
-    # first, newest last — the newest sits at the bottom, beside the prompt.
+    # Ascending, so the newest sits last, beside the prompt Enter picks.
     ranked = sorted(cands, key=recency)[-8:]
     rows = []
     for p in ranked:
@@ -2267,9 +2459,7 @@ def _pick_transcript() -> pathlib.Path:
     default = len(ranked)  # newest = last row = the one Enter picks
     idx_w, age_w, dur_w = len(str(default)), max(len(r[0]) for r in rows), \
         max(len(r[1]) for r in rows)
-    # This function only runs at a tty by construction (see docstring), but
-    # NO_COLOR must still win — and it's stderr being drawn to here, not
-    # stdout, so `_colour_ok` needs telling which stream to ask.
+    # stderr here, not stdout, so `_colour_ok` needs telling which stream to ask.
     bold, dim, reset = ("\033[1m", "\033[2m", "\033[0m") if _colour_ok(sys.stderr) else ("", "", "")
     # Capped, same pattern as `cmd_sessions`: an unclipped title wraps at the
     # terminal's own column 0 and reads as a second row, not a folded one.
@@ -2298,16 +2488,42 @@ _CATCHUP_HINT = "the transcript has the rest"
 
 
 def _status(msg: str) -> None:
-    """A transient one-line stderr narration of which phase catch-up is in.
-    Gated on the tty, not just "not captured": stdout is the document — it has
-    to come out byte-identical whether piped, redirected, or run via `!` — so
-    the only safe place for progress chatter is stderr, and only when a human
-    is actually watching it flicker. Dim, like `_dim`'s quoted text — secondary,
-    not the record — but the tty check above already implies `_colour_ok`
-    except for NO_COLOR, so this only needs to check that."""
+    """Transient one-line stderr narration of catch-up's phase. Tty-gated,
+    never stdout — stdout is the document and must stay byte-identical."""
     if sys.stderr.isatty():
         text = f"\033[2m{msg}\033[0m" if _colour_ok(sys.stderr) else msg
         sys.stderr.write(f"\r{text}\033[K")
+        sys.stderr.flush()
+
+
+def _usage_note(usage: dict, seconds: float, est: int) -> str:
+    """What the call was actually charged, once it's over. Beside the estimate
+    that preceded it, because `_est_tokens` is chars/4 and this is the only
+    thing that ever says by how much it was off."""
+    got = lambda k: int(usage.get(k) or 0)
+    fresh, made, read = (got("input_tokens"), got("cache_creation_input_tokens"),
+                         got("cache_read_input_tokens"))
+    total = fresh + made + read
+    # Read and creation are not the same thing and must not be added together:
+    # a cache read is billed well below base rate, writing the cache above it.
+    split = [f"{read:,} cache read" if read else "",
+             f"{made:,} cache write" if made else ""]
+    bits = [f"{total:,} in" + (f" ({', '.join(b for b in split if b)})"
+                               if any(split) else "")]
+    bits += [f"{got('output_tokens'):,} out", f"{seconds:.1f}s"]
+    # The extract was `est`; the rest is the harness. Naming the split is the
+    # point — it is what `--dry-run` predicts, and the only check on it.
+    if est and total > est:
+        bits.append(f"extract estimated ~{est:,}, harness ~{total - est:,}")
+    return "haiku: " + " · ".join(bits)
+
+
+def _note(msg: str) -> None:
+    """A line of narration that stays on screen, unlike `_status`. stderr and
+    tty-only for the same reason: stdout is the document."""
+    if sys.stderr.isatty():
+        text = f"\033[2m{msg}\033[0m" if _colour_ok(sys.stderr) else msg
+        sys.stderr.write(f"\r\033[K{text}\n")
         sys.stderr.flush()
 
 
@@ -2317,12 +2533,26 @@ def _clear_status() -> None:
         sys.stderr.flush()
 
 
+# Constant of the *harness*, measured not computed.
+_HARNESS_FLOOR = 158
+_HARNESS_FLOOR_WHEN = "2026-08-16"
+
+
+def _est_tokens(text: str) -> int:
+    """Chars/4. An exact count needs the model's tokeniser and `dependencies`
+    stays empty, so every number derived from this prints with a `~` and the
+    exact character count beside it — the chars are the fact, the tokens are the
+    estimate, and prose-vs-diff mix moves the real ratio either way by a quarter."""
+    return round(len(text) / 4)
+
+
+def _fmt_tokens(n: int) -> str:
+    return f"~{n / 1000:.1f}k" if n >= 1000 else f"~{n}"
+
+
 class _Ticker:
-    """Elapsed-time status while `HaikuSummariser.timeline` sits inside a
-    blocking `subprocess.run`. There's no real progress to report — a daemon
-    thread that reprints "still going" every couple of seconds is the
-    cheapest honest liveness signal short of rewriting the backend around
-    Popen (and feeding it 40KB of stdin without deadlocking)."""
+    """Elapsed-time status while a blocking `subprocess.run` call sits with no
+    real progress to report."""
 
     def __init__(self, label: str):
         self._label = label
@@ -2345,14 +2575,7 @@ class _Ticker:
 
 
 def cmd_catchup(args) -> int:
-    # Colour is presentation only, and only for a human watching a tty: bytes
-    # piped or captured must stay exact markdown, so this checks once and the
-    # print sites below just call it.
-    def out(text: str, **kw) -> None:
-        print(_md_ansi(text) if _colour_ok() else text, **kw)
-
-    # Pick before the status line starts: `_status` writes `\r...\033[K` to
-    # stderr, which would garble the picker's own rendering there.
+    # Pick before the status line starts, or `_status`'s stderr writes garble the picker.
     path = _pick_transcript()
     _status("reading the live transcript…")
     meta = extract_meta(path)
@@ -2361,29 +2584,47 @@ def cmd_catchup(args) -> int:
         _clear_status()
         raise SystemExit("nothing typed in this conversation yet — no prompt to catch up from")
     anchor_line, anchor_rec = anchor
-    prompt_text = _typed_text(anchor_rec)
-    anchor_ts = str(anchor_rec.get("timestamp") or "")
+    return _render_window(path, meta, anchor_line, str(anchor_rec.get("timestamp") or ""),
+                          _typed_text(anchor_rec), "", args)
 
-    # Header and your own prompt need nothing but the anchor, so they print
-    # before the (slower) event walk — the first thing on screen is what you
-    # typed, not silence.
+
+def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: str,
+                   prompt_text: str, until_ts: str, args, turns: list[_Turn] | None = None) -> int:
+    """The document, for a window with a start and an optional end. One body
+    for `last --here` and `recap` — they differ only in how the window was
+    chosen. `until_ts` empty means "to now", the live case."""
+    def out(text: str, **kw) -> None:
+        print(_md_ansi(text) if _colour_ok() else text, **kw)
+
+    live = not until_ts
+    # `--dry-run` makes no call, so there's nothing to slice.
+    interleave = bool(turns) and not live and not getattr(args, "dry_run", False)
+    # Prints before the slower event walk, so the first thing on screen is what you typed.
     _clear_status()
-    header = [f"# Catch-up — {meta.title}"]
-    bits = [meta.project_name, f"your prompt at {_hhmm(anchor_ts)}",
-            f"snapshot at {datetime.now().astimezone().strftime('%H:%M')} — "
-            "the transcript trails the live screen"]
+    header = [f"# {'Catch-up' if live else 'Recap'} — {meta.title}"]
+    bits = [meta.project_name, f"your prompt at {_hhmm(anchor_ts)}"]
+    bits.append(f"snapshot at {datetime.now().astimezone().strftime('%H:%M')} — "
+                "the transcript trails the live screen" if live
+                else f"window ends {_hhmm(until_ts)}")
     header.append(f"*{' · '.join(bits)}*\n")
     header.append(f"## You said ({_hhmm(anchor_ts)})\n")
     header.append(_quote(_clip(prompt_text, 500, _CATCHUP_HINT)) + "\n")
+    # Moves down to the interleave instead when slicing — printing both would repeat the text.
+    if turns and not interleave:
+        header += _spine(turns)
     out("\n".join(header), flush=True)
 
-    _status("reading the live transcript…")
-    events = _events_since(path, anchor_line, anchor_ts)
+    _status("reading the transcript…")
+    events = _events_since(path, anchor_line, anchor_ts, until_ts)
+    # Your own turns are events too, or the extract shows a direction change with no cause.
+    if turns:
+        events += [_Event(t.when, "", "you", t.text) for t in turns]
+        events.sort(key=lambda e: e.when)
     _status(f"{_plural(len(events), 'event')} since {_hhmm(anchor_ts)}")
 
     if not events:
         _clear_status()
-        out("*Nothing recorded since — either it just started, or the "
+        out("*Nothing recorded in that window — either it just started, or the "
             "transcript hasn't caught up yet.*", flush=True)
         return 0
 
@@ -2406,7 +2647,8 @@ def cmd_catchup(args) -> int:
         if a and b:
             span = _fmt_secs(max(0, int((b - a).total_seconds())))
 
-    since = [f"## Since then — {_plural(len(events), 'event')}"
+    since = [f"## {'Since then' if live else 'In that window'} — "
+             f"{_plural(len(events), 'event')}"
              + (f" over {span}" if span else "") + "\n"]
     if edited:
         since.append("Files changed:")
@@ -2420,6 +2662,8 @@ def cmd_catchup(args) -> int:
         since += [f"- `{a}`" + (f"  {desc[a]}" if desc.get(a) else "") for a in agents_seen]
         since.append("")
 
+    since += _failures_section(events)
+
     said = [e for e in events if e.kind == "said"]
     if said:
         last = said[-1]
@@ -2430,37 +2674,516 @@ def cmd_catchup(args) -> int:
     _clear_status()
     out("\n".join(since), flush=True)
 
-    material = _catchup_material(anchor_ts, prompt_text, events)
-    omitted, kept = 0, list(events)
-    while len(material) > 40_000 and len(kept) > 12:
-        # Drop from the early middle: the opening shows what was set up, the tail
-        # is what you're catching up to.
-        kept.pop(len(kept) // 3)
-        omitted += 1
-        material = _catchup_material(anchor_ts, prompt_text, kept, omitted)
+    # Built off `turns`/`live` directly, not `interleave`, so a dry run still
+    # prices the chunks a real run would make.
+    spine = ([_Turn(anchor_line, anchor_ts, "said", prompt_text)] + list(turns or [])
+             if turns and not live else [])
+    boundaries = [t.when for t in spine]
 
-    # Last, beneath everything verbatim, so a wrong sentence sits next to the
-    # quotes and computed lists that would contradict it.
-    timeline = [f"## {_MODEL_WRITTEN_HEADING}\n",
-                "*The one non-verbatim section chsum prints: written by "
-                f"`claude -p --model {HaikuSummariser.model}` from a verbatim extract "
-                "of the events above. Where it and the transcript disagree, the "
-                "transcript wins."
-                + (f" Extract clipped: {omitted} events omitted." if omitted else "")
-                + "*\n"]
-    try:
-        with _Ticker("haiku is writing the timeline"):
-            timeline.append(HaikuSummariser().timeline(material))
-    except SummariserError as e:
-        # _Ticker.__exit__ already cleared the status line on the way out.
-        timeline.append(f"*Timeline unavailable — {e}. Everything above is still verbatim.*")
+    if getattr(args, "dry_run", False):
+        _clear_status()
+        out(_dry_run_report(events, boundaries, "last --here" if live else "recap"))
+        return 0
+
+    # One call per chunk, run independently and in parallel — no chunk's call
+    # ever sees another chunk's material or output.
+    chunks = _chunk_events(events, boundaries, _CHUNK_MAX_CHARS)
+
+    def _run_chunk(chunk: list[_Event]) -> tuple[str, dict, float, str]:
+        """(bullets text, usage, seconds, error) — never raises, so one chunk's
+        failure can't break `executor.map`'s order for the rest."""
+        if not _chunk_activity(chunk):
+            return "", {}, 0.0, ""
+        summariser = HaikuSummariser()
+        try:
+            text = summariser.digest(_CHUNK_PROMPT, _chunk_material(chunk))
+            return text, summariser.usage, summariser.seconds, ""
+        except SummariserError as e:
+            return "", summariser.usage, summariser.seconds, str(e)
+
+    chunk_est = sum(_est_tokens(_CHUNK_PROMPT) + _est_tokens(_chunk_material(c))
+                    for c in chunks if _chunk_activity(c))
+    with _Ticker(f"haiku is writing {_plural(len(chunks), 'chunk')} of the timeline "
+                 f"— {_fmt_tokens(chunk_est)} tokens total"):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(chunks))) as ex:
+            # `map` preserves submission order, so chunk order stays chronological.
+            results = list(ex.map(_run_chunk, chunks))
+
+    total_usage: dict = {}
+    total_seconds = 0.0
+    for _, usage, seconds, _err in results:
+        total_seconds += seconds
+        for k, v in (usage or {}).items():
+            if isinstance(v, (int, float)):
+                total_usage[k] = total_usage.get(k, 0) + v
+
+    # Every chunk failing degrades to verbatim sections plus a one-line notice;
+    # a mix of hits and misses gives each failed gap its own notice.
+    all_failed = bool(results) and all(err for *_, err in results)
+    unavailable = (f"*Timeline unavailable — {results[0][3]}. Everything above "
+                   "is still verbatim.*" if all_failed else "")
+
+    sliced: list[str] = []
+    written = ""
+    if interleave and not all_failed:
+        stamps = sorted(boundaries)
+        turn_bullets: list[list[str]] = [[] for _ in spine]
+        for chunk, (text, _, _, err) in zip(chunks, results):
+            # Re-derives which turn this chunk belongs to via its first event's timestamp.
+            idx = max(0, bisect.bisect_right(stamps, chunk[0].when) - 1)
+            if err:
+                turn_bullets[idx].append(
+                    f"*Digest unavailable for part of this gap — {err}. The "
+                    "verbatim record above still covers it.*")
+            elif text:
+                turn_bullets[idx].extend(_chunk_bullets(text))
+        sliced = _interleaved(spine, turn_bullets, [])
+    elif not all_failed:
+        parts: list[str] = []
+        for text, _, _, err in results:
+            if err:
+                parts.append(f"*Digest unavailable for part of this window — {err}. "
+                             "The verbatim record above still covers it.*")
+            elif text:
+                parts.extend(_chunk_bullets(text))
+        written = "\n".join(parts)
+
+    timeline = [f"## {_MODEL_WRITTEN_HEADING}\n"]
+    if sliced:
+        timeline.append(
+            "*Your turns below are verbatim. The bullets under each come from "
+            f"a dedicated `claude -p --model {HaikuSummariser.model}` call "
+            "scoped to just that turn's own events above (split into more "
+            "than one call if that gap was large), run independently of every "
+            "other turn's call. Where a bullet and the transcript disagree, "
+            "the transcript wins.*\n")
+        timeline += sliced
+    else:
+        timeline.append(
+            "*The one non-verbatim section chsum prints: written by "
+            f"`claude -p --model {HaikuSummariser.model}`, one call per chunk "
+            "of the events above, each run independently from a verbatim "
+            "extract of just its own chunk. Where it and the transcript "
+            "disagree, the transcript wins.*\n")
+        # The header left the spine out for a slice that then didn't happen —
+        # every chunk failed. Your turns still belong in the document.
+        if interleave and turns:
+            timeline += _spine(turns)
+        timeline.append(written or unavailable)
     out("\n".join(timeline).rstrip())
+    # After the document, and on stderr: what the calls were actually charged,
+    # summed across all of them — the one set of numbers here that is neither
+    # verbatim nor estimated but measured.
+    if total_usage:
+        _note(_usage_note(total_usage, total_seconds, chunk_est))
     return 0
+
+
+@contextlib.contextmanager
+def _tty_curses():
+    """curses drawn on `/dev/tty` with fd 1 pointed at it for the duration —
+    fd 1 is the document, so stdout is restored before anything prints. Raises
+    if there's no controlling terminal; the caller falls back to typed prompts."""
+    tty = os.open("/dev/tty", os.O_RDWR)
+    saved = os.dup(1)
+    scr = None
+    try:
+        os.dup2(tty, 1)
+        scr = curses.initscr()
+        curses.noecho()
+        curses.cbreak()
+        scr.keypad(True)
+        # 80ms: long enough that a split arrow-key sequence isn't misread as Escape.
+        if hasattr(curses, "set_escdelay"):
+            curses.set_escdelay(80)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass  # terminals that can't hide the cursor still work
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_CYAN, -1)
+            curses.init_pair(2, curses.COLOR_YELLOW, -1)
+        except curses.error:
+            pass
+        yield scr
+    finally:
+        if scr is not None:
+            scr.keypad(False)
+            curses.echo()
+            curses.nocbreak()
+            curses.endwin()
+        os.dup2(saved, 1)
+        os.close(saved)
+        os.close(tty)
+
+
+class _Wizard:
+    """Arrow-key selection for `recap`: session, then start turn, then end turn,
+    then what it will cost before anything is spent. Escape steps back rather
+    than quitting, since every step is a guess you refine."""
+
+    HELP = {
+        0: "↑↓ move · enter choose session · esc quit",
+        1: "↑↓ move · enter set START · esc back to sessions",
+        2: "↑↓ move · enter set END · esc back to start",
+        3: "enter run the recap · esc back to end",
+    }
+
+    def __init__(self, cands: list[pathlib.Path]):
+        self.cands = cands
+        self.step = 0
+        self.cursor = 0
+        self.top = 0
+        self.path: pathlib.Path | None = None
+        self.turns: list[_Turn] = []
+        self.acts: list[str] = []
+        self.start = 0
+        self.end = 0
+        self.cost: list[str] = []
+        self.lines: list[str] = []
+        self.line_turn: list[int] = []
+        self.line_kind: list[str] = []
+        self.rows = [self._session_row(p) for p in cands]
+        # Newest last and selected, same default as the typed picker.
+        self.cursor = max(0, len(cands) - 1)
+
+    @staticmethod
+    def _session_row(p: pathlib.Path) -> tuple[str, str, str]:
+        m = extract_meta(p)
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        title = ("✎ " if m.renamed else "") + (m.title or "(untitled)")
+        return (_ago(last_activity(p), mtime), m.duration or "-", title)
+
+    # -- drawing ---------------------------------------------------------
+    def _draw(self, scr) -> None:
+        scr.erase()
+        h, w = scr.getmaxyx()
+        head = {0: "which session?", 1: "start where?", 2: "end where?",
+                3: "what this will cost"}[self.step]
+        scr.addnstr(0, 0, head, w - 1, curses.A_BOLD)
+        body_h = max(1, h - 3)
+        if self.step == 3:
+            for i, line in enumerate(self.cost[:body_h]):
+                scr.addnstr(2 + i, 0, line, w - 1)
+        else:
+            lines = self._lines()
+            # The cursor is a turn, but a turn is several lines: scroll so its
+            # whole block is on screen, not just the line the index points at.
+            owners = self.line_turn if self.step else list(range(len(lines)))
+            mine = [i for i, o in enumerate(owners) if o == self.cursor] or [0]
+            if mine[0] < self.top:
+                self.top = mine[0]
+            elif mine[-1] >= self.top + body_h:
+                self.top = min(mine[0], mine[-1] - body_h + 1)
+            self.top = max(0, min(self.top, max(0, len(lines) - body_h)))
+            for i, text in enumerate(lines[self.top:self.top + body_h]):
+                idx = self.top + i
+                owner = owners[idx]
+                # Two channels: colour says what the line is, gutter+bold says whether it's in range.
+                kind = self.line_kind[idx] if self.step else "said"
+                attr = {"said": curses.A_NORMAL,
+                        "answered": curses.color_pair(2),
+                        "act": curses.A_DIM}.get(kind, curses.A_NORMAL)
+                if self._in_range(owner):
+                    attr |= curses.A_BOLD
+                if owner == self.cursor:
+                    attr |= curses.A_REVERSE
+                if self.step:
+                    gutter = "│ " if self._in_range(owner) else "  "
+                    scr.addnstr(2 + i, 0, gutter, 2, curses.color_pair(1))
+                    scr.addnstr(2 + i, 2, text.ljust(w - 3)[:w - 3], w - 3, attr)
+                else:
+                    scr.addnstr(2 + i, 0, text.ljust(w - 1)[:w - 1], w - 1, attr)
+        scr.addnstr(h - 1, 0, self.HELP[self.step][:w - 1], w - 1, curses.A_DIM)
+        scr.refresh()
+
+    def _in_range(self, idx: int) -> bool:
+        """Rows that would be included, highlighted as the end moves — the point
+        of doing this on a screen rather than by typing two numbers."""
+        if self.step != 2:
+            return False
+        lo, hi = sorted((self.start, self.cursor))
+        return lo <= idx <= hi
+
+    def _build_turn_lines(self, width: int) -> None:
+        """Each turn as however many lines its text needs, plus what happened
+        after it on a line of its own. Nothing you typed is shortened here —
+        this is the screen where you decide what to include."""
+        n = len(self.turns)
+        w = len(str(n))
+        # Two columns of gutter, drawn separately, so range membership can be
+        # shown without spending the text's own colour on it.
+        indent = " " * (w + 8)
+        body_w = max(24, width - len(indent) - 3)
+        self.lines, self.line_turn, self.line_kind = [], [], []
+        for i, t in enumerate(self.turns):
+            flag = "?" if t.kind == "answered" else " "
+            head = f"{i + 1:>{w}}{flag} {_hhmm(t.when)}  "
+            para = [ln for raw in t.text.splitlines() or [""]
+                    for ln in (textwrap.wrap(raw, body_w) or [""])]
+            for j, ln in enumerate(para):
+                self.lines.append((head if j == 0 else indent) + ln)
+                self.line_turn.append(i)
+                self.line_kind.append(t.kind)  # "said" | "answered"
+            act = self.acts[i] if i < len(self.acts) else ""
+            if act:
+                # Tagged to the same turn so it highlights with it, not as a row you could land on.
+                self.lines.append(f"{indent}↳ {act}")
+                self.line_turn.append(i)
+                self.line_kind.append("act")
+
+    def _lines(self) -> list[str]:
+        if self.step == 0:
+            aw = max((len(r[0]) for r in self.rows), default=3)
+            dw = max((len(r[1]) for r in self.rows), default=3)
+            return [f"{a:<{aw}}  {d:<{dw}}  {t}" for a, d, t in self.rows]
+        return self.lines
+
+    # -- steps -----------------------------------------------------------
+    def _load_session(self, scr) -> bool:
+        scr.erase()
+        scr.addnstr(0, 0, "reading the transcript…", scr.getmaxyx()[1] - 1)
+        scr.refresh()
+        self.turns = _your_turns(self.cands[self.cursor])
+        if not self.turns:
+            scr.addnstr(2, 0, "nothing typed in that session — esc to go back",
+                        scr.getmaxyx()[1] - 1)
+            scr.refresh()
+            scr.getch()
+            return False
+        self.path = self.cands[self.cursor]
+        self.acts = _turn_activity(self.path, self.turns)
+        self._build_turn_lines(scr.getmaxyx()[1] - 1)
+        return True
+
+    def _load_cost(self, scr) -> None:
+        scr.erase()
+        scr.addnstr(0, 0, "sizing the extract…", scr.getmaxyx()[1] - 1)
+        scr.refresh()
+        lo, hi = sorted((self.start, self.cursor))
+        a, b = self.turns[lo], self.turns[hi]
+        assert self.path is not None
+        events = _events_since(self.path, a.line, a.when, b.when)
+        inner = [t for t in self.turns if a.when < t.when <= b.when]
+        events += [_Event(t.when, "", "you", t.text) for t in inner]
+        events.sort(key=lambda e: e.when)
+        # Mirrors `_render_window`'s `spine`, so this prices the N calls a real run would make.
+        boundaries = [t.when for t in [a] + inner]
+        rows, by_kind = _cost_rows(events, boundaries)
+        called = [(chunk, chars) for chunk, chars, ok in rows if ok]
+        n_called, n_total = len(called), len(rows)
+        prompt_chars = len(_CHUNK_PROMPT) * n_called
+        material_chars = sum(chars for _, chars in called)
+        total_chars = prompt_chars + material_chars
+        est = n_called * _est_tokens(_CHUNK_PROMPT) + sum(round(c / 4) for _, c in called)
+        self.cost = [
+            f"turns {lo + 1}–{hi + 1}   {_hhmm(a.when)} → {_hhmm(b.when)}"
+            f"   {_plural(len(events), 'event')}   {_plural(n_called, 'call')}"
+            + (f" ({n_total - n_called} skipped)" if n_total > n_called else ""),
+            "",
+        ]
+        kind_rows = sorted(((_KIND_LABELS.get(k, k), v[1], v[0]) for k, v in by_kind.items()),
+                           key=lambda r: -r[1])
+        for label, chars, cnt in kind_rows:
+            self.cost.append(f"  {label:<28} {_plural(cnt, 'event'):>12}"
+                             f"  {_fmt_tokens(round(chars / 4)):>7} tokens")
+        self.cost += [
+            f"  {'chunk instructions':<28} {_plural(n_called, 'call'):>12}"
+            f"  {_fmt_tokens(round(prompt_chars / 4)):>7} tokens",
+            "",
+            f"  extract          {total_chars:>9,} chars   ~{est:,} tokens",
+            f"  claude -p floor  {'':>9}          ~{_HARNESS_FLOOR:,} tokens × {n_called}"
+            f"  (measured {_HARNESS_FLOOR_WHEN})",
+            f"  total                                ~{est + _HARNESS_FLOOR * n_called:,} tokens",
+        ]
+
+    @staticmethod
+    def _decode_escape(scr) -> int:
+        """An undecoded `ESC [ X` / `ESC O X` sequence to its key, else 27.
+        Non-blocking, so a lone Escape reports immediately rather than stalling."""
+        scr.nodelay(True)
+        try:
+            nxt = scr.getch()
+            if nxt not in (ord("["), ord("O")):
+                return 27
+            final = scr.getch()
+        finally:
+            scr.nodelay(False)
+        return {ord("A"): curses.KEY_UP, ord("B"): curses.KEY_DOWN,
+                ord("5"): curses.KEY_PPAGE, ord("6"): curses.KEY_NPAGE,
+                ord("H"): curses.KEY_HOME, ord("F"): curses.KEY_END}.get(final, 27)
+
+    def run(self, scr) -> tuple[pathlib.Path, _Turn, _Turn] | None:
+        while True:
+            self._draw(scr)
+            key = scr.getch()
+            if key in (ord("q"), 3):  # q, ctrl-c
+                return None
+            if key == 27:
+                # Escape, or an arrow whose sequence ncurses didn't decode for this terminal.
+                key = self._decode_escape(scr)
+            if key == 27:  # a real Escape: back one step, or out of the first
+                if self.step == 0:
+                    return None
+                self.step -= 1
+                if self.step == 1:
+                    self.cursor = self.start
+                continue
+            if key in (curses.KEY_ENTER, 10, 13):
+                if self.step == 0:
+                    if self._load_session(scr):
+                        self.step, self.cursor, self.top = 1, 0, 0
+                elif self.step == 1:
+                    self.start = self.cursor
+                    self.step = 2
+                elif self.step == 2:
+                    self.end = self.cursor
+                    self._load_cost(scr)
+                    self.step = 3
+                else:
+                    lo, hi = sorted((self.start, self.end))
+                    assert self.path is not None
+                    return self.path, self.turns[lo], self.turns[hi]
+                continue
+            if self.step == 3:
+                continue
+            # Steps 1 and 2 move by turn, not by line — a multi-line turn is one thing to choose.
+            n = len(self.rows) if self.step == 0 else len(self.turns)
+            h = max(1, scr.getmaxyx()[0] - 3)
+            moves = {curses.KEY_UP: -1, ord("k"): -1, curses.KEY_DOWN: 1, ord("j"): 1,
+                     curses.KEY_PPAGE: -h, curses.KEY_NPAGE: h}
+            if key in moves:
+                self.cursor = max(0, min(n - 1, self.cursor + moves[key]))
+            elif key == curses.KEY_HOME:
+                self.cursor = 0
+            elif key == curses.KEY_END:
+                self.cursor = n - 1
+
+
+def _ask(prompt: str, default: int, hi: int) -> int:
+    """One numbered choice on stderr, defaulting on empty input. stderr because
+    stdout is the document, and written rather than passed to `input()` for the
+    same reason — `input`'s own prompt goes to stdout."""
+    bold, reset = ("\033[1m", "\033[0m") if _colour_ok(sys.stderr) else ("", "")
+    print(f"{prompt} [{bold}{default}{reset}]: ", end="", file=sys.stderr, flush=True)
+    try:
+        raw = input().strip()
+    except EOFError:
+        raw = ""
+    if not raw:
+        return default
+    if raw.isdigit() and 1 <= int(raw) <= hi:
+        return int(raw)
+    raise SystemExit(f"not a turn number: {raw!r}")
+
+
+def _pick_range(turns: list[_Turn], args) -> tuple[_Turn, _Turn]:
+    """Start and end of the window, from your own turns. `--from/--to` skip the
+    prompts entirely, so a recap is repeatable and scriptable; without them it
+    only asks at a tty, or a script blocking on `input()` would hang."""
+    n = len(turns)
+    lo, hi = getattr(args, "from_", 0), getattr(args, "to", 0)
+    if not (lo and hi) and not (sys.stdin.isatty() and sys.stderr.isatty()):
+        raise SystemExit("recap needs --from and --to when it can't ask "
+                         "(not a terminal)")
+    if not (lo and hi):
+        show = turns if getattr(args, "all_turns", False) else turns[-30:]
+        if len(show) < n:
+            print(f"  … {n - len(show)} earlier turns hidden (--all-turns for all)",
+                  file=sys.stderr)
+        w = len(str(n))
+        dim, reset = ("\033[2m", "\033[0m") if _colour_ok(sys.stderr) else ("", "")
+        cols = max(40, min(shutil.get_terminal_size((100, 24)).columns, 88))
+        for t in show:
+            i = turns.index(t) + 1
+            # `?` marks an answer to the question tool: the turn exists and
+            # steered the session, but you did not type it.
+            flag = "?" if t.kind == "answered" else " "
+            body = _clip_line(t.text.replace("\n", " · "), max(20, cols - w - 12))
+            print(f"  {i:>{w}}{flag} {dim}{_hhmm(t.when)}{reset}  {body}", file=sys.stderr)
+        lo = lo or _ask("start turn?", 1, n)
+        hi = hi or _ask("end turn?", n, n)
+    if not (1 <= lo <= n and 1 <= hi <= n):
+        raise SystemExit(f"turn out of range: this session has {n}")
+    if lo > hi:
+        lo, hi = hi, lo  # asked backwards is a slip, not a different request
+    return turns[lo - 1], turns[hi - 1]
+
+
+def _run_wizard(args):
+    """`("ok", selection)`, `("quit", None)`, or `("unavailable", None)` — kept
+    apart because escaping the first step (a decision) must not fall through
+    to the typed prompts the way an unavailable terminal does."""
+    why = ("--no-tui" if getattr(args, "no_tui", False) else
+           "--from/--to given" if (args.from_ or args.to) else
+           "session named" if (args.ref or args.file) else
+           "stdin is not a terminal" if not sys.stdin.isatty() else "")
+    if os.environ.get("CHSUM_TUI_DEBUG"):
+        pathlib.Path(os.environ["CHSUM_TUI_DEBUG"]).write_text(f"guard: {why or 'none'}\n")
+    if why:
+        return "unavailable", None
+    cands = transcripts(local=True)
+    if not cands:
+        return "unavailable", None
+
+    def recency(p: pathlib.Path) -> tuple[str, float]:
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        return (last_activity(p), mtime)
+
+    cands = sorted(cands, key=recency)[-40:]
+    try:
+        with _tty_curses() as scr:
+            picked = _Wizard(cands).run(scr)
+        return ("ok", picked) if picked else ("quit", None)
+    except (curses.error, OSError):
+        # Falls back rather than failing the command; CHSUM_TUI_DEBUG surfaces why.
+        if os.environ.get("CHSUM_TUI_DEBUG"):
+            import traceback
+            pathlib.Path(os.environ["CHSUM_TUI_DEBUG"]).write_text(traceback.format_exc())
+        return "unavailable", None
+
+
+def cmd_recap(args) -> int:
+    """Any session, any range of your turns — `last --here` with both ends
+    chosen instead of "since the last thing I typed, to now"."""
+    verdict, picked = _run_wizard(args)
+    if verdict == "quit":
+        return 0  # you escaped out: nothing chosen, nothing to print
+    if picked:
+        path, start, end = picked
+        turns = _your_turns(path)
+    else:
+        path = pathlib.Path(args.file) if args.file else (
+            path_for_ref(args.ref) if args.ref else _pick_transcript(live_only=False))
+        turns = _your_turns(path)
+        if not turns:
+            raise SystemExit("nothing typed in that conversation — no turns to pick from")
+        start, end = _pick_range(turns, args)
+    _status("reading the transcript…")
+    meta = extract_meta(path)
+    # The end turn bounds the window; the turns strictly between the two are
+    # yours as well and belong in the record.
+    inner = [t for t in turns if start.when < t.when <= end.when]
+    return _render_window(path, meta, start.line, start.when, start.text,
+                          end.when, args, inner)
 
 
 def cmd_last(args) -> int:
     if args.here:
         return cmd_catchup(args)
+    # There is no model call on this path, so there is nothing to not-make: say
+    # so rather than accepting the flag and silently ignoring it.
+    if getattr(args, "dry_run", False):
+        raise SystemExit("--dry-run only means something with --here "
+                         "(nothing else in `last` calls a model)")
     args.file = str(latest_transcript(local=not args.all, nth=args.nth))
     args.ref = None
     return cmd_context(args)
@@ -2468,12 +3191,8 @@ def cmd_last(args) -> int:
 
 def cmd_sessions(args) -> int:
     """One line per conversation, newest first. Triage: which were real work.
-
-    Empty ones are listed, not hidden — knowing a session was a dead end is the
-    answer to "where did that work go". So is the one running right now: it is
-    tagged, not skipped, because a listing that silently omits today's work reads
-    as work that never happened. `last` still skips it — you are already in it.
-    """
+    Empty sessions are listed, not hidden, and so is the one running right now
+    (tagged) — `last` skips that one, since you're already in it."""
     cutoff = _parse_since(args.since) if args.since else None
     live = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     metas = []
@@ -2508,13 +3227,9 @@ def cmd_sessions(args) -> int:
     # last worked on it.
     by_day: dict[str, list[tuple]] = defaultdict(list)
     for m in shown:
-        # Tagged, because its numbers are a snapshot: Claude Code is still
-        # appending, so counts and duration are behind by however much of the
-        # conversation has not been flushed yet.
+        # Tagged since its numbers are a snapshot — still being appended to.
         here = " · this session (in progress)" if m.path.stem == live else ""
-        # Named, not just counted: "3 agents" is the least useful thing to say
-        # about a session that delegated its work. Ids in full — `chsum context
-        # <ref>/<id>` matches exactly, so a clipped one wouldn't resolve.
+        # Ids in full — `chsum context <ref>/<id>` matches exactly, so a clipped one wouldn't resolve.
         delegated = [f"{r.id}  {_clip_line(r.description, cols - len(r.id) - 8)}"
                      if r.description else r.id for r in m.agents[:5]]
         if m.agent_count > len(delegated):
@@ -2660,67 +3375,113 @@ class SummariserError(RuntimeError):
 
 
 class Summariser:
-    """Where prose generation plugs in. The deterministic record never needs a
-    model; a backend gets extracted material (never a raw transcript), and its
-    output is additive — printed beneath the verbatim record, labelled
-    model-written, so a wrong sentence can be checked against the quotes above.
-    """
+    """Where prose generation plugs in. A backend gets extracted material,
+    never a raw transcript; its output prints beneath the verbatim record,
+    labelled model-written."""
 
-    def timeline(self, material: str) -> str:
+    def digest(self, system_prompt: str, material: str) -> str:
         raise NotImplementedError("no summariser backend configured")
 
 
-_TIMELINE_PROMPT = """\
-Below is a verbatim extract from a Claude Code session that is still running:
-the user's last prompt, then every recorded event since — assistant messages,
-tool calls, file edits (with the edited text), commands and the tail of their
-output, subagent activity — oldest first.
+# Scoped to one chunk, not a whole window: same hard rules (verbatim-only,
+# outcomes as recorded, failures kept separate, no opinions), a lower bullet
+# ceiling, and no "start each bullet with HH:MM" — the chunk boundary is the
+# turn boundary now, known before the call is made.
+_CHUNK_PROMPT = """\
+Below is a verbatim extract from one slice of a Claude Code session: a
+consecutive run of recorded events — assistant messages, tool calls, file
+edits (with the edited text), commands and the tail of their output, subagent
+activity — oldest first.
 
-Write a factual timeline of what has happened since the prompt, as a markdown
-bullet list, oldest first. Hard rules:
+Write a plain-language account of what happened in this slice, for someone
+who stepped away from the screen and is coming back to it. Markdown bullet
+list, oldest first.
+
+How to write it:
+- Full sentences, in ordinary words, that someone who does not know this
+  codebase can follow. Not a changelog, not a list of tool calls.
+- Lead with what changed for the user, then the mechanism: "the tool can now
+  show what a run would cost before making the call, via a new --dry-run flag",
+  not "added _dry_run_report()".
+- Name the files, functions and commands inside those sentences, copied
+  exactly, whenever they are the thing being described. The plain wording is
+  the frame; the identifiers stay in it.
+- Where the extract itself says why something was done — someone states a
+  reason, a command's output prompts the next step — say so. Where it does
+  not, describe only what was done.
+
+Hard rules:
 - State only what the extract shows. If it is not in the extract, it does not
-  go in the timeline.
-- Name files, and the functions or methods the edited text shows being
-  changed. Copy identifiers exactly.
+  go in the account.
 - Report outcomes only as recorded ("pytest printed 4 passed"), never as a
   judgement ("successfully", "correctly", "works").
-- Start each bullet with the HH:MM time of the first event it covers, copied
-  from the extract (drop the seconds).
-- No opinions, no advice, no guesses about intent, no closing summary.
-- Merge steps that serve one change into one bullet; 5-15 bullets total.
+- No opinions, no advice, no closing summary, and no guesses about intent
+  beyond what the extract states.
+- Keep failed attempts, errors and corrections as their own bullets. Never
+  merge a failure into the step that fixed it, and never report a check as
+  passing at the time it failed. This rule outranks every instruction below
+  about merging and length: if something has to give to fit the ceiling, merge
+  the steps that worked and leave the failures standing.
+- Otherwise merge steps that serve one change into one bullet.
+- Leave out pure orientation — searching or reading files to find where
+  something lives — unless what it turned up changed what was done next.
+- Between 2 and 8 bullets: a slice is small, not a whole window. This is a
+  ceiling, not a target: if you are at 8 and events remain, merge harder, do
+  not continue past it.
 - Do not use any tools; answer from the extract alone.
 Reply with only the bullet list.
 """
 
 
 class HaikuSummariser(Summariser):
-    """Shells out to `claude -p --model haiku`: no SDK (`dependencies` stays
-    empty), no key handling — the user's existing Claude Code auth signs the
-    call. Run from chsum's own state dir, because a print-mode run records a
-    session of its own, and run from the project it would list as a session of
-    *that* project.
-    """
+    """Shells out to `claude -p --model haiku`: no SDK, no key handling — the
+    user's existing Claude Code auth signs the call. Run from chsum's own state
+    dir, since a print-mode run there would otherwise record a session of the
+    project being summarised."""
 
     model = "haiku"
 
-    def timeline(self, material: str) -> str:
+    def __init__(self) -> None:
+        # What the call actually cost, filled in by `digest`. Empty when the
+        # run reported nothing parseable — a caller checks it, never assumes it.
+        self.usage: dict = {}
+        self.seconds = 0.0
+
+    def digest(self, system_prompt: str, material: str) -> str:
+        """One `claude -p` call: `system_prompt` via `--system-prompt`,
+        `material` alone on stdin."""
         exe = shutil.which("claude")
         if not exe:
             raise SummariserError("claude CLI not on PATH")
         cwd = DIGEST_DIR.parent
         cwd.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
         try:
             proc = subprocess.run(
-                [exe, "-p", "--model", self.model],
-                input=f"{_TIMELINE_PROMPT}\n{material}",
+                # JSON purely for accounting: it carries `usage`, tokens actually charged.
+                [exe, "-p", "--model", self.model, "--output-format", "json",
+                 "--system-prompt", system_prompt, "--tools", "", "--setting-sources", ""],
+                input=material,
                 capture_output=True, text=True, timeout=240, cwd=cwd,
             )
         except subprocess.TimeoutExpired:
             raise SummariserError("claude -p timed out after 240s") from None
+        self.seconds = time.monotonic() - started
         if proc.returncode != 0 or not proc.stdout.strip():
             err = (proc.stderr or proc.stdout).strip().splitlines()
             raise SummariserError(err[0][:200] if err else "claude -p printed nothing")
-        return proc.stdout.strip()
+        # Falls back to raw stdout if the envelope is ever not what we expect:
+        # the digest is the point, the accounting is not worth failing over.
+        try:
+            env = json.loads(proc.stdout)
+            text = env["result"] if isinstance(env, dict) else ""
+            if isinstance(env, dict) and isinstance(env.get("usage"), dict):
+                self.usage = env["usage"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            text = proc.stdout
+        if not isinstance(text, str) or not text.strip():
+            raise SummariserError("claude -p returned no digest")
+        return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -2753,6 +3514,9 @@ def main(argv=None) -> int:
     p.add_argument("--here", action="store_true",
                    help="the session running right now: what has happened since "
                         "your last prompt, ending in a model-written timeline")
+    p.add_argument("--dry-run", action="store_true",
+                   help="with --here: print the verbatim record and a size "
+                        "breakdown of what would be sent, and make no model call")
     p.set_defaults(func=cmd_last)
 
     p = sub.add_parser("find", help="search conversations")
@@ -2764,6 +3528,21 @@ def main(argv=None) -> int:
     for mode in ("hybrid", "semantic", "lexical", "exact"):
         p.add_argument(f"--{mode}", dest="mode", action="store_const", const=mode)
     p.set_defaults(mode="hybrid", func=cmd_find)
+
+    p = sub.add_parser("recap", help="summarise a chosen range of one conversation")
+    p.add_argument("ref", nargs="?", help="ch_... ref (default: pick a session)")
+    p.add_argument("--file", help="transcript path")
+    p.add_argument("--from", dest="from_", type=int, default=0, metavar="N",
+                   help="start at your Nth turn (default: ask)")
+    p.add_argument("--to", type=int, default=0, metavar="N",
+                   help="end at your Nth turn (default: ask)")
+    p.add_argument("--all-turns", dest="all_turns", action="store_true",
+                   help="list every turn when asking, not just the last 30")
+    p.add_argument("--no-tui", dest="no_tui", action="store_true",
+                   help="typed prompts instead of the arrow-key picker")
+    p.add_argument("--dry-run", action="store_true",
+                   help="size breakdown of what would be sent; no model call")
+    p.set_defaults(func=cmd_recap)
 
     p = sub.add_parser("digest", help="deterministic digest of one conversation")
     p.add_argument("ref", nargs="?", help="ch_... ref from `chsum find`")
