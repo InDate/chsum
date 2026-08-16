@@ -2005,12 +2005,25 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
                 rec = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            if not isinstance(rec, dict) or rec.get("type") not in ("user", "assistant"):
+            if not isinstance(rec, dict) or rec.get("type") not in ("user", "assistant", "system"):
                 continue
             ts = str(rec.get("timestamp") or "")
             live = (lineno > anchor_line) if src == path else (ts > anchor_ts)
             if until_ts and ts and ts > until_ts:
                 live = False
+            if rec.get("type") == "system":
+                # Only compaction is surfaced; other system records (session
+                # start, etc.) carry `content` outside `message`, not an event.
+                if live and rec.get("subtype") == "compact_boundary":
+                    cm = rec.get("compactMetadata") or {}
+                    pre, post = cm.get("preTokens"), cm.get("postTokens")
+                    stats = (f"{pre:,} → {post:,} tokens"
+                             if isinstance(pre, int) and isinstance(post, int)
+                             else "token counts unrecorded")
+                    events.append(_Event(ts, agent, "compacted",
+                                         f"Conversation compacted — {stats}, "
+                                         f"{cm.get('trigger', 'trigger unrecorded')}"))
+                continue
             content = (rec.get("message") or {}).get("content")
             if isinstance(content, str) and live and rec["type"] == "assistant":
                 if content.strip() and not notice_kind(content):
@@ -2215,7 +2228,23 @@ def _chunk_events(events: list[_Event], boundaries: list[str],
 _KIND_LABELS = {"said": "what Claude said", "edit": "file edits",
                 "ran": "commands run", "output": "command output",
                 "failed": "failures (command + error)", "you": "your own turns",
-                "spawn": "subagents spawned", "tool": "other tool calls"}
+                "spawn": "subagents spawned", "tool": "other tool calls",
+                "compacted": "conversation compaction"}
+
+
+def _compaction_section(events: list[_Event]) -> list[str]:
+    """Compaction boundaries, computed from Claude Code's own `compactMetadata`
+    — printed unconditionally rather than left to the model-written timeline,
+    which could omit it entirely when real work also happened in the same
+    chunk (see the drop-loop/`_failures_section` precedent this follows)."""
+    compactions = [e for e in events if e.kind == "compacted"]
+    if not compactions:
+        return []
+    out = [f"## {_plural(len(compactions), 'compaction')} in this window\n"]
+    for e in compactions:
+        who = f" (agent {e.agent[:8]})" if e.agent else ""
+        out.append(f"- {_hhmm(e.when)}{who}  {e.text}")
+    return out + [""]
 
 
 def _failures_section(events: list[_Event]) -> list[str]:
@@ -2666,6 +2695,7 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
         since += [f"- `{a}`" + (f"  {desc[a]}" if desc.get(a) else "") for a in agents_seen]
         since.append("")
 
+    since += _compaction_section(events)
     since += _failures_section(events)
 
     said = [e for e in events if e.kind == "said"]
