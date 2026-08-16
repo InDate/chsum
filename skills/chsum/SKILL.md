@@ -22,6 +22,8 @@ on as fact.
 | `chsum context <ref>/<agent-id>` | One subagent's own digest |
 | `chsum digest <ref>` | Same, written to a file (`--stdout` to print) |
 | `chsum journal --since 7d` | Chronological work log across sessions |
+| `chsum recap <ref> --from N --to M` | Reload a specific turn range from a past session |
+| `chsum last --here` | Catch up on *this* session since your last prompt (second terminal) |
 | `chsum mark "<reason>"` | Flag this moment as notable, for the digest |
 | `chsum find --marks [query]` | What's been marked, across sessions |
 | `chsum name "<title>"` | Rename this session; lead with a `ch_` ref to rename a past one |
@@ -76,6 +78,23 @@ The user can't type `! chsum mark` while addressing an agent — their text goes
 the agent instead. So a moment worth keeping from an agent is marked either by the
 agent itself, or afterwards from the session with `--match "<phrase it said>"`.
 
+## Catching up
+
+`chsum recap <ref> --from N --to M` reloads a specific window of a past
+session: your turns in that range verbatim, with a model-written timeline
+sliced under each one. Run non-interactively with `--no-tui` plus both
+`--from`/`--to` — without a terminal there's no session/turn picker to fall
+back on. `--dry-run` prices the call without making it.
+
+`chsum last --here` is the live case — what's happened in the *current*
+session since the last typed prompt. It's a second-terminal tool for the
+user to watch progress, not something to invoke on your own turn: it reads
+the transcript of the session it's run from, which mid-turn is the one you're
+already inside.
+
+Both end in one clearly-labelled non-verbatim section: a timeline written by
+`claude -p --model haiku` from the verbatim record printed above it.
+
 ## Choosing
 
 - Vague reference ("the one about the overlays") → `find`. Default hybrid search
@@ -83,6 +102,8 @@ agent itself, or afterwards from the session with `--match "<phrase it said>"`.
 - "Yesterday" / "last time" → `chsum` first, match on date, then `context`. The
   most recent session is often not the one meant.
 - What's been happening → `journal --since 7d`.
+- A specific stretch of a past session, not the whole thing → `recap <ref>
+  --from N --to M --no-tui`.
 
 ## Reading the output
 
