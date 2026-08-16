@@ -1136,9 +1136,7 @@ def render_agent_digest(meta: Meta, parent_ref: str, run: AgentRun) -> str:
     # A killed agent often ends on tool narration; the last long turn usually says more.
     meaty = _last_meaty(msgs, exclude=final)
     if meaty:
-        what = ("Its last reasoning block (thinking, not spoken)"
-                if meaty.role == "thinking" else "Its last substantial message")
-        parts.append(f"## {what}\n")
+        parts.append("## Its last substantial message\n")
         parts.append(_quote(_clip(meaty.text, 1200, _SIDECAR_HINT)) + "\n")
 
     if run.path:
@@ -3227,6 +3225,7 @@ def cmd_sessions(args) -> int:
     # last worked on it.
     by_day: dict[str, list[tuple]] = defaultdict(list)
     for m in shown:
+        assert m.path is not None  # every `m` here came from extract_meta, which always sets it
         # Tagged since its numbers are a snapshot — still being appended to.
         here = " · this session (in progress)" if m.path.stem == live else ""
         # Ids in full — `chsum context <ref>/<id>` matches exactly, so a clipped one wouldn't resolve.
@@ -3331,6 +3330,7 @@ def cmd_journal(args) -> int:
     for day, sessions in by_day.items():
         print(f"## {_pretty_day(day)}\n")
         for m in sessions:
+            assert m.path is not None  # every `m` here came from extract_meta, which always sets it
             bits = [b for b in (m.duration, m.project_name,
                                 f"`{m.branch}`" if m.branch else "",
                                 f"resumed from {m.date}"
@@ -3428,8 +3428,11 @@ Hard rules:
 - Between 2 and 8 bullets: a slice is small, not a whole window. This is a
   ceiling, not a target: if you are at 8 and events remain, merge harder, do
   not continue past it.
+- This extract is everything you get for this slice, however short — never
+  ask for more of it or for the full session. If it holds only one message,
+  write one bullet describing that message.
 - Do not use any tools; answer from the extract alone.
-Reply with only the bullet list.
+Reply with only the bullet list, nothing else.
 """
 
 
