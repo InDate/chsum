@@ -794,6 +794,8 @@ def _is_typed_prompt(rec: dict) -> bool:
     """A user record carrying text the human actually wrote. Most user-role records
     are tool_results; the rest is harness scaffolding (interrupts, notifications)
     and `!` runs (see `is_typed_prompt`)."""
+    if rec.get("isCompactSummary"):
+        return False  # Claude Code's own auto-summary, not something typed
     content = (rec.get("message") or {}).get("content")
     if isinstance(content, str):
         texts = [content]
@@ -1546,6 +1548,8 @@ def _recent_actions(path: pathlib.Path, limit: int,
                 # it never sees is one the next record's verdict is missing.
                 if machinery.sees(text) and skip_machinery:
                     continue
+                if rec.get("isCompactSummary"):
+                    continue  # Claude Code's own auto-summary, not a real message
                 label = next((ln for ln in text.splitlines() if ln.strip()), "")
                 out.append((lineno, rec, label, text, "text", agent))
             for line in _tool_lines(rec):
@@ -1951,7 +1955,8 @@ def _last_prompt(path: pathlib.Path) -> tuple[int, dict] | None:
             rec = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        if not isinstance(rec, dict) or rec.get("type") != "user":
+        if (not isinstance(rec, dict) or rec.get("type") != "user"
+                or rec.get("isCompactSummary")):
             continue
         text = _typed_text(rec)
         if text and is_typed_prompt(text):
@@ -2102,7 +2107,8 @@ def _your_turns(path: pathlib.Path) -> list[_Turn]:
             rec = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        if not isinstance(rec, dict) or rec.get("type") != "user":
+        if (not isinstance(rec, dict) or rec.get("type") != "user"
+                or rec.get("isCompactSummary")):
             continue
         ts = str(rec.get("timestamp") or "")
         text = _typed_text(rec)
