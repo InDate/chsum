@@ -363,12 +363,21 @@ Testing                             32e8b253
   ↳ Left in place — it records the state that prompted the change.
 
 ! chsum mark --list --full          # whole reason, whole marked message
+! chsum mark --show dde43c3c        # where it landed, with what surrounds it
 ! chsum mark --revoke 32e8b253      # takes several ids at once
 ```
 
 Each mark shows its reason, its id, and the message it marks. A bare `chsum mark`
 points at the message it followed — its own output record says nothing about what
 you were marking.
+
+`--show` takes the same id and answers where: the file, the row in it, the time,
+the agent when the message is a subagent's, the `mN` where claude-history has
+caught up, then the marked message whole and `--context N` records either side
+(3 by default). The location is stamped into the mark as it is made, so this is a
+lookup rather than a fresh search of the conversation and every sidecar. A stamp
+that disagrees with the record it names is discarded and the search runs anyway,
+which is what keeps an edited or rebuilt transcript from pointing somewhere wrong.
 
 A revocation is another line of output, same as a mark — nothing was written, so
 there is nothing to delete. Both records stay in the transcript; the mark simply

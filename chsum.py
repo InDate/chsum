@@ -450,9 +450,21 @@ class Mark:
     at_path: pathlib.Path | None = None  # file `at_line` is a line of, if not the transcript
     quote: str = ""  # first line of the marked message, verbatim
     when: str = ""
-    agent: str = ""  # sidecar it came from; blank for the parent's own
+    agent: str = ""  # sidecar the mark was made in; blank for the parent's own
+    # Kept apart from `agent`: a mark typed in the parent can point into a running
+    # agent's sidecar, and only the target's side decides whether an mN exists.
+    at_agent: str = ""  # sidecar the marked record lives in
     n: int = 0  # message ordinal, only on the digest path
     anchor: str = ""
+
+
+@dataclass
+class _MarkTarget:
+    """Where a mark points, resolved before the sentinel prints. Stamped into the
+    sentinel so reading a mark back is a lookup, not a search of every file."""
+    uuid: str
+    line: int = 0
+    agent: str = ""
 
 
 def _record_text(rec: dict) -> str:
@@ -525,12 +537,20 @@ def _scan_marks_raw(path: pathlib.Path) -> tuple[list[Mark], set[str]]:
                 # Nothing was written to take back, so the record stays and the mark drops.
                 revoked.add(fields["revoke"])
                 continue
+            stamp = fields.get("line", "")
             marks.append(Mark(reason=_MARK_TAIL_RE.sub("", m.group("reason")).strip(),
                               rec=str(rec.get("uuid") or ""),
                               at=fields.get("at", ""),
                               line=lineno,
+                              at_line=int(stamp) if stamp.isdigit() else 0,
+                              at_agent=fields.get("agent", ""),
                               when=str(rec.get("timestamp") or "")))
-    if any(m.at for m in marks):
+    # A stamp is a copy, so it is checked against the uuid it claims before it is
+    # used — anything that disagrees drops back to the search below.
+    for mk in marks:
+        if mk.at_line and not _verify_stamp(mk, path):
+            mk.at_line, mk.at_agent, mk.at_path = 0, "", None
+    if any(m.at and not m.at_line for m in marks):
         _resolve_marked(data, marks, path)
         # A mark typed in the transcript can name a record in a sidecar: while an
         # agent is running, that is the file the conversation is landing in.
@@ -544,6 +564,41 @@ def _scan_marks_raw(path: pathlib.Path) -> tuple[list[Mark], set[str]]:
     return marks, revoked
 
 
+def _mark_file(path: pathlib.Path, agent: str) -> pathlib.Path | None:
+    """The file an `agent=` stamp names. Resolved through the parent transcript,
+    since a mark read out of a sidecar names its siblings by the parent's ids."""
+    root = (path.parent.parent.with_suffix(".jsonl")
+            if path.parent.name == "subagents" else path)
+    if not agent:
+        return root
+    return next((s for s, a in mark_sources(root) if a == agent), None)
+
+
+def _verify_stamp(mark: Mark, path: pathlib.Path) -> bool:
+    """Confirm the stamped row still holds the record the mark names, and fill the
+    quote from it. False sends the mark back to the search that predates stamping."""
+    src = _mark_file(path, mark.at_agent)
+    if not src or not src.exists() or not mark.at:
+        return False
+    try:
+        lines = src.read_text(errors="replace").splitlines()
+    except OSError:
+        return False
+    if mark.at_line > len(lines):
+        return False
+    try:
+        rec = json.loads(lines[mark.at_line - 1])
+    except json.JSONDecodeError:
+        return False
+    uid = rec.get("uuid") if isinstance(rec, dict) else ""
+    if not isinstance(uid, str) or not uid.startswith(mark.at):
+        return False
+    mark.at_path = src
+    text = _record_text(rec).strip()
+    mark.quote = next((ln for ln in text.splitlines() if ln.strip()), "")
+    return True
+
+
 def _text_at_line(lines: list[str], lineno: int) -> str:
     """Whole text of the record on that line — what `--list --full` shows."""
     if not lineno or lineno > len(lines):
@@ -555,14 +610,15 @@ def _text_at_line(lines: list[str], lineno: int) -> str:
     return _record_text(rec).strip() if isinstance(rec, dict) else ""
 
 
-def _resolve_here(data: str, marks: list[Mark], path: pathlib.Path | None = None) -> None:
-    """Point a bare `chsum mark` at the last real thing said before it (its own
-    record is command output, not a target), skipping its own plumbing. Ordered
-    by timestamp once sidecars are in play, since two files' line numbers don't
-    order against each other; falls back to line order otherwise."""
-    said: list[tuple[str, int, pathlib.Path | None, str, str]] = []
+def _said_records(path: pathlib.Path | None,
+                  data: str = "") -> list[tuple[str, int, pathlib.Path | None, str, str, str]]:
+    """Everything either side really said, across the transcript and its sidecars,
+    ordered by timestamp: (when, line, file, agent, first line, uuid). `chsum mark`'s
+    own plumbing is skipped, since a mark is never a target. Timestamp order because
+    two files' line numbers don't order against each other."""
+    said = []
     for src, agent in (mark_sources(path) if path else [(None, "")]):
-        raw_text = data if src is None or src == path else src.read_text(errors="replace")
+        raw_text = data if src is None or (src == path and data) else src.read_text(errors="replace")
         machinery = _Machinery()
         for lineno, raw in enumerate(raw_text.splitlines(), start=1):
             try:
@@ -577,8 +633,28 @@ def _resolve_here(data: str, marks: list[Mark], path: pathlib.Path | None = None
             if machinery.sees(text):
                 continue
             said.append((str(rec.get("timestamp") or ""), lineno, src, agent,
-                         next((ln for ln in text.splitlines() if ln.strip()), "")))
+                         next((ln for ln in text.splitlines() if ln.strip()), ""),
+                         str(rec.get("uuid") or "")))
     said.sort(key=lambda s: (s[0], s[1]))
+    return said
+
+
+def _here_target(path: pathlib.Path) -> _MarkTarget | None:
+    """What a bare `chsum mark` points at, fixed while you type it rather than at
+    read time: the last real thing said in the files as they stand. Read-time
+    resolution can land on a record written after the command ran — one that was
+    never on screen when the mark was made."""
+    said = _said_records(path)
+    if not said:
+        return None
+    _ts, lineno, _src, agent, _first, uid = said[-1]
+    return _MarkTarget(uid, lineno, agent) if uid else None
+
+
+def _resolve_here(data: str, marks: list[Mark], path: pathlib.Path | None = None) -> None:
+    """Place a bare mark made before stamping existed: the last real thing said
+    before its own record, which is command output and never a target itself."""
+    said = _said_records(path, data)
     for mk in marks:
         if mk.at:
             continue
@@ -587,9 +663,9 @@ def _resolve_here(data: str, marks: list[Mark], path: pathlib.Path | None = None
         else:
             prior = [s for s in said if s[2] in (None, path) and s[1] < mk.line]
         if prior:
-            _ts, mk.at_line, mk.at_path, agent, mk.quote = prior[-1]
+            _ts, mk.at_line, mk.at_path, agent, mk.quote, _uid = prior[-1]
             if agent:
-                mk.agent = agent
+                mk.at_agent = agent
 
 
 def _resolve_marked(data: str, marks: list[Mark], src: pathlib.Path | None = None,
@@ -612,7 +688,7 @@ def _resolve_marked(data: str, marks: list[Mark], src: pathlib.Path | None = Non
                 if agent:
                     # Lines of a sidecar, which has no mN: the id stands in for the
                     # ordinal, exactly as it does for a mark an agent made itself.
-                    mk.agent = agent
+                    mk.at_agent = agent
                 text = _record_text(rec).strip()
                 mk.quote = next((ln for ln in text.splitlines() if ln.strip()), "")
 
@@ -1253,9 +1329,12 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
 def _locate_mark(mark: Mark, msgs: list[Message]) -> None:
     """Give a mark its mN and anchor only on an exact line match; unplaced marks
     fall back to their record id, and the quote carries the content either way."""
-    target = mark.at_line or mark.line
+    # The file the line belongs to decides: a target's line is in the target's file,
+    # and only the parent's lines number against a ref.
+    target, in_agent = ((mark.at_line, mark.at_agent) if mark.at_line
+                        else (mark.line, mark.agent))
     # A sidecar has no per-agent ref to number lines against, so it gets its agent id instead.
-    if not target or mark.agent:
+    if not target or in_agent:
         return
     for m in msgs:
         if m.line == target:
@@ -1273,8 +1352,10 @@ def _render_marks(marks: list[Mark], msgs: list[Message],
             where.append(f"m{mk.n}")
         if mk.anchor:
             where.append(f"`{mk.anchor}`")
-        if mk.agent and show_agent:
-            where.append(f"agent `{mk.agent}`")
+        # The target's file first: that is what the reader has to open.
+        agent = mk.at_agent or mk.agent
+        if agent and show_agent:
+            where.append(f"agent `{agent}`")
         head = f"- **{_clip_line(mk.reason, 300)}**"
         if where:
             head += f"  ({' · '.join(where)})"
@@ -1460,8 +1541,8 @@ def live_transcript() -> pathlib.Path:
     return cands[0]
 
 
-def _mark_target(path: pathlib.Path, spec: str) -> str:
-    """Resolve `--at` to a full record uuid: either a uuid prefix from
+def _mark_target(path: pathlib.Path, spec: str) -> _MarkTarget:
+    """Resolve `--at` to a full record uuid, its row and its file: either a uuid prefix from
     `chsum mark --recent` (looked for in sidecars too, since `--recent` lists
     them), or an mN, which needs claude-history to place it and stays parent-only."""
     if re.fullmatch(r"m\d+", spec):
@@ -1478,8 +1559,8 @@ def _mark_target(path: pathlib.Path, spec: str) -> str:
     else:
         line = 0
     prefix = spec.lower()
-    hits = []
-    for src, _agent in ([(path, "")] if line else mark_sources(path)):
+    hits: list[_MarkTarget] = []
+    for src, agent in ([(path, "")] if line else mark_sources(path)):
         for lineno, raw in enumerate(src.read_text(errors="replace").splitlines(), start=1):
             try:
                 rec = json.loads(raw)
@@ -1489,7 +1570,7 @@ def _mark_target(path: pathlib.Path, spec: str) -> str:
             if not isinstance(uid, str) or not uid:
                 continue
             if (line and lineno == line) or (not line and uid.startswith(prefix)):
-                hits.append(uid)
+                hits.append(_MarkTarget(uid, lineno, agent))
     if not hits:
         raise SystemExit(f"no record matching {spec!r} in {path.name}")
     if len(hits) > 1:
@@ -1595,7 +1676,7 @@ class _Machinery:
         return self.after_mark or MARK_SENTINEL in text
 
 
-def _match_target(path: pathlib.Path, needle: str) -> str:
+def _match_target(path: pathlib.Path, needle: str) -> _MarkTarget:
     """The one record whose text contains `needle`. Ambiguity is reported, never
     resolved: asking to mark a phrase puts that phrase in your own prompt too, so
     "newest wins" would routinely mark the request instead of its subject."""
@@ -1606,19 +1687,118 @@ def _match_target(path: pathlib.Path, needle: str) -> str:
         if want not in _fold(text) or uid in seen:
             continue
         seen.add(uid)
-        hits.append((uid, rec, label, agent))
+        hits.append((_MarkTarget(uid, lineno, agent), rec, label))
     if not hits:
         raise SystemExit(f"nothing in this conversation matches {needle!r}")
     if len(hits) > 1:
         print(f"{len(hits)} matches — mark one with --at, or give a longer string:",
               file=sys.stderr)
-        for uid, rec, label, agent in hits:
-            who = f"agent {agent[:8]}" if agent else (
+        for target, rec, label in hits:
+            who = f"agent {target.agent[:8]}" if target.agent else (
                 "you" if rec.get("type") == "user" else "claude")
             when = str(rec.get("timestamp") or "")[11:16]
-            print(f"  {uid[:8]}  {when:<5}  {who:<14}  {label[:80]}", file=sys.stderr)
+            print(f"  {target.uuid[:8]}  {when:<5}  {who:<14}  {label[:80]}", file=sys.stderr)
         raise SystemExit(2)
     return hits[0][0]
+
+
+def _find_mark(marks: list[Mark], spec: str) -> list[Mark]:
+    """Every mark on the record an id prefix names. One record can carry several —
+    a single command printing several sentinels — and the id names the record, so
+    they come back together rather than as an ambiguity nothing can narrow.
+    Shared by `--revoke` and `--show`, so a prefix that resolves for one resolves
+    for the other."""
+    hits = [mk for mk in marks if mk.rec.startswith(spec)]
+    if not hits:
+        raise SystemExit(f"no live mark {spec!r} — `chsum mark --list` shows them")
+    if len({mk.rec for mk in hits}) > 1:
+        raise SystemExit(f"{spec!r} matches {len(hits)} marks — use more characters")
+    return hits
+
+
+def _context_rows(src: pathlib.Path, lineno: int, n: int) -> list[tuple[int, dict]]:
+    """The n records either side of a row, in file order. Messages and one line per
+    tool call — the level `--list --full` prints at, not tool inputs or result bodies."""
+    try:
+        lines = src.read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    rows = []
+    for i, raw in enumerate(lines, start=1):
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict) or rec.get("type") not in ("user", "assistant"):
+            continue
+        # A record carrying neither text nor a tool call is a tool result: its own
+        # header would print with nothing under it and read as a message that said nothing.
+        if i == lineno or _record_text(rec).strip() or _tool_lines(rec):
+            rows.append((i, rec))
+    here = next((k for k, (i, _rec) in enumerate(rows) if i == lineno), None)
+    if here is None:
+        return []
+    return rows[max(0, here - n):here + n + 1]
+
+
+def _show_mark(path: pathlib.Path, marks: list[Mark], context: int, cols: int) -> int:
+    """Where the marks on one record landed, and what surrounds them. The header
+    carries the whole answer to "where is this" — file, row, time, record id,
+    agent — so nothing downstream has to search the transcript again to place it.
+    Several reasons print above one location: they share the record they name."""
+    mk = next((m for m in marks if m.at_line), marks[0])
+    src = mk.at_path or _mark_file(path, mk.at_agent) or path
+    where = [f"{src}:{mk.at_line}" if mk.at_line else str(src)]
+    if mk.when:
+        where.append(_hhmmss(mk.when))
+    if mk.at and mk.at_line:
+        where.append(f"record {mk.at[:8]}")
+    agent = mk.at_agent or mk.agent
+    if agent:
+        where.append(f"agent {agent}")
+    if mk.at_line and not agent:
+        # Only the parent's lines number against a ref, and a live transcript
+        # often has no mN for them yet — the message itself prints either way.
+        try:
+            _locate_mark(mk, read_messages(ch_ref_for_path(path)))
+        except HistoryError:
+            pass
+        if mk.n:
+            where.append(f"m{mk.n}")
+    for one in marks:
+        print(f"{one.rec[:8]}  {one.reason}")
+    print(_dim("  " + "  ·  ".join(where)))
+    if not mk.at_line:
+        # Naming the record it points at, not just "nothing": a mark quoted out of
+        # another conversation names a record this file has never held.
+        print(_dim(f"\n  record {mk.at[:8]} is not in this file" if mk.at
+                   else "\n  (nothing before it)"))
+        return 0
+    rows = _context_rows(src, mk.at_line, max(0, context))
+    for lineno, rec in rows or []:
+        print()
+        who = f"agent {agent[:8]}" if agent else (
+            "you" if rec.get("type") == "user" else "claude")
+        # Local clock, matching the header's own stamp — two clocks in one view
+        # read as two different moments.
+        head = f"{'▸' if lineno == mk.at_line else ' '} {lineno:>6}  " \
+               f"{_hhmmss(str(rec.get('timestamp') or ''))}  {who}"
+        print(head if lineno == mk.at_line else _dim(head))
+        body = _record_text(rec).strip()
+        if lineno != mk.at_line:
+            # The marked record prints whole; its neighbours are orientation, and
+            # the row number above each one says where to read the rest.
+            body = _clip(body, 400, f"line {lineno} of {src.name}")
+        for para in body.splitlines() + [f"⚙ {t}" for t in _tool_lines(rec)]:
+            if not para.strip():
+                print()
+                continue
+            text = "\n".join(textwrap.wrap(para, cols, initial_indent="    ",
+                                           subsequent_indent="    "))
+            print(text if lineno == mk.at_line else _dim(text))
+    if not rows:
+        print(_dim(f"\n  row {mk.at_line} is not in {src.name}"))
+    return 0
 
 
 def cmd_mark(args) -> int:
@@ -1628,13 +1808,23 @@ def cmd_mark(args) -> int:
     if not path.exists():
         raise SystemExit(f"no such transcript: {path}")
 
+    # Named on every path that quotes the transcript: a result that disagrees with
+    # another invocation is unreadable without knowing which file each one searched.
+    cols = max(40, min(shutil.get_terminal_size((100, 24)).columns, 88))
+
+    if args.show:
+        marks = extract_meta(path).marks
+        if not marks:
+            print(f"nothing marked in {path}", file=sys.stderr)
+            return 1
+        return _show_mark(path, _find_mark(marks, args.show), args.context, cols)
+
     if args.list:
         # The session's marks (agents' folded in too), same pooled definition extract_meta uses.
         marks = extract_meta(path).marks
         if not marks:
-            print("nothing marked in this conversation", file=sys.stderr)
+            print(f"nothing marked in {path}", file=sys.stderr)
             return 1
-        cols = max(40, min(shutil.get_terminal_size((100, 24)).columns, 88))
         if args.full:
             # The stored quote is only the marked message's first line; the rest comes back off disk.
             # Keyed by file: a mark can point into a sidecar, whose line numbers mean nothing here.
@@ -1657,7 +1847,7 @@ def cmd_mark(args) -> int:
                         subsequent_indent="    "))))
                     first = False
             sys.stdout.flush()
-            print(f"\n{_plural(len(marks), 'mark')}.", file=sys.stderr)
+            print(f"\n{_plural(len(marks), 'mark')} in {path}", file=sys.stderr)
             return 0
         # Two lines each: a reason and the message it marks are both prose.
         rows = [(_clip_line(mk.reason, 60),
@@ -1675,21 +1865,20 @@ def cmd_mark(args) -> int:
         # Flushed first, or the hint jumps the list: stdout is block-buffered when
         # piped, stderr never is.
         sys.stdout.flush()
-        print('\nDrop one: `chsum mark --revoke <id>`', file=sys.stderr)
+        print(f"\n{path}\nShow one: `chsum mark --show <id>`  ·  "
+              "drop one: `chsum mark --revoke <id>`", file=sys.stderr)
         return 0
 
     if args.revoke:
         # Agents' marks included: either side can retract the other's.
-        known = {mk.rec: mk for mk in extract_meta(path).marks}
+        marks = extract_meta(path).marks
         out = []
         for spec in args.revoke:
-            hits = [uid for uid in known if uid.startswith(spec)]
-            if not hits:
-                raise SystemExit(f"no live mark {spec!r} — `chsum mark --list` shows them")
-            if len(hits) > 1:
-                raise SystemExit(f"{spec!r} matches {len(hits)} marks — use more characters")
-            out.append(f"{MARK_SENTINEL} revoke={hits[0]} | "
-                       f"dropped: {_clip_line(known[hits[0]].reason, 120)}")
+            # One sentinel per record: `_apply_revocations` drops by record id, so
+            # naming it once retracts every mark that record carries.
+            hits = _find_mark(marks, spec)
+            out.append(f"{MARK_SENTINEL} revoke={hits[0].rec} | dropped: "
+                       f"{_clip_line(' / '.join(mk.reason for mk in hits), 120)}")
         print("\n".join(out))
         if not os.environ.get("CLAUDECODE"):
             print("warning: not running inside Claude Code, so nothing recorded this.",
@@ -1725,10 +1914,20 @@ def cmd_mark(args) -> int:
     reason = " ".join(reason.split())
     if args.at and args.match:
         raise SystemExit("--at and --match name the same thing two ways; use one")
-    at = (_mark_target(path, args.at) if args.at
-          else _match_target(path, args.match) if args.match else "")
+    target = (_mark_target(path, args.at) if args.at
+              else _match_target(path, args.match) if args.match
+              else _here_target(path))
+    # Row and file are stamped beside the uuid so reading the mark back is a lookup;
+    # both values are digits or hex, which the space-separated field grammar requires.
+    fields = ""
+    if target:
+        fields = f" at={target.uuid}"
+        if target.line:
+            fields += f" line={target.line}"
+        if target.agent:
+            fields += f" agent={target.agent}"
 
-    print(f"{MARK_SENTINEL}{f' at={at}' if at else ''} | {reason}")
+    print(f"{MARK_SENTINEL}{fields} | {reason}")
     if not os.environ.get("CLAUDECODE"):
         print("warning: not running inside Claude Code, so nothing recorded this. "
               "Run it as `! chsum mark …` in a session.", file=sys.stderr)
@@ -2000,6 +2199,10 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
         # id -> the command, not just its id: a failure has to be able to name
         # what failed, and by the time the result lands the tool_use is gone.
         pending: dict[str, str] = {}
+        # file-tool id -> index into `events`, so the line range from its
+        # tool_result (available only after the fact) can be patched onto the
+        # edit event already appended at tool_use time.
+        pending_edits: dict[str, int] = {}
         for lineno, raw in enumerate(src.read_text(errors="replace").splitlines(), start=1):
             try:
                 rec = json.loads(raw)
@@ -2048,6 +2251,28 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
                             cmd.strip().splitlines()[0], 120) if isinstance(cmd, str) and cmd.strip() else ""
                     if live:
                         events.append(_Event(ts, agent, *_tool_event(part)))
+                        if (part.get("name") in _FILE_TOOLS
+                                and isinstance((part.get("input") or {}).get("file_path"), str)):
+                            pending_edits[str(part.get("id") or "")] = len(events) - 1
+                elif part.get("type") == "tool_result" and live and part.get("tool_use_id") in pending_edits:
+                    # The line range an edit landed on, straight off the tool's
+                    # own patch — never inferred from the old/new text chsum
+                    # already clips. Folded onto the edit event's first line so
+                    # both the model and `_files_touched` read it from one place.
+                    idx = pending_edits.pop(part["tool_use_id"])
+                    tur = rec.get("toolUseResult")
+                    hunks = tur.get("structuredPatch") if isinstance(tur, dict) else None
+                    if isinstance(hunks, list) and hunks and idx < len(events):
+                        starts = [h["newStart"] for h in hunks
+                                 if isinstance(h, dict) and isinstance(h.get("newStart"), int)]
+                        ends = [h["newStart"] + h.get("newLines", 0) - 1 for h in hunks
+                               if isinstance(h, dict) and isinstance(h.get("newStart"), int)]
+                        if starts and min(starts) > 0:
+                            ev = events[idx]
+                            lines = ev.text.splitlines()
+                            if lines:
+                                lines[0] = f"{lines[0]} (lines {min(starts)}-{max(ends)})"
+                                events[idx] = _Event(ev.when, ev.agent, ev.kind, "\n".join(lines))
                 elif (part.get("type") == "tool_result" and live
                         and part.get("tool_use_id") in pending):
                     # Bash results only: they carry verdicts (tests, builds). Read
@@ -2230,6 +2455,181 @@ _KIND_LABELS = {"said": "what Claude said", "edit": "file edits",
                 "failed": "failures (command + error)", "you": "your own turns",
                 "spawn": "subagents spawned", "tool": "other tool calls",
                 "compacted": "conversation compaction"}
+
+
+_EDIT_LINES_RE = re.compile(r"^(.+?) \(lines (\d+)-(\d+)\)$")
+
+
+def _files_touched(events: list[_Event]) -> list[str]:
+    """Full path and line range per file edited in this slice — computed from
+    the line range `_events_since` folded onto each edit event's first line
+    (itself off the Edit tool's own `structuredPatch`, never inferred), not
+    narrated by a model. A range is missing only when the tool result never
+    carried one (e.g. `Write`, a whole file, not a range)."""
+    by_path: dict[str, list[str]] = {}
+    order: list[str] = []
+    for e in events:
+        if e.kind != "edit" or not e.text:
+            continue
+        head = e.text.splitlines()[0]
+        m = _EDIT_LINES_RE.match(head)
+        path, rng = (m.group(1), f"{m.group(2)}-{m.group(3)}") if m else (head, "")
+        if path not in by_path:
+            by_path[path] = []
+            order.append(path)
+        if rng and rng not in by_path[path]:
+            by_path[path].append(rng)
+    return [f"- `{path}`" + (f":{', '.join(by_path[path])}" if by_path[path] else "")
+           for path in order]
+
+
+_CHECKPOINT_RE = re.compile(r"^chsum-checkpoint: (\S+) @ (\S+)$")
+
+
+def _checkpoint_shas(project_dir: pathlib.Path | None, session_uuid: str) -> list[tuple[str, str]]:
+    """(timestamp, sha) per turn the `hooks/chsum_checkpoint.py` Stop hook
+    committed-then-reset-away for this session, oldest first (the raw reflog
+    is newest-first). Never raises: no repo, no `git`, no hook installed, or
+    a reflog that's already aged the entries out (see CLAUDE.md) all degrade
+    to `[]`, same as a session that never had checkpoints at all — this must
+    be exactly as forgiving as the rest of this file's summariser-failure
+    handling, even though no model call is involved."""
+    if not project_dir:
+        return []
+    try:
+        proc = subprocess.run(
+            ["git", "reflog", "show", "HEAD", "--format=%H %gs"],
+            cwd=project_dir, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+    out: list[tuple[str, str]] = []
+    for line in proc.stdout.splitlines():
+        sha, _, rest = line.partition(" ")
+        if not sha:
+            continue
+        # `%gs` is the reflog *action* plus the commit subject — "commit: …",
+        # "commit (initial): …" — not the subject alone; only the part after
+        # the first ": " is ever the message the hook actually wrote.
+        _, sep, subject = rest.partition(": ")
+        if not sep:
+            continue
+        m = _CHECKPOINT_RE.match(subject)
+        if m and m.group(1) == session_uuid:
+            out.append((m.group(2), sha))
+    out.reverse()
+    return out
+
+
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+def _checkpoint_diff_files(project_dir: pathlib.Path | None, prev_ref: str, cur_ref: str) -> list[str]:
+    """Same bullet shape `_files_touched` produces — `- \\`path\\`:ranges` — but
+    sourced from a real `git diff` between two checkpoint commits instead of
+    the transcript, so it sees every change regardless of how it was made (a
+    raw `sed -i`, not just Edit/Write/MultiEdit) and is never stale (no line
+    numbers frozen at the moment of an earlier edit in the same turn). Parses
+    `--- a/`/`+++ b/` for the path and `@@ -a,b +c,d @@` hunks for the new-side
+    range (`c` to `c+d-1`); `d == 0` is a pure deletion at the new side, which
+    would invent a range that doesn't exist, so a file left with no real range
+    prints `(deleted)` instead. Never raises: not a repo, bad refs, or an
+    unparseable diff all degrade to `[]`."""
+    if not project_dir:
+        return []
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "-U0", prev_ref, cur_ref],
+            cwd=project_dir, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+    by_path: dict[str, list[str]] = {}
+    order: list[str] = []
+    pure_deletion: set[str] = set()
+    path = None
+    pending_a = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("--- "):
+            a = line[4:]
+            pending_a = None if a == "/dev/null" else a[2:]  # strip "a/"
+        elif line.startswith("+++ "):
+            b = line[4:]
+            path = pending_a if b == "/dev/null" else b[2:]  # strip "b/"
+            if path and path not in by_path:
+                by_path[path] = []
+                order.append(path)
+        elif line.startswith("@@ ") and path:
+            m = _HUNK_RE.match(line)
+            if not m:
+                continue
+            new_start = int(m.group(1))
+            new_lines = int(m.group(2)) if m.group(2) is not None else 1
+            if new_lines == 0:
+                pure_deletion.add(path)
+                continue
+            rng = f"{new_start}-{new_start + new_lines - 1}"
+            if rng not in by_path[path]:
+                by_path[path].append(rng)
+    out = []
+    for p in order:
+        ranges = by_path[p]
+        if ranges:
+            out.append(f"- `{p}`:{', '.join(ranges)}")
+        elif p in pure_deletion:
+            out.append(f"- `{p}` (deleted)")
+        else:
+            out.append(f"- `{p}`")
+    return out
+
+
+def _turn_files(turn_events: list[list[_Event]], spine: list[_Turn], until_ts: str,
+                project_dir: pathlib.Path | None, session_uuid: str) -> list[list[str]]:
+    """Per-turn files-touched, one entry per turn — preferring a git checkpoint
+    diff over the transcript-based `_files_touched` wherever a checkpoint
+    covers that turn's time window, since a checkpoint sees every change
+    regardless of how it was made and is never stale. Falls back to
+    `_files_touched` turn-by-turn (today's behaviour, byte-identical) when no
+    checkpoint exists for this session at all, or per-turn when a given turn
+    just isn't covered by one.
+
+    `spine[i].when` to `spine[i+1].when` (or `until_ts` for the last turn) is
+    each turn's window — same rightmost-boundary convention `_turn_activity`
+    bisects on. A window with more than one checkpoint in it (shouldn't
+    normally happen — one hook firing per turn) still just diffs from the
+    running pointer to the *last* checkpoint in that window."""
+    checkpoints = _checkpoint_shas(project_dir, session_uuid)
+    if not checkpoints:
+        return [_files_touched(evs) for evs in turn_events]
+    out: list[list[str]] = []
+    last_sha: str | None = None
+    ci, n = 0, len(checkpoints)
+    for i, evs in enumerate(turn_events):
+        start = spine[i].when
+        is_last = i == len(turn_events) - 1
+        while ci < n and checkpoints[ci][0] < start:
+            ci += 1  # a checkpoint stamped before this window opened isn't this turn's
+        j = ci
+        while j < n and (checkpoints[j][0] <= until_ts if is_last
+                          else checkpoints[j][0] < spine[i + 1].when):
+            j += 1
+        in_window = checkpoints[ci:j]
+        ci = j
+        if in_window:
+            sha = in_window[-1][1]
+            # The very first checkpoint seen has no prior checkpoint to diff
+            # from, so its baseline is its own first parent — the branch tip
+            # right before checkpointing started, not "nothing".
+            prev = last_sha if last_sha is not None else f"{sha}^"
+            files = _checkpoint_diff_files(project_dir, prev, sha)
+            out.append([f"- checkpoint `{sha[:12]}` — `git show {sha[:12]}` for this "
+                        "turn's exact snapshot"] + files)
+            last_sha = sha
+        else:
+            out.append(_files_touched(evs))
+    return out
 
 
 def _compaction_section(events: list[_Event]) -> list[str]:
@@ -2665,7 +3065,12 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
     cmd_times: dict[str, str] = {}  # first occurrence's time — a rerun keeps its earliest stamp
     for e in events:
         if e.kind == "edit":
-            edited.append(e.text.splitlines()[0])
+            # This list dedupes by path (`_dedupe` below) — strip the line
+            # range `_events_since` may have folded on, or the same file
+            # edited twice at different lines stops deduping at all.
+            head = e.text.splitlines()[0]
+            m = _EDIT_LINES_RE.match(head)
+            edited.append(m.group(1) if m else head)
         elif e.kind == "ran" and _is_notable_command(e.text):
             cmds.append(e.text)
             cmd_times.setdefault(e.text, e.when)
@@ -2762,15 +3167,26 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
     if interleave and not all_failed:
         stamps = sorted(boundaries)
         turn_bullets: list[list[str]] = [[] for _ in spine]
+        turn_events: list[list[_Event]] = [[] for _ in spine]
         for chunk, (text, _, _, err) in zip(chunks, results):
             # Re-derives which turn this chunk belongs to via its first event's timestamp.
             idx = max(0, bisect.bisect_right(stamps, chunk[0].when) - 1)
+            turn_events[idx] += chunk
             if err:
                 turn_bullets[idx].append(
                     f"*Digest unavailable for part of this gap — {err}. The "
                     "verbatim record above still covers it.*")
             elif text:
                 turn_bullets[idx].extend(_chunk_bullets(text))
+        # Computed, not model-narrated — prepended ahead of the bullets it sits
+        # beside, same reasoning as `_failures_section`/`_compaction_section`.
+        # Prefers a git checkpoint diff over the transcript scan per turn,
+        # wherever the `chsum_checkpoint.py` Stop hook covered it — see `_turn_files`.
+        project_dir = pathlib.Path(meta.project) if meta.project else None
+        for idx, files in enumerate(_turn_files(turn_events, spine, until_ts,
+                                                project_dir, meta.uuid)):
+            if files:
+                turn_bullets[idx] = files + turn_bullets[idx]
         sliced = _interleaved(spine, turn_bullets, [])
     elif not all_failed:
         parts: list[str] = []
@@ -3611,6 +4027,11 @@ def main(argv=None) -> int:
                         "the record ids --at takes")
     p.add_argument("--list", action="store_true",
                    help="marks made in this conversation, with the ids --revoke takes")
+    p.add_argument("--show", metavar="ID",
+                   help="where a mark landed: file, row, time, agent, and the "
+                        "message it points at")
+    p.add_argument("--context", type=int, default=3, metavar="N",
+                   help="with --show: N records either side of it (default 3)")
     p.add_argument("--full", action="store_true",
                    help="with --list: whole reason and whole marked message, unclipped")
     p.add_argument("--revoke", nargs="+", metavar="ID",

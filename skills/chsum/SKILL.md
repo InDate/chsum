@@ -25,6 +25,7 @@ on as fact.
 | `chsum recap <ref> --from N --to M` | Reload a specific turn range from a past session |
 | `chsum last --here` | Catch up on *this* session since your last prompt (second terminal) |
 | `chsum mark "<reason>"` | Flag this moment as notable, for the digest |
+| `chsum mark --show <id>` | Where a mark landed: file, row, time, agent, message |
 | `chsum find --marks [query]` | What's been marked, across sessions |
 | `chsum name "<title>"` | Rename this session; lead with a `ch_` ref to rename a past one |
 
@@ -66,6 +67,12 @@ want to read cold months later, not a label.
 whole marked message); `--revoke <id>` drops one. Revoking is additive too — both records stay in the transcript, the
 mark just stops counting. Never revoke a mark the user made without being asked.
 
+`chsum mark --show <id>` takes the same id and prints where the mark landed — the
+file, the row, the time, the agent, the `mN` where there is one — then the marked
+message whole with `--context N` records either side. Use it before writing any
+code that walks a transcript by hand: file and row are stamped into the mark as it
+is made, so this answers "where is this" without a search.
+
 Marks made by a subagent fold into the parent session, tagged `agent <id>` rather
 than an `mN`. Worth telling an agent to mark what it finds: its digest is thin,
 and a mark survives into the parent's.
@@ -94,6 +101,29 @@ already inside.
 
 Both end in one clearly-labelled non-verbatim section: a timeline written by
 `claude -p --model haiku` from the verbatim record printed above it.
+
+## Per-turn git checkpoints (offer once, per project)
+
+This plugin ships a Stop hook (`hooks/chsum_checkpoint.py`) that, *if enabled
+for the current project*, commits the working tree after each turn and
+immediately resets the commit away — invisible in `git log`/`git status`,
+recoverable via `git reflog` — so `recap`'s files-touched section can read
+real `git diff`s instead of reconstructing them from the transcript. It ships
+installed but inert everywhere: nothing happens until a project opts in.
+
+A SessionStart hook (`hooks/chsum_session_start.py`) checks this at the start
+of every session in a git repo: if `.git/chsum-checkpoint` doesn't exist yet
+(never asked, or a fresh clone), it injects a note asking you to raise this
+with the user. When it does, ask once, plainly: do they want per-turn
+checkpointing enabled here, for more accurate file/line tracking in recaps?
+Briefly note it's invisible in normal git commands and reversible. Write
+`enabled` or `declined` into `.git/chsum-checkpoint` based on their answer —
+either way, never ask again in this checkout. If the file already says
+`enabled` or `declined`, the hook stays silent and there's nothing to do.
+
+To change a decision already made, edit `.git/chsum-checkpoint` directly —
+write `enabled` or `declined` to flip it, or delete the file to get the
+nudge again next session.
 
 ## Choosing
 
