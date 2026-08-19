@@ -225,6 +225,43 @@ def is_typed_prompt(text: str) -> bool:
     return is_real_prompt(text) and not text.lstrip().startswith("<bash-")
 
 
+_COMMAND_NAME_RE = re.compile(r"<command-name>(.*?)</command-name>", re.DOTALL)
+_COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.DOTALL)
+
+
+def _parsed(lines):
+    """Every line that parses, skipping the rest — the line-numbered readers hold
+    their lines already and would otherwise re-read the file to scan them."""
+    for raw in lines:
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict):
+            yield rec
+
+
+def _command_prompt_ids(recs) -> frozenset[str]:
+    """`promptId` of every record carrying a `<command-name>` marker. A slash
+    command lands as two records sharing one id — the command you typed, then
+    the body it loaded — and only the id joins them."""
+    return frozenset(
+        rec["promptId"] for rec in recs
+        if isinstance(rec, dict) and rec.get("type") == "user" and rec.get("promptId")
+        and "<command-name" in _record_text(rec))
+
+
+def _tool_injected(rec: dict, command_ids: frozenset[str] = frozenset()) -> bool:
+    """A user record loaded on your behalf, not typed by you. Two shapes, both
+    structural so no prose is matched to reject them: the Skill tool stamps
+    `sourceToolUseID`, and a slash command's body shares its `promptId` with the
+    `<command-name>` record. Neither is a turn — the first is Claude's tool call,
+    the second is the body of a command you ran."""
+    if rec.get("sourceToolUseID"):
+        return True
+    return bool(rec.get("isMeta")) and rec.get("promptId") in command_ids
+
+
 # Steering turns with no standalone meaning ("yes", "ok, do that") — counted,
 # not shown in the trail.
 _ACK_RE = re.compile(
@@ -774,7 +811,11 @@ def extract_agent(side: pathlib.Path) -> AgentRun:
 def extract_meta(path: pathlib.Path) -> Meta:
     meta = Meta(uuid=path.stem, path=path)
     stamps, edited, read, cmds = [], [], [], []
-    for rec in _records(path):
+    # One read, held: the command ids a body is matched against are only complete
+    # once the whole file is seen, and this path stays off a second pass.
+    recs = list(_records(path))
+    command_ids = _command_prompt_ids(recs)
+    for rec in recs:
         if rec.get("timestamp"):
             stamps.append(rec["timestamp"])
         if rec.get("type") == "ai-title" and rec.get("aiTitle"):
@@ -786,7 +827,7 @@ def extract_meta(path: pathlib.Path) -> Meta:
         if rec.get("type") in ("user", "assistant"):
             meta.records += 1
             meta.spawned += _collect_tools(rec, edited, read, cmds)
-        if rec.get("type") == "user" and _is_typed_prompt(rec):
+        if rec.get("type") == "user" and _is_typed_prompt(rec, command_ids):
             meta.prompts += 1
     # Yours wins over Claude Code's own later `ai-title` appends.
     named = load_names().get(meta.uuid, "")
@@ -866,12 +907,13 @@ def _relpath(path: str, project: str) -> str:
     return "~" + path[len(home):] if path.startswith(home + "/") else path
 
 
-def _is_typed_prompt(rec: dict) -> bool:
+def _is_typed_prompt(rec: dict, command_ids: frozenset[str] = frozenset()) -> bool:
     """A user record carrying text the human actually wrote. Most user-role records
     are tool_results; the rest is harness scaffolding (interrupts, notifications)
-    and `!` runs (see `is_typed_prompt`)."""
-    if rec.get("isCompactSummary"):
-        return False  # Claude Code's own auto-summary, not something typed
+    and `!` runs (see `is_typed_prompt`). `command_ids` comes from the same file
+    (`_command_prompt_ids`) — without it a slash command's body still reads as typed."""
+    if rec.get("isCompactSummary") or _tool_injected(rec, command_ids):
+        return False  # Claude Code's own auto-summary, or a loaded body — not typed
     content = (rec.get("message") or {}).get("content")
     if isinstance(content, str):
         texts = [content]
@@ -1098,10 +1140,14 @@ def messages_from_jsonl(path: pathlib.Path) -> list[Message]:
     has no per-agent ref. Anchors stay empty: `ma_` values are claude-history's
     to mint, and a fabricated one is worse than none."""
     msgs: list[Message] = []
-    for rec in _records(path):
+    recs = list(_records(path))
+    command_ids = _command_prompt_ids(recs)
+    for rec in recs:
         role = rec.get("type")
         if role not in ("user", "assistant"):
             continue
+        if role == "user" and _tool_injected(rec, command_ids):
+            continue  # a body the agent loaded, not a prompt it was given
         content = (rec.get("message") or {}).get("content")
         if isinstance(content, str):
             texts = [content]
@@ -2147,15 +2193,18 @@ def _typed_text(rec: dict) -> str:
 
 def _last_prompt(path: pathlib.Path) -> tuple[int, dict] | None:
     """Line and record of the last thing you typed — the catch-up anchor.
-    `<bash-…>` records are excluded, or anchoring could catch up from its own footprint."""
+    `<bash-…>` records and Skill bodies are excluded, or anchoring could catch up
+    from its own footprint."""
     found = None
-    for lineno, raw in enumerate(path.read_text(errors="replace").splitlines(), start=1):
+    lines = path.read_text(errors="replace").splitlines()
+    command_ids = _command_prompt_ids(_parsed(lines))
+    for lineno, raw in enumerate(lines, start=1):
         try:
             rec = json.loads(raw)
         except json.JSONDecodeError:
             continue
         if (not isinstance(rec, dict) or rec.get("type") != "user"
-                or rec.get("isCompactSummary")):
+                or rec.get("isCompactSummary") or _tool_injected(rec, command_ids)):
             continue
         text = _typed_text(rec)
         if text and is_typed_prompt(text):
@@ -2181,6 +2230,13 @@ def _tool_event(part: dict) -> tuple[str, str]:
     if name in _AGENT_TOOLS:
         desc, prompt = str(inp.get("description") or ""), str(inp.get("prompt") or "")
         return "spawn", _clip_line(f"{desc}: {prompt}" if desc else prompt, 400)
+    if name == "Skill" and isinstance(inp.get("skill"), str):
+        # The loaded body is dropped as a turn, so this call is the only record
+        # of which skill ran and what it was asked — `skill`/`args` are its keys,
+        # neither of which the generic detail scan below covers.
+        args = str(inp.get("args") or "").strip()
+        return "tool", _clip_line(f"Skill: {inp['skill']}"
+                                  + (f" — {args}" if args else ""), 400)
     detail = next((inp[k].strip().splitlines()[0]
                    for k in ("file_path", "command", "description", "pattern", "query", "path")
                    if isinstance(inp.get(k), str) and inp[k].strip()), "")
@@ -2227,6 +2283,18 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
                                          f"Conversation compacted — {stats}, "
                                          f"{cm.get('trigger', 'trigger unrecorded')}"))
                 continue
+            if rec.get("type") == "user" and live:
+                # The command you typed, kept as an event where its loaded body
+                # is dropped as a turn — otherwise the work it caused appears
+                # under the previous turn with nothing naming the cause.
+                cmd = _COMMAND_NAME_RE.search(_record_text(rec))
+                if cmd:
+                    cargs = _COMMAND_ARGS_RE.search(_record_text(rec))
+                    detail = cargs.group(1).strip() if cargs else ""
+                    events.append(_Event(ts, agent, "command",
+                                         _clip_line(cmd.group(1)
+                                                    + (f" {detail}" if detail else ""), 200)))
+                    continue
             content = (rec.get("message") or {}).get("content")
             if isinstance(content, str) and live and rec["type"] == "assistant":
                 if content.strip() and not notice_kind(content):
@@ -2340,13 +2408,15 @@ def _answered(rec: dict) -> str:
 def _your_turns(path: pathlib.Path) -> list[_Turn]:
     """Every turn of yours in a transcript, in order, for `recap`'s range picker."""
     turns = []
-    for lineno, raw in enumerate(path.read_text(errors="replace").splitlines(), start=1):
+    lines = path.read_text(errors="replace").splitlines()
+    command_ids = _command_prompt_ids(_parsed(lines))
+    for lineno, raw in enumerate(lines, start=1):
         try:
             rec = json.loads(raw)
         except json.JSONDecodeError:
             continue
         if (not isinstance(rec, dict) or rec.get("type") != "user"
-                or rec.get("isCompactSummary")):
+                or rec.get("isCompactSummary") or _tool_injected(rec, command_ids)):
             continue
         ts = str(rec.get("timestamp") or "")
         text = _typed_text(rec)
@@ -2381,7 +2451,7 @@ def _turn_activity(path: pathlib.Path, turns: list[_Turn]) -> list[str]:
     for counts, seen in zip(tally, agents):
         bits = []
         for kind, word in (("edit", "edit"), ("ran", "cmd"), ("tool", "tool"),
-                           ("failed", "failure")):
+                           ("command", "slash cmd"), ("failed", "failure")):
             if counts[kind]:
                 bits.append(_plural(counts[kind], word))
         if seen:
@@ -2454,6 +2524,7 @@ _KIND_LABELS = {"said": "what Claude said", "edit": "file edits",
                 "ran": "commands run", "output": "command output",
                 "failed": "failures (command + error)", "you": "your own turns",
                 "spawn": "subagents spawned", "tool": "other tool calls",
+                "command": "slash commands you ran",
                 "compacted": "conversation compaction"}
 
 
@@ -2612,7 +2683,9 @@ def _turn_files(turn_events: list[list[_Event]], spine: list[_Turn], until_ts: s
         while ci < n and checkpoints[ci][0] < start:
             ci += 1  # a checkpoint stamped before this window opened isn't this turn's
         j = ci
-        while j < n and (checkpoints[j][0] <= until_ts if is_last
+        # An empty `until_ts` bounds the last turn by nothing, so every remaining
+        # checkpoint is its own — `<= ""` would take none of them.
+        while j < n and ((not until_ts or checkpoints[j][0] <= until_ts) if is_last
                           else checkpoints[j][0] < spine[i + 1].when):
             j += 1
         in_window = checkpoints[ci:j]
@@ -2856,6 +2929,15 @@ def _ago(ts: str, mtime: float) -> str:
     return f"{int(secs)}w ago"
 
 
+def _local_when(ts: str, mtime: float) -> str:
+    """Full local datetime for the picker's `when` column, in the same form the
+    day headings use — `_ago`'s coarse age reads two same-day sessions as one.
+    Same `mtime` fallback as `_ago`, for a conversation with no clock of its own."""
+    t = _parse_ts(ts) if ts else None
+    when = t.astimezone() if t else datetime.fromtimestamp(mtime).astimezone()
+    return when.strftime("%a %d %b %Y %H:%M")
+
+
 def _pick_transcript(live_only: bool = True) -> pathlib.Path:
     """`last --here`'s picker — used only here; `live_transcript` itself stays
     untouched since `mark`/`name` depend on its silent newest-file fallback.
@@ -2983,11 +3065,34 @@ def _fmt_tokens(n: int) -> str:
     return f"~{n / 1000:.1f}k" if n >= 1000 else f"~{n}"
 
 
-class _Ticker:
-    """Elapsed-time status while a blocking `subprocess.run` call sits with no
-    real progress to report."""
+# Chunk calls in flight at once, and the cap on any one of them. Both are read
+# by the ticker to state a ceiling, so they live beside it rather than inline.
+_CHUNK_WORKERS = 8
+_CALL_TIMEOUT = 240
 
-    def __init__(self, label: str):
+
+class _Counter:
+    """Completed-call count, incremented from worker threads and read by the
+    ticker thread. `+=` on an int is not atomic under the lock-free path, and a
+    dropped increment stalls the line one short of the total for the whole run."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.value = 0
+
+    def bump(self) -> None:
+        with self._lock:
+            self.value += 1
+
+
+class _Ticker:
+    """Status line while blocking `subprocess.run` calls sit in flight. `label`
+    is re-read every tick, so a caller that knows how many calls have finished
+    passes a callable and the line carries a denominator instead of a clock
+    alone — 2,116s of rising seconds with no total says nothing about how far in
+    it is."""
+
+    def __init__(self, label):
         self._label = label
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -2995,7 +3100,8 @@ class _Ticker:
     def _run(self) -> None:
         start = time.monotonic()
         while not self._stop.wait(2):
-            _status(f"… {self._label} ({int(time.monotonic() - start)}s)")
+            text = self._label() if callable(self._label) else self._label
+            _status(f"… {text} ({int(time.monotonic() - start)}s)")
 
     def __enter__(self) -> "_Ticker":
         self._thread.start()
@@ -3022,14 +3128,17 @@ def cmd_catchup(args) -> int:
 
 
 def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: str,
-                   prompt_text: str, until_ts: str, args, turns: list[_Turn] | None = None) -> int:
+                   prompt_text: str, until_ts: str, args, turns: list[_Turn] | None = None,
+                   live: bool = True) -> int:
     """The document, for a window with a start and an optional end. One body
     for `last --here` and `recap` — they differ only in how the window was
-    chosen. `until_ts` empty means "to now", the live case."""
+    chosen. `live` says which: `last --here` runs to now, `recap` to a chosen
+    end. An empty `until_ts` bounds the window by nothing, which is "to now"
+    live and "to the end of the session" in a recap — so `live` is passed in
+    rather than derived from it."""
     def out(text: str, **kw) -> None:
         print(_md_ansi(text) if _colour_ok() else text, **kw)
 
-    live = not until_ts
     # `--dry-run` makes no call, so there's nothing to slice.
     interleave = bool(turns) and not live and not getattr(args, "dry_run", False)
     # Prints before the slower event walk, so the first thing on screen is what you typed.
@@ -3038,7 +3147,8 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
     bits = [meta.project_name, f"your prompt at {_hhmm(anchor_ts)}"]
     bits.append(f"snapshot at {datetime.now().astimezone().strftime('%H:%M')} — "
                 "the transcript trails the live screen" if live
-                else f"window ends {_hhmm(until_ts)}")
+                else f"window ends {_hhmm(until_ts)}" if until_ts
+                else "window ends with the session")
     header.append(f"*{' · '.join(bits)}*\n")
     header.append(f"## You said ({_hhmm(anchor_ts)})\n")
     header.append(_quote(_clip(prompt_text, 500, _CATCHUP_HINT)) + "\n")
@@ -3131,20 +3241,28 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
     def _run_chunk(chunk: list[_Event]) -> tuple[str, dict, float, str]:
         """(bullets text, usage, seconds, error) — never raises, so one chunk's
         failure can't break `executor.map`'s order for the rest."""
-        if not _chunk_activity(chunk):
-            return "", {}, 0.0, ""
-        summariser = HaikuSummariser()
         try:
-            text = summariser.digest(_CHUNK_PROMPT, _chunk_material(chunk))
-            return text, summariser.usage, summariser.seconds, ""
-        except SummariserError as e:
-            return "", summariser.usage, summariser.seconds, str(e)
+            if not _chunk_activity(chunk):
+                return "", {}, 0.0, ""
+            summariser = HaikuSummariser()
+            try:
+                text = summariser.digest(_CHUNK_PROMPT, _chunk_material(chunk))
+                return text, summariser.usage, summariser.seconds, ""
+            except SummariserError as e:
+                return "", summariser.usage, summariser.seconds, str(e)
+        finally:
+            done.bump()  # counted whichever way it ended, or the line stalls short
 
     chunk_est = sum(_est_tokens(_CHUNK_PROMPT) + _est_tokens(_chunk_material(c))
                     for c in chunks if _chunk_activity(c))
-    with _Ticker(f"haiku is writing {_plural(len(chunks), 'chunk')} of the timeline "
-                 f"— {_fmt_tokens(chunk_est)} tokens total"):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(chunks))) as ex:
+    workers = max(1, min(_CHUNK_WORKERS, len(chunks)))
+    # A real ceiling, not an estimate: each call is capped at `_CALL_TIMEOUT`, so
+    # the phase cannot outlast one timeout per wave of `workers`.
+    ceiling = _fmt_secs(-(-len(chunks) // workers) * _CALL_TIMEOUT)
+    done = _Counter()
+    with _Ticker(lambda: f"haiku: {done.value}/{len(chunks)} chunks · "
+                         f"{_fmt_tokens(chunk_est)} tokens · at most {ceiling}"):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             # `map` preserves submission order, so chunk order stays chronological.
             results = list(ex.map(_run_chunk, chunks))
 
@@ -3275,9 +3393,9 @@ class _Wizard:
     than quitting, since every step is a guess you refine."""
 
     HELP = {
-        0: "↑↓ move · enter choose session · esc quit",
-        1: "↑↓ move · enter set START · esc back to sessions",
-        2: "↑↓ move · enter set END · esc back to start",
+        0: "↑↓ move · f/l first/last · enter choose session · esc quit",
+        1: "↑↓ move · f/l first/last · enter set START · esc back to sessions",
+        2: "↑↓ move · f/l first/last · enter set END · esc back to start",
         3: "enter run the recap · esc back to end",
     }
 
@@ -3296,18 +3414,32 @@ class _Wizard:
         self.line_turn: list[int] = []
         self.line_kind: list[str] = []
         self.rows = [self._session_row(p) for p in cands]
+        # Widths across every row and the header, so the columns line up as one
+        # table. The title is last and unpadded — it is prose and runs long.
+        self.widths = [max(len(r[i]) for r in (*self.rows, self.SESSION_HEADS))
+                       for i in range(len(self.SESSION_HEADS) - 1)]
         # Newest last and selected, same default as the typed picker.
         self.cursor = max(0, len(cands) - 1)
 
+    # Same columns `chsum` prints, in the same order — this is the screen where
+    # you pick a session, and duration alone doesn't say which one was real work.
+    SESSION_HEADS = ("when", "dur", "prompts", "files", "agents", "marks", "")
+
     @staticmethod
-    def _session_row(p: pathlib.Path) -> tuple[str, str, str]:
+    def _session_row(p: pathlib.Path) -> tuple[str, ...]:
         m = extract_meta(p)
         try:
             mtime = p.stat().st_mtime
         except OSError:
             mtime = 0.0
         title = ("✎ " if m.renamed else "") + (m.title or "(untitled)")
-        return (_ago(last_activity(p), mtime), m.duration or "-", title)
+        return (_local_when(last_activity(p), mtime), m.duration or "-", str(m.prompts),
+                str(len(m.edited)), str(m.agent_count) if m.agent_count else "-",
+                f"⚑{len(m.marks)}" if m.marks else "-", title)
+
+    def _session_line(self, row: tuple[str, ...]) -> str:
+        return ("  ".join(f"{c:<{w}}" for c, w in zip(row, self.widths))
+                + "  " + row[-1]).rstrip()
 
     # -- drawing ---------------------------------------------------------
     def _draw(self, scr) -> None:
@@ -3316,6 +3448,10 @@ class _Wizard:
         head = {0: "which session?", 1: "start where?", 2: "end where?",
                 3: "what this will cost"}[self.step]
         scr.addnstr(0, 0, head, w - 1, curses.A_BOLD)
+        if self.step == 0:
+            # The blank line under the heading, spent on column names — the
+            # numbers below it are unreadable without them.
+            scr.addnstr(1, 0, self._session_line(self.SESSION_HEADS), w - 1, curses.A_DIM)
         body_h = max(1, h - 3)
         if self.step == 3:
             for i, line in enumerate(self.cost[:body_h]):
@@ -3389,9 +3525,7 @@ class _Wizard:
 
     def _lines(self) -> list[str]:
         if self.step == 0:
-            aw = max((len(r[0]) for r in self.rows), default=3)
-            dw = max((len(r[1]) for r in self.rows), default=3)
-            return [f"{a:<{aw}}  {d:<{dw}}  {t}" for a, d, t in self.rows]
+            return [self._session_line(r) for r in self.rows]
         return self.lines
 
     # -- steps -----------------------------------------------------------
@@ -3418,7 +3552,9 @@ class _Wizard:
         lo, hi = sorted((self.start, self.cursor))
         a, b = self.turns[lo], self.turns[hi]
         assert self.path is not None
-        events = _events_since(self.path, a.line, a.when, b.when)
+        # Same far-edge rule as `cmd_recap`, or the price and the run disagree.
+        until = "" if hi == len(self.turns) - 1 else b.when
+        events = _events_since(self.path, a.line, a.when, until)
         inner = [t for t in self.turns if a.when < t.when <= b.when]
         events += [_Event(t.when, "", "you", t.text) for t in inner]
         events.sort(key=lambda e: e.when)
@@ -3432,7 +3568,8 @@ class _Wizard:
         total_chars = prompt_chars + material_chars
         est = n_called * _est_tokens(_CHUNK_PROMPT) + sum(round(c / 4) for _, c in called)
         self.cost = [
-            f"turns {lo + 1}–{hi + 1}   {_hhmm(a.when)} → {_hhmm(b.when)}"
+            f"turns {lo + 1}–{hi + 1}   {_hhmm(a.when)} → "
+            f"{_hhmm(b.when) if until else 'end of session'}"
             f"   {_plural(len(events), 'event')}   {_plural(n_called, 'call')}"
             + (f" ({n_total - n_called} skipped)" if n_total > n_called else ""),
             "",
@@ -3509,9 +3646,11 @@ class _Wizard:
                      curses.KEY_PPAGE: -h, curses.KEY_NPAGE: h}
             if key in moves:
                 self.cursor = max(0, min(n - 1, self.cursor + moves[key]))
-            elif key == curses.KEY_HOME:
+            # `f`/`l` alongside Home/End: the ends are what you reach for, and a
+            # terminal that swallows Home/End still has letters.
+            elif key in (curses.KEY_HOME, ord("f")):
                 self.cursor = 0
-            elif key == curses.KEY_END:
+            elif key in (curses.KEY_END, ord("l")):
                 self.cursor = n - 1
 
 
@@ -3622,8 +3761,11 @@ def cmd_recap(args) -> int:
     # The end turn bounds the window; the turns strictly between the two are
     # yours as well and belong in the record.
     inner = [t for t in turns if start.when < t.when <= end.when]
+    # Ending on the last turn bounds the window by nothing: that turn's own work
+    # is what follows it, and a bound at its timestamp would cut all of it.
+    until = "" if end is turns[-1] else end.when
     return _render_window(path, meta, start.line, start.when, start.text,
-                          end.when, args, inner)
+                          until, args, inner, live=False)
 
 
 def cmd_last(args) -> int:
@@ -3917,7 +4059,7 @@ class HaikuSummariser(Summariser):
                 [exe, "-p", "--model", self.model, "--output-format", "json",
                  "--system-prompt", system_prompt, "--tools", "", "--setting-sources", ""],
                 input=material,
-                capture_output=True, text=True, timeout=240, cwd=cwd,
+                capture_output=True, text=True, timeout=_CALL_TIMEOUT, cwd=cwd,
             )
         except subprocess.TimeoutExpired:
             raise SummariserError("claude -p timed out after 240s") from None
