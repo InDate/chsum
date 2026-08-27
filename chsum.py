@@ -360,10 +360,22 @@ _NOISE_MARKERS = (
     "[SYSTEM NOTIFICATION",
 )
 
+# Matched at the start, unlike `_NOISE_MARKERS`: these read as ordinary prose,
+# so a substring test would drop a message that merely discusses one. They carry
+# no structural marker at all — `/context`'s output is a `user` record with
+# `isMeta` and no `sourceToolUseID`, byte-for-byte the shape of an image paste,
+# which is your own text and stays. Text is the only thing that separates them.
+_NOISE_PREFIXES = (
+    "## Context Usage",  # `/context` writes its report in as a user record
+    "[Your previous response had no visible output",
+)
+
 
 def is_real_prompt(text: str) -> bool:
     t = text.strip()
     if len(t) < 2:
+        return False
+    if t.startswith(_NOISE_PREFIXES):
         return False
     return not any(m in t for m in _NOISE_MARKERS)
 
