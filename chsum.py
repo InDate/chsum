@@ -202,7 +202,11 @@ def _build_line() -> str:
     # Regex rather than tomllib, which is 3.11+ and this file targets lower.
     src = re.search(r'(?m)^version\s*=\s*"([^"]+)"', _read_pyproject(here))
     version = src.group(1) if src else (dist or "unknown")
-    stale = f" (installed {dist})" if dist and src and dist != src.group(1) else ""
+    # Named, not just shown: `chsum 2.0.0 (installed 1.0.0)` reads as two
+    # versions of what ran, when the second describes nothing running — an
+    # editable install froze it and it has not moved since.
+    stale = (f" · package metadata says {dist}, stale since it was installed"
+             if dist and src and dist != src.group(1) else "")
     build = ""
     try:
         rev = subprocess.run(["git", "-C", str(here), "rev-parse", "--short", "HEAD"],
@@ -214,7 +218,8 @@ def _build_line() -> str:
     except (OSError, subprocess.SubprocessError):
         build = ""
     py = ".".join(str(n) for n in sys.version_info[:3])
-    return f"chsum {version}{stale}{build} · python {py} · {sys.platform}"
+    # The commit belongs beside the version it built, not beside the stale note.
+    return f"chsum {version}{build}{stale} · python {py} · {sys.platform}"
 
 
 def _read_pyproject(here: pathlib.Path) -> str:
@@ -5088,6 +5093,8 @@ def main(argv=None) -> int:
                     "Deterministic: nothing invented. The one model-written section "
                     "(`recap`'s timeline) is labelled as such.",
     )
+    ap.add_argument("--version", "-V", action="store_true",
+                    help="which chsum this is, and what built it")
     ap.add_argument("--out", type=pathlib.Path, default=DIGEST_DIR,
                     help=f"digest directory (default: {DIGEST_DIR})")
     # A parent, not a top-level flag: `--out` sits on `ap` and so has to precede
@@ -5233,6 +5240,13 @@ def main(argv=None) -> int:
     # Bare `chsum` lists sessions: you usually want to pick one, and "most recent"
     # is often a dud. Anything naming a subcommand or asking for help is left alone.
     raw = list(argv) if argv is not None else sys.argv[1:]
+    # Answered before the subcommand default is applied, or `--version` would be
+    # read as an argument to `sessions`. Not an argparse `version` action: that
+    # evaluates its text while the parser is built, so every other command would
+    # pay `_build_line`'s two git calls to print a string it never uses.
+    if any(tok in ("--version", "-V") for tok in raw):
+        print(_build_line())
+        return 0
     if not any(tok in sub.choices or tok in ("-h", "--help") for tok in raw):
         raw = ["sessions"] + raw
     args = ap.parse_args(raw)

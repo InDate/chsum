@@ -34,6 +34,18 @@ Blockquoting is functional, not cosmetic: a quoted reply containing `## Summary`
 would otherwise forge a section of the digest. Everything else — dates, duration,
 branch, files, commands — is parsed straight out of the transcript.
 
+## Which version am I running
+
+```sh
+chsum --version
+chsum 2.0.0 (dc12598) · python 3.10.11 · darwin
+```
+
+The version comes from the checkout's own `pyproject.toml`, and the commit
+beside it is what built it. On an editable install the packaged metadata freezes
+at install time and stops describing anything that runs, so when the two
+disagree the line says so rather than printing a second number on its own.
+
 ## Requirements
 
 - [`claude-history`](https://github.com/) on your `PATH` — for `chsum find`'s
