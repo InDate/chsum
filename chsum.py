@@ -1456,13 +1456,27 @@ def render_agent_digest(meta: Meta, parent_ref: str, run: AgentRun) -> str:
     parts.append(_quote(_clip(task, 500, _SIDECAR_HINT)) + "\n" if task
                  else "*No instruction recorded.*\n")
 
+    ref = f"{parent_ref}/{run.id}"
     if run.edited:
         parts.append("## Files changed\n")
-        parts += _bullets(run.edited, 20) + [""]
+        shown = run.edited[:20]
+        parts += [f"- `{f}`" for f in shown]
+        if len(run.edited) > len(shown):
+            parts.append(f"- …and {len(run.edited) - len(shown)} more — "
+                         f"`chsum digest {ref} --tools` lists every call in order")
+        parts.append("")
 
     if run.commands:
         parts.append("## Commands run\n")
-        parts += _bullets(run.commands, 10) + [""]
+        shown = run.commands[:10]
+        parts += [f"- `{c}`" for c in shown]
+        if len(run.commands) > len(shown):
+            # Both counts: these are filtered and deduplicated and the view is
+            # neither, so one number cannot stand for the other.
+            parts.append(f"- …and {len(run.commands) - len(shown)} more of these — "
+                         f"`chsum digest {ref} --commands` lists all "
+                         f"{run.command_total} in order")
+        parts.append("")
 
     # Not "final report": an interrupted agent ends mid-thought, and the transcript
     # can't tell you which happened.
