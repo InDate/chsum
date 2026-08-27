@@ -2585,6 +2585,12 @@ _FAIL_RES = [re.compile(p, re.MULTILINE) for p in (
 # summariser then reports it as an event ("the explanation was cut off").
 _EXTRACT_CLIP = "not in this extract"
 
+# What Claude said is the text a recap is about, so it is clipped at ~p99 rather
+# than the 600 it used to be: over 932 transcripts and 20,971 assistant messages,
+# 600 kept 55.7% of that text and 3,000 keeps 98.7%. Costs 3,000 chars more than
+# a 2,000 cap across a whole session, since few messages sit in that band.
+_SAID_CLIP = 3000
+
 
 def _fail_excerpt(out: str) -> str:
     """400 chars from the first error line rather than the tail — a command that
@@ -2743,7 +2749,7 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
             content = (rec.get("message") or {}).get("content")
             if isinstance(content, str) and live and rec["type"] == "assistant":
                 if content.strip() and not notice_kind(content):
-                    events.append(_Event(ts, agent, "said", _clip(content, 600, _EXTRACT_CLIP),
+                    events.append(_Event(ts, agent, "said", _clip(content, _SAID_CLIP, _EXTRACT_CLIP),
                                      lineno, src))
                 continue
             if not isinstance(content, list):
@@ -2754,7 +2760,7 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
                 if part.get("type") == "text" and live and rec["type"] == "assistant":
                     t = part.get("text", "").strip()
                     if t and not notice_kind(t):
-                        events.append(_Event(ts, agent, "said", _clip(t, 600, _EXTRACT_CLIP),
+                        events.append(_Event(ts, agent, "said", _clip(t, _SAID_CLIP, _EXTRACT_CLIP),
                                              lineno, src))
                 elif part.get("type") == "tool_use":
                     if part.get("name") == "Bash":
