@@ -202,10 +202,12 @@ def _build_line() -> str:
     # Regex rather than tomllib, which is 3.11+ and this file targets lower.
     src = re.search(r'(?m)^version\s*=\s*"([^"]+)"', _read_pyproject(here))
     version = src.group(1) if src else (dist or "unknown")
-    # Named, not just shown: `chsum 2.0.0 (installed 1.0.0)` reads as two
-    # versions of what ran, when the second describes nothing running — an
-    # editable install froze it and it has not moved since.
-    stale = (f" · package metadata says {dist}, stale since it was installed"
+    # Names the remedy, not just the mismatch. An editable install freezes the
+    # packaged metadata at install time, so it stops describing what runs and
+    # nothing refreshes it on its own — a reader who is told only that the two
+    # disagree has to work out that a reinstall is the fix.
+    stale = (f" · packaged metadata says {dist} and no longer describes what runs;"
+             f" `pipx install --editable . --force` from the checkout refreshes it"
              if dist and src and dist != src.group(1) else "")
     build = ""
     try:

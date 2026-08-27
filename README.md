@@ -42,9 +42,14 @@ chsum 2.0.0 (dc12598) · python 3.10.11 · darwin
 ```
 
 The version comes from the checkout's own `pyproject.toml`, and the commit
-beside it is what built it. On an editable install the packaged metadata freezes
-at install time and stops describing anything that runs, so when the two
-disagree the line says so rather than printing a second number on its own.
+beside it is what built it. An editable install freezes the packaged metadata at
+install time and nothing refreshes it on its own, so after a version bump the
+two can disagree — the line then says so and names the fix:
+
+```
+chsum 2.0.1 (1c8e002) · packaged metadata says 2.0.0 and no longer describes
+what runs; `pipx install --editable . --force` from the checkout refreshes it
+```
 
 ## Requirements
 
