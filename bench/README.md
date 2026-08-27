@@ -107,3 +107,25 @@ CLAUDE.md records an earlier design that carried `HH:MM` through the summariser
 and was deleted; there the copied time *placed* the bullet, so a wrong copy
 misplaced it silently. Here it attributes, and a wrong copy is what `invented`
 counts.
+
+### The reading, which overturned the counts
+
+`baseline` won. It is the most concrete of the five — "2 API calls would be
+made (10,687 chars, ~2.7k tokens)", "5 cache hits, 1 miss" — keeps "Claude did
+X" throughout, and carried no editorial tail in the sample read.
+
+`citation` scored best on groundedness and reads worst. Its wording pushes the
+model into passive voice — "Two test output files were verified", "Testing
+revealed", "A script execution showed" — which discards the actor attribution
+`_CHUNK_PROMPT` was fixed to produce. Across six samples, 16 of 40 citation
+bullets name Claude against baseline's 39 of 48; two citation samples name it in
+none. One bullet welded a diff result onto a cache-metrics event.
+
+`abstain` carried the worst editorial tail in the set ("confirming a file
+transformation was working correctly", "efficient cache usage"): permission to
+abstain produced more assessment, not less.
+
+Every variant written to fix one defect introduced a worse one, and the defect
+that motivated the work appeared once, in one live run. Four layers of counting
+pointed at `citation`; five minutes of reading overturned it. **Read the
+outputs. The table is where to start, not what to conclude.**
