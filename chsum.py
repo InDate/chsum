@@ -1144,12 +1144,15 @@ def _bullets(items: list[str], limit: int) -> list[str]:
     return out
 
 
-def _timed_bullets(pairs: list[tuple[str, str, str]], limit: int) -> list[str]:
-    """Same shape as `_bullets`, stamped and located: `pairs` is (when, locator,
-    text), the overflow line hand-built because `_bullets` itself has no room for
-    the extra columns. An empty locator prints nothing in its place."""
+def _timed_bullets(pairs: list[tuple[str, str, str, int]], limit: int) -> list[str]:
+    """Same shape as `_bullets`, stamped, located and counted: `pairs` is (when,
+    locator, text, runs), the overflow line hand-built because `_bullets` itself
+    has no room for the extra columns. An empty locator prints nothing in its
+    place. `runs` above 1 is stated rather than collapsed silently: a command is
+    shown by its first line, so several different scripts share one bullet."""
     out = [f"- {_hhmm(when)}  " + (f"`{loc}`  " if loc else "") + f"`{text}`"
-           for when, loc, text in pairs[:limit]]
+           + (f"  ×{runs}" if runs > 1 else "")
+           for when, loc, text, runs in pairs[:limit]]
     if len(pairs) > limit:
         out.append(f"- …and {len(pairs) - limit} more")
     return out
@@ -2632,7 +2635,10 @@ def _tool_event(part: dict) -> tuple[str, str]:
     """(kind, text) for one tool_use block."""
     name, inp = str(part.get("name") or "?"), part.get("input") or {}
     if name == "Bash" and isinstance(inp.get("command"), str):
-        return "ran", _clip_line(inp["command"], 200)
+        # First line, not a flattened clip: a heredoc squashed onto one line is
+        # 200 chars of its own source, where `python3 - <<'PY'` identifies it.
+        first = next(iter(inp["command"].strip().splitlines()), "")
+        return "ran", _clip_line(first, 200)
     if name in _FILE_TOOLS and isinstance(inp.get("file_path"), str):
         # Edited text rides along verbatim — what the summariser reads function
         # names out of, instead of chsum parsing code. `content` (a Write) is
@@ -3877,6 +3883,7 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
 
     edited, cmds, agents_seen = [], [], []
     cmd_times: dict[str, str] = {}  # first occurrence's time — a rerun keeps its earliest stamp
+    cmd_runs: dict[str, int] = {}  # how many share this bullet, stated not swallowed
     # First occurrence's row too: a deduplicated list has no event left to ask.
     where: dict[str, str] = {}
     def _loc(e: _Event) -> str:
@@ -3900,6 +3907,7 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
             cmds.append(e.text)
             cmd_times.setdefault(e.text, e.when)
             where.setdefault(e.text, _loc(e))
+            cmd_runs[e.text] = cmd_runs.get(e.text, 0) + 1
         if e.agent and e.agent not in agents_seen:
             agents_seen.append(e.agent)
     keep = lambda fs: _dedupe(_relpath(f, meta.project) for f in fs if _is_project_file(f))
@@ -3919,7 +3927,8 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
         since += _located_bullets(edited, where, 12) + [""]
     if cmds:
         since.append("Commands:")
-        since += _timed_bullets([(cmd_times[c], where.get(c, ""), c) for c in cmds], 8) + [""]
+        since += _timed_bullets([(cmd_times[c], where.get(c, ""), c, cmd_runs[c])
+                                 for c in cmds], 8) + [""]
     if agents_seen:
         desc = {r.id: r.description for r in meta.agents}
         since.append("Agents at work:")
