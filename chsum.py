@@ -3985,7 +3985,8 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
     if getattr(args, "dry_run", False):
         _clear_status()
         cached: set[int] = set()
-        if spine and not getattr(args, "no_cache", False):
+        if (spine and not getattr(args, "no_cache", False)
+                and not getattr(args, "invalidate", False)):
             _, cached = _cached_turns(
                 path.parent.name, spine,
                 _chunk_events(events, boundaries, _CHUNK_MAX_CHARS), boundaries,
@@ -4017,10 +4018,15 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
     # The store is read only where the document slices onto turns: a bare recap
     # names its chunks by nothing durable, and its tail gap is open by construction.
     instructions = _fingerprint(_CHUNK_PROMPT, HaikuSummariser.model)
-    use_store = interleave and not getattr(args, "no_cache", False)
+    # Two gates, not one. `--invalidate` treats what is stored for this window
+    # as no longer standing: the read is skipped so every chunk is called, and
+    # the write still happens so the result replaces it. `--no-cache` skips
+    # both and leaves the store exactly as it found it.
+    write_store = interleave and not getattr(args, "no_cache", False)
+    read_store = write_store and not getattr(args, "invalidate", False)
     hits: list[list[list[str]] | None] = [None] * len(spine)
     cached: set[int] = set()
-    if use_store:
+    if read_store:
         hits, cached = _cached_turns(path.parent.name, spine, chunks, boundaries,
                                      instructions, HaikuSummariser.model)
 
@@ -4033,7 +4039,7 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
     pending = [i for i in range(len(chunks)) if i not in cached]
     # Read once, ahead of the first call rather than after the last: a turn is
     # written the moment it finishes, and its gap has to already be known closed.
-    closers = ([] if not use_store or all(h is not None for h in hits)
+    closers = ([] if not write_store or all(h is not None for h in hits)
                else _turn_closers(path, spine, until_ts))
     outstanding = [sum(1 for i in idxs if i in pending) for idxs in per_turn]
     parts_by_turn: list[list[dict]] = [[] for _ in spine]
@@ -5084,6 +5090,9 @@ def main(argv=None) -> int:
                    help="size breakdown of what would be sent; no model call")
     p.add_argument("--no-cache", dest="no_cache", action="store_true",
                    help=f"call for every chunk; neither read nor write {TURNS_DIR}")
+    p.add_argument("--invalidate", action="store_true",
+                   help="treat what's stored for this window as no longer standing: "
+                        "call for every chunk and replace it")
     p.set_defaults(func=cmd_recap)
 
     p = sub.add_parser("digest", parents=[dbg], help="deterministic digest of one conversation")

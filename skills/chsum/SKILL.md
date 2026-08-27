@@ -29,6 +29,7 @@ on as fact.
 | `chsum journal --since 7d` | Chronological work log across sessions |
 | `chsum recap <ref> --from N --to M` | Reload a specific turn range from a past session |
 | `chsum recap --last` | Recap the most recent session that isn't this one, whole |
+| `chsum recap --invalidate` | Summarise this window again, replacing what's stored for it |
 | `chsum mark "<reason>"` | Flag this moment as notable, for the digest |
 | `chsum mark --show <id>` | Where a mark landed: file, row, time, agent, message |
 | `chsum find --marks [query]` | What's been marked, across sessions |

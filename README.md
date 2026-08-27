@@ -183,6 +183,7 @@ actually runs.
 
 ```sh
 chsum recap --dry-run                          # what would this cost, and why
+chsum recap --invalidate                       # summarise this window again, replacing what's stored
 ```
 
 After a real run, the terminal gets one line of what it actually cost, summed
