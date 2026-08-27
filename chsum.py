@@ -329,6 +329,10 @@ class Message:
     n: int
     role: str
     text: str
+    # The harness's own verdict that this record is an API error rather than
+    # something Claude wrote — `isApiErrorMessage`, the same standing `is_error`
+    # has on a tool result. Taken as given; never inferred from the text.
+    api_error: bool = False
     line: int = 0  # 1-based line of its first record in the JSONL; 0 when unknown
 
 
@@ -443,6 +447,11 @@ def last_said(msgs: list[Message]) -> tuple[Message | None, str]:
     notice = ""
     for m in reversed(msgs):
         if m.role != "assistant" or not m.text.strip():
+            continue
+        # An API error is how the session stopped, not what Claude last said:
+        # "Prompt is too long" quoted as a closing remark reads as a reply.
+        if m.api_error:
+            notice = notice or m.text.strip()
             continue
         kind = notice_kind(m.text)
         if kind:
@@ -1376,7 +1385,8 @@ def messages_from_jsonl(path: pathlib.Path) -> list[Message]:
             continue
         text = "\n".join(t for t in texts if t.strip()).strip()
         if text:
-            msgs.append(Message(n=len(msgs) + 1, role=role, text=text, line=lineno))
+            msgs.append(Message(n=len(msgs) + 1, role=role, text=text, line=lineno,
+                                api_error=bool(rec.get("isApiErrorMessage"))))
     return msgs
 
 
