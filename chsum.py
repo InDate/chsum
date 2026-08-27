@@ -2580,6 +2580,12 @@ _FAIL_RES = [re.compile(p, re.MULTILINE) for p in (
 )]
 
 
+# What a reader of the extract is told when chsum shortened a message. Not
+# "clipped": that reads as something that happened to the message, and a
+# summariser then reports it as an event ("the explanation was cut off").
+_EXTRACT_CLIP = "not in this extract"
+
+
 def _fail_excerpt(out: str) -> str:
     """400 chars from the first error line rather than the tail — a command that
     carries on after a traceback would otherwise have the tail quote whatever
@@ -2737,7 +2743,7 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
             content = (rec.get("message") or {}).get("content")
             if isinstance(content, str) and live and rec["type"] == "assistant":
                 if content.strip() and not notice_kind(content):
-                    events.append(_Event(ts, agent, "said", _clip(content, 600, "clipped"),
+                    events.append(_Event(ts, agent, "said", _clip(content, 600, _EXTRACT_CLIP),
                                      lineno, src))
                 continue
             if not isinstance(content, list):
@@ -2748,7 +2754,7 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
                 if part.get("type") == "text" and live and rec["type"] == "assistant":
                     t = part.get("text", "").strip()
                     if t and not notice_kind(t):
-                        events.append(_Event(ts, agent, "said", _clip(t, 600, "clipped"),
+                        events.append(_Event(ts, agent, "said", _clip(t, 600, _EXTRACT_CLIP),
                                              lineno, src))
                 elif part.get("type") == "tool_use":
                     if part.get("name") == "Bash":
@@ -3478,11 +3484,22 @@ def _timeline_bullets(text: str) -> tuple[list[str], list[str]]:
 
 
 def _chunk_bullets(text: str) -> list[str]:
-    """One chunk digest's bullets. Falls back to the preamble when a reply has
-    no bullet markers at all, rather than dropping the model's only output for
-    that chunk silently."""
+    """One chunk digest's bullets, or a marked line when the reply carried none.
+
+    A reply with no bullet markers is not a summary. On a chunk holding a single
+    proposal-shaped message the call sometimes answers the conversation instead
+    of describing it — "I approve the sentence as written" — and printed bare
+    that lands in the document as a first-person line nobody said. Dropping it
+    is worse (the turn loses its only output), so it is kept and labelled, which
+    is a structural test the grounding problem never had: a bullet list either
+    has bullets or it does not."""
     preamble, bullets = _timeline_bullets(text)
-    return bullets or preamble
+    if bullets:
+        return bullets
+    if not preamble:
+        return []
+    return [f"- *no bullet list came back for this turn; the call replied:* "
+            f"{_clip_line(' '.join(preamble), 400)}"]
 
 
 def _spine(turns: list[_Turn]) -> list[str]:
@@ -4882,6 +4899,11 @@ Below is a verbatim extract from one slice of a Claude Code session: a
 consecutive run of recorded events — assistant messages, tool calls, file
 edits (with the edited text), commands and the tail of their output, subagent
 activity — oldest first.
+
+A line ending `… [+N chars not in this extract]` was shortened by the tool that
+built this extract. The message itself was complete. Never describe it as cut
+off, interrupted, incomplete, or unfinished — that is a fact about the extract,
+not about what happened.
 
 Who did what, by event kind. `said:`, `ran:`, `edit:`, `tool:`, `output:`,
 `failed:` and `spawn:` are all Claude's own work. Only two kinds are the
