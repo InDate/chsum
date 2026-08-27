@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code SessionStart hook: nudges Claude, via `additionalContext`, to
 ask the user about per-turn checkpointing — once per project, the moment a
-session opens rather than waiting for `recap`/`last --here` to be used. See
+session opens rather than waiting for `chsum recap` to be used. See
 chsum's CLAUDE.md ("Checkpoints") for the gate file this reads and why the
 ask moved here from prose in the chsum skill.
 
@@ -22,7 +22,7 @@ _NUDGE = (
     "chsum: per-turn git checkpointing is undecided for this project "
     "({gate} absent). Ask the user once, plainly, whether to enable it — "
     "each turn gets committed then reset away into the reflog, invisible in "
-    "normal git commands and reversible, so `chsum recap`/`last --here` can "
+    "normal git commands and reversible, so `chsum recap` can "
     "read real git diffs for file/line tracking instead of reconstructing "
     "them from the transcript. Write `enabled` or `declined` to {gate} based "
     "on their answer, then never ask again in this checkout."

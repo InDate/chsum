@@ -21,7 +21,7 @@ There is no test suite. Compile, then run the commands the change could reach:
 ```sh
 python3 -m compileall -q chsum.py
 chsum                      # listing
-chsum last                 # digest, incl. a subagent one if the session had any
+chsum digest --last        # digest, incl. a subagent one if the session had any
 chsum journal --since 7d
 chsum mark --list          # from inside Claude Code — marks need a live session
 ```

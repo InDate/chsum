@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code Stop hook: commit the working tree for real, then reset the
 commit away, so a per-turn snapshot lands only in `HEAD`'s own reflog —
-`chsum recap`/`last --here` read it back via `_checkpoint_shas`/
+`chsum recap` reads it back via `_checkpoint_shas`/
 `_checkpoint_diff_files` in chsum.py. See chsum's CLAUDE.md ("Checkpoints")
 for why commit-then-reset was chosen over `commit --amend` or a dedicated ref.
 
