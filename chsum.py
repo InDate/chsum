@@ -15,10 +15,13 @@ import bisect
 import concurrent.futures
 import contextlib
 import curses
+import hashlib
+import importlib.metadata
 import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -32,7 +35,194 @@ from datetime import datetime, timezone
 PROJECTS_ROOT = pathlib.Path(
     os.environ.get("CLAUDE_CONFIG_DIR", pathlib.Path.home() / ".claude")
 ) / "projects"
-DIGEST_DIR = pathlib.Path.home() / ".claude" / "chsum" / "digests"
+# chsum's own state, in a root of its own: `~/.claude` holds what Claude Code
+# wrote, and nothing here is read by Claude Code.
+CHSUM_DIR = pathlib.Path.home() / ".chsum"
+DIGEST_DIR = CHSUM_DIR / "digests"
+TURNS_DIR = CHSUM_DIR / "turns"
+
+# ---------------------------------------------------------------------------
+# --debug trace
+# ---------------------------------------------------------------------------
+# What a run read, ran, and resolved — enough to reach the record behind a line
+# that looked wrong, without carrying any transcript text. Off unless `--debug`
+# is passed: every method returns on `self.on`, so the normal path costs one
+# attribute read per call site.
+
+_TRACE_KEEP = 3    # instances held at each end of a step name before the middle collapses
+_TRACE_ROWS = 24   # files (and subprocesses) listed before the rest become a count
+
+
+@dataclass
+class _Trace:
+    on: bool = False
+    argv: list[str] = field(default_factory=list)
+    files: dict[str, dict] = field(default_factory=dict)
+    procs: list[tuple] = field(default_factory=list)
+    steps: list[tuple[str, dict]] = field(default_factory=list)
+    repro: list[str] = field(default_factory=list)
+
+    def reset(self, on: bool, argv: list[str]) -> None:
+        self.on, self.argv = on, list(argv)
+        self.files, self.procs, self.steps, self.repro = {}, [], [], []
+
+    def file(self, path, role: str, records: int | None = None) -> None:
+        """One transcript or sidecar the run opened. Deduped by path and roles
+        accumulate: the same file read twice for different reasons is one line."""
+        if not self.on or path is None:
+            return
+        key = str(path)
+        entry = self.files.setdefault(key, {"path": pathlib.Path(path), "roles": [], "records": None})
+        if role not in entry["roles"]:
+            entry["roles"].append(role)
+        if records is not None:
+            entry["records"] = records
+
+    def proc(self, argv, code, seconds: float, extra: str = "") -> None:
+        if not self.on:
+            return
+        self.procs.append((list(argv), code, seconds, extra))
+
+    def step(self, name: str, **fields) -> None:
+        if not self.on:
+            return
+        self.steps.append((name, fields))
+
+    def reproduce(self, line: str) -> None:
+        if not self.on or line in self.repro:
+            return
+        self.repro.append(line)
+
+    # -- rendering ---------------------------------------------------------
+
+    @staticmethod
+    def _short(path: pathlib.Path) -> str:
+        """Relative to the projects root where it sits under one — every row would
+        otherwise repeat the same 40-character prefix, at the title's expense."""
+        text = str(path)
+        for root, prefix in ((str(PROJECTS_ROOT), "…/"), (str(pathlib.Path.home()), "~/")):
+            if text.startswith(root + "/"):
+                return prefix + text[len(root) + 1:]
+        return text
+
+    @staticmethod
+    def _val(v) -> str:
+        """`key=value` splits on whitespace, so only a value carrying whitespace
+        is quoted. Not `_yaml`, whose `ensure_ascii` would escape the arrows and
+        the ⚑ these lines copy out of the transcript."""
+        text = str(v)
+        return f'"{text}"' if (not text or any(c.isspace() for c in text)) else text
+
+    @staticmethod
+    def _size(n: int) -> str:
+        for unit, div in (("M", 1 << 20), ("K", 1 << 10)):
+            if n >= div:
+                return f"{n / div:.1f}{unit}"
+        return f"{n}B"
+
+    def _file_rows(self) -> list[tuple[str, ...]]:
+        rows = []
+        for entry in self.files.values():
+            path = entry["path"]
+            try:
+                size = self._size(path.stat().st_size)
+            except OSError:
+                size = "gone"
+            parent = path.parent.name != "subagents" and not path.name.startswith("agent-")
+            ref = ch_ref_for_path(path) if parent else "—"
+            recs = "" if entry["records"] is None else _plural(entry["records"], "rec")
+            rows.append((ref, ",".join(entry["roles"]), size, recs, self._short(path)))
+        return rows
+
+    def _step_lines(self) -> list[str]:
+        """Repeated steps collapse in the middle: a recap makes hundreds of
+        `_run_chunk` calls and all of them would bury the six that differ."""
+        seen: dict[str, int] = defaultdict(int)
+        for name, _ in self.steps:
+            seen[name] += 1
+        kept: dict[str, int] = defaultdict(int)
+        out, held = [], []
+        for name, fields in self.steps:
+            kept[name] += 1
+            nth, total = kept[name], seen[name]
+            if total > _TRACE_KEEP * 2 and _TRACE_KEEP < nth <= total - _TRACE_KEEP:
+                if nth == _TRACE_KEEP + 1:
+                    held.append((len(out), name, total - _TRACE_KEEP * 2))
+                    out.append("")
+                continue
+            body = " ".join(f"{k}={self._val(v)}" for k, v in fields.items())
+            out.append(f"  {name}{'  ' + body if body else ''}")
+        for idx, name, n in held:
+            out[idx] = f"  … {n} further {name}"
+        return out
+
+    def render(self, exit_code: int) -> str:
+        rows = self._file_rows()
+        shown, dropped = rows[:_TRACE_ROWS], max(0, len(rows) - _TRACE_ROWS)
+        widths = [max((len(r[i]) for r in shown), default=0) for i in range(4)]
+        lines = ["--- chsum debug ---",
+                 f"invocation: {shlex.join(self.argv)}",
+                 f"cwd: {self._short(pathlib.Path.cwd())}",
+                 f"projects: {self._short(PROJECTS_ROOT)}/  (…/ below)",
+                 f"{_build_line()} · exit {exit_code}",
+                 f"files ({len(rows)})"]
+        for r in shown:
+            cols = "  ".join(c.ljust(w) for c, w in zip(r[:4], widths))
+            lines.append(f"  {cols}  {r[4]}")
+        if dropped:
+            lines.append(f"  …and {dropped} more")
+        lines.append(f"procs ({len(self.procs)})")
+        for argv, code, seconds, extra in self.procs[:_TRACE_ROWS]:
+            tail = f"  ({extra})" if extra else ""
+            lines.append(f"  {code}  {seconds:5.2f}s  {_clip_line(shlex.join(argv), 140)}{tail}")
+        if len(self.procs) > _TRACE_ROWS:
+            lines.append(f"  …and {len(self.procs) - _TRACE_ROWS} more")
+        lines.append(f"steps ({len(self.steps)})")
+        lines.extend(self._step_lines())
+        if self.repro:
+            lines.append("reproduce")
+            lines.extend(f"  {line}" for line in self.repro)
+        lines.append("--- end chsum debug ---")
+        return "\n".join(lines)
+
+
+TRACE = _Trace()
+
+
+def _build_line() -> str:
+    """Which chsum ran. The commit resolves because the install is editable —
+    `chsum.py` in the checkout is what executes."""
+    try:
+        dist = importlib.metadata.version("chsum")
+    except importlib.metadata.PackageNotFoundError:
+        dist = ""
+    here = pathlib.Path(__file__).resolve().parent
+    # The checkout's own pyproject outranks the installed metadata, which an
+    # editable install froze at install time: `chsum.py` here is what ran.
+    # Regex rather than tomllib, which is 3.11+ and this file targets lower.
+    src = re.search(r'(?m)^version\s*=\s*"([^"]+)"', _read_pyproject(here))
+    version = src.group(1) if src else (dist or "unknown")
+    stale = f" (installed {dist})" if dist and src and dist != src.group(1) else ""
+    build = ""
+    try:
+        rev = subprocess.run(["git", "-C", str(here), "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=5)
+        dirty = subprocess.run(["git", "-C", str(here), "status", "--porcelain"],
+                               capture_output=True, text=True, timeout=5)
+        if rev.returncode == 0:
+            build = f" ({rev.stdout.strip()}{' dirty' if dirty.stdout.strip() else ''})"
+    except (OSError, subprocess.SubprocessError):
+        build = ""
+    py = ".".join(str(n) for n in sys.version_info[:3])
+    return f"chsum {version}{stale}{build} · python {py} · {sys.platform}"
+
+
+def _read_pyproject(here: pathlib.Path) -> str:
+    try:
+        return (here / "pyproject.toml").read_text(errors="replace")
+    except OSError:
+        return ""
+
 
 # ---------------------------------------------------------------------------
 # ch_ ref derivation
@@ -91,8 +281,12 @@ class HistoryError(RuntimeError):
 def _history(*args: str, timeout: int = 600) -> str:
     exe = shutil.which("claude-history")
     if not exe:
+        TRACE.step("claude-history", found="no")
         raise HistoryError("claude-history not found on PATH")
+    started = time.monotonic()
     proc = subprocess.run([exe, *args], capture_output=True, text=True, timeout=timeout)
+    TRACE.proc(["claude-history", *args], proc.returncode, time.monotonic() - started,
+               f"{len(proc.stdout)} chars out")
     if "agent-error" in proc.stdout:
         raise HistoryError(
             f"claude-history rejected {' '.join(args)}: "
@@ -165,6 +359,7 @@ def read_messages(ref: str, start: int = 1, end: int | None = None) -> list[Mess
     messages with their mN ordinal and ma_ anchor."""
     end = end or last_message_number(ref)
     if not end:
+        TRACE.step("read_messages", ref=ref, end=0, messages=0)
         return []
     raw = _history("agent", "read", f"{ref}:m{start}..m{end}", "--no-budget")
     msgs: list[Message] = []
@@ -191,6 +386,8 @@ def read_messages(ref: str, start: int = 1, end: int | None = None) -> list[Mess
     if cur:
         cur.text = "\n".join(body).strip()
         msgs.append(cur)
+    TRACE.step("read_messages", ref=ref, asked=f"m{start}..m{end}", messages=len(msgs),
+               got=f"m{msgs[0].n}..m{msgs[-1].n}" if msgs else "—")
     return msgs
 
 
@@ -386,7 +583,7 @@ class Meta:
 # `ai-title` record so /resume shows it too — the one exception to writing
 # nothing to a transcript.
 
-NAMES_PATH = DIGEST_DIR.parent / "names.json"
+NAMES_PATH = CHSUM_DIR / "names.json"
 
 _names_cache: tuple[float, dict[str, str]] | None = None
 
@@ -554,7 +751,11 @@ def _scan_marks_raw(path: pathlib.Path) -> tuple[list[Mark], set[str]]:
         data = path.read_text(errors="replace")
     except OSError:
         return [], set()
+    TRACE.file(path, "marks")
     if _MARK_GREP not in data:
+        # Said explicitly: "no sentinel anywhere in this file" is the answer to
+        # a mark that didn't show up, and the walk below never runs to report it.
+        TRACE.step("scan_marks", file=path.name, marks=0, sentinel="absent")
         return [], set()
     marks: list[Mark] = []
     revoked: set[str] = set()
@@ -586,7 +787,10 @@ def _scan_marks_raw(path: pathlib.Path) -> tuple[list[Mark], set[str]]:
     # used — anything that disagrees drops back to the search below.
     for mk in marks:
         if mk.at_line and not _verify_stamp(mk, path):
+            TRACE.step("_verify_stamp", mark=mk.rec[:8], at=mk.at[:8], line=mk.at_line,
+                       agent=mk.at_agent or "—", match="no", fallback="walk")
             mk.at_line, mk.at_agent, mk.at_path = 0, "", None
+    stamped = sum(1 for m in marks if m.at_line)
     if any(m.at and not m.at_line for m in marks):
         _resolve_marked(data, marks, path)
         # A mark typed in the transcript can name a record in a sidecar: while an
@@ -595,9 +799,15 @@ def _scan_marks_raw(path: pathlib.Path) -> tuple[list[Mark], set[str]]:
             missing = [m for m in marks if m.at and not m.at_line]
             if not missing:
                 break
+            TRACE.file(side, "marks")
             _resolve_marked(side.read_text(errors="replace"), missing, side, agent)
     if any(not m.at for m in marks):
         _resolve_here(data, marks, path)
+    # After resolution, not before: whether the walk placed what the stamp missed
+    # is the answer to a mark that came back without a row.
+    TRACE.step("scan_marks", file=path.name, marks=len(marks), revoked=len(revoked),
+               stamped=stamped, placed=sum(1 for m in marks if m.at_line),
+               unplaced=sum(1 for m in marks if not m.at_line))
     return marks, revoked
 
 
@@ -621,6 +831,7 @@ def _verify_stamp(mark: Mark, path: pathlib.Path) -> bool:
         lines = src.read_text(errors="replace").splitlines()
     except OSError:
         return False
+    TRACE.file(src, "stamp", records=len(lines))
     if mark.at_line > len(lines):
         return False
     try:
@@ -656,6 +867,7 @@ def _said_records(path: pathlib.Path | None,
     said = []
     for src, agent in (mark_sources(path) if path else [(None, "")]):
         raw_text = data if src is None or (src == path and data) else src.read_text(errors="replace")
+        TRACE.file(src, "said")
         machinery = _Machinery()
         for lineno, raw in enumerate(raw_text.splitlines(), start=1):
             try:
@@ -683,8 +895,11 @@ def _here_target(path: pathlib.Path) -> _MarkTarget | None:
     never on screen when the mark was made."""
     said = _said_records(path)
     if not said:
+        TRACE.step("_here_target", said=0, target="none")
         return None
     _ts, lineno, _src, agent, _first, uid = said[-1]
+    TRACE.step("_here_target", said=len(said), at=uid[:8], line=lineno,
+               agent=agent or "—", when=_ts)
     return _MarkTarget(uid, lineno, agent) if uid else None
 
 
@@ -814,6 +1029,7 @@ def extract_meta(path: pathlib.Path) -> Meta:
     # One read, held: the command ids a body is matched against are only complete
     # once the whole file is seen, and this path stays off a second pass.
     recs = list(_records(path))
+    TRACE.file(path, "meta", records=len(recs))
     command_ids = _command_prompt_ids(recs)
     for rec in recs:
         if rec.get("timestamp"):
@@ -1141,6 +1357,7 @@ def messages_from_jsonl(path: pathlib.Path) -> list[Message]:
     to mint, and a fabricated one is worse than none."""
     msgs: list[Message] = []
     recs = list(_records(path))
+    TRACE.file(path, "jsonl-messages", records=len(recs))
     command_ids = _command_prompt_ids(recs)
     for rec in recs:
         role = rec.get("type")
@@ -1381,11 +1598,17 @@ def _locate_mark(mark: Mark, msgs: list[Message]) -> None:
                         else (mark.line, mark.agent))
     # A sidecar has no per-agent ref to number lines against, so it gets its agent id instead.
     if not target or in_agent:
+        TRACE.step("_locate_mark", mark=mark.rec[:8], line=target,
+                   agent=in_agent[:8] if in_agent else "—", placed="no")
         return
     for m in msgs:
         if m.line == target:
             mark.n, mark.anchor = m.n, m.anchor
+            TRACE.step("_locate_mark", mark=mark.rec[:8], line=target,
+                       placed=f"m{m.n}", anchor=m.anchor or "—")
             return
+    TRACE.step("_locate_mark", mark=mark.rec[:8], line=target, placed="no",
+               lines_read=len(msgs), reason="no message at that row")
 
 
 def _render_marks(marks: list[Mark], msgs: list[Message],
@@ -1463,7 +1686,9 @@ def resolve_ref(args) -> str:
                 f"derived ref resolved to {got or '(nothing)'}, expected {path.stem}.\n"
                 "claude-history's ref scheme has probably changed — use `chsum find` instead."
             )
+        TRACE.step("resolve_ref", via="--file", ref=ref, uuid=got, verified="yes")
         return ref
+    TRACE.step("resolve_ref", via="argv", ref=args.ref or "—")
     return args.ref
 
 
@@ -1524,6 +1749,8 @@ def _parent_path(ref: str) -> pathlib.Path:
     path = _path_for_uuid(uuid)
     if not path:
         raise HistoryError(f"no transcript on disk for {uuid}")
+    TRACE.step("_parent_path", ref=ref, uuid=uuid)
+    TRACE.reproduce(f"claude-history agent read {ref} --no-budget")
     return path
 
 
@@ -1580,10 +1807,13 @@ def live_transcript() -> pathlib.Path:
     if live:
         path = PROJECTS_ROOT / project_dir_name(pathlib.Path.cwd()) / f"{live}.jsonl"
         if path.exists():
+            TRACE.step("live_transcript", via="CLAUDE_CODE_SESSION_ID", uuid=live)
             return path
     cands = sorted(transcripts(local=True), key=lambda p: p.stat().st_mtime, reverse=True)
     if not cands:
         raise SystemExit("no conversation found for this project")
+    TRACE.step("live_transcript", via="newest mtime", uuid=cands[0].stem,
+               env_session=live or "unset", candidates=len(cands))
     return cands[0]
 
 
@@ -1607,6 +1837,7 @@ def _mark_target(path: pathlib.Path, spec: str) -> _MarkTarget:
     prefix = spec.lower()
     hits: list[_MarkTarget] = []
     for src, agent in ([(path, "")] if line else mark_sources(path)):
+        TRACE.file(src, "at")
         for lineno, raw in enumerate(src.read_text(errors="replace").splitlines(), start=1):
             try:
                 rec = json.loads(raw)
@@ -1618,9 +1849,13 @@ def _mark_target(path: pathlib.Path, spec: str) -> _MarkTarget:
             if (line and lineno == line) or (not line and uid.startswith(prefix)):
                 hits.append(_MarkTarget(uid, lineno, agent))
     if not hits:
+        TRACE.step("_mark_target", spec=spec, mN_line=line, hits=0)
         raise SystemExit(f"no record matching {spec!r} in {path.name}")
     if len(hits) > 1:
+        TRACE.step("_mark_target", spec=spec, mN_line=line, hits=len(hits))
         raise SystemExit(f"{spec!r} matches {len(hits)} records — use more characters")
+    TRACE.step("_mark_target", spec=spec, mN_line=line, at=hits[0].uuid[:8],
+               line=hits[0].line, agent=hits[0].agent or "—")
     return hits[0]
 
 
@@ -1661,6 +1896,7 @@ def _recent_actions(path: pathlib.Path, limit: int,
     transcript lags behind the file."""
     out = []
     for src, agent in mark_sources(path):
+        TRACE.file(src, "recent")
         machinery = _Machinery()
         for lineno, raw in enumerate(src.read_text(errors="replace").splitlines(), start=1):
             try:
@@ -1734,6 +1970,7 @@ def _match_target(path: pathlib.Path, needle: str) -> _MarkTarget:
             continue
         seen.add(uid)
         hits.append((_MarkTarget(uid, lineno, agent), rec, label))
+    TRACE.step("_match_target", needle=_clip_line(needle, 60), hits=len(hits))
     if not hits:
         raise SystemExit(f"nothing in this conversation matches {needle!r}")
     if len(hits) > 1:
@@ -1769,6 +2006,7 @@ def _context_rows(src: pathlib.Path, lineno: int, n: int) -> list[tuple[int, dic
         lines = src.read_text(errors="replace").splitlines()
     except OSError:
         return []
+    TRACE.file(src, "context", records=len(lines))
     rows = []
     for i, raw in enumerate(lines, start=1):
         try:
@@ -1882,6 +2120,7 @@ def cmd_mark(args) -> int:
                 src = mk.at_path or path
                 if src not in lines_of:
                     lines_of[src] = src.read_text(errors="replace").splitlines()
+                    TRACE.file(src, "list-full", records=len(lines_of[src]))
                 body = _text_at_line(lines_of[src], mk.at_line) or mk.quote
                 first = True  # the ↳ opens the message, it doesn't bullet its paragraphs
                 for para in (body or "(nothing before it)").splitlines():
@@ -1997,6 +2236,7 @@ def path_for_ref(ref: str) -> pathlib.Path:
                          for p in hits[:8])
         more = f"\n  … and {len(hits) - 8} more" if len(hits) > 8 else ""
         raise SystemExit(f"{ref!r} matches {len(hits)} conversations:\n{rows}{more}")
+    TRACE.step("path_for_ref", asked=want, ref=ch_ref_for_path(hits[0]), uuid=hits[0].stem)
     return hits[0]
 
 
@@ -2121,6 +2361,8 @@ def latest_transcript(local: bool = True, nth: int = 1) -> pathlib.Path:
             continue
         seen += 1
         if seen == nth:
+            TRACE.step("latest_transcript", nth=nth, local=local, candidates=len(cands),
+                       skipped_live=live or "unset", uuid=p.stem)
             return p
     where = "this project" if local else "any project"
     raise SystemExit(f"no conversation #{nth} in {where}"
@@ -2197,6 +2439,7 @@ def _last_prompt(path: pathlib.Path) -> tuple[int, dict] | None:
     from its own footprint."""
     found = None
     lines = path.read_text(errors="replace").splitlines()
+    TRACE.file(path, "anchor", records=len(lines))
     command_ids = _command_prompt_ids(_parsed(lines))
     for lineno, raw in enumerate(lines, start=1):
         try:
@@ -2209,6 +2452,11 @@ def _last_prompt(path: pathlib.Path) -> tuple[int, dict] | None:
         text = _typed_text(rec)
         if text and is_typed_prompt(text):
             found = (lineno, rec)
+    if found:
+        TRACE.step("_last_prompt", line=found[0], uuid=str(found[1].get("uuid") or "")[:8],
+                   ts=str(found[1].get("timestamp") or ""), skill_bodies=len(command_ids))
+    else:
+        TRACE.step("_last_prompt", line=0, found="none", records=len(lines))
     return found
 
 
@@ -2251,7 +2499,8 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
     running to now — a timestamp even for the parent, since the far end has to
     cut sidecars too."""
     events: list[_Event] = []
-    for src, agent in mark_sources(path):
+    sources = mark_sources(path)
+    for src, agent in sources:
         # id -> the command, not just its id: a failure has to be able to name
         # what failed, and by the time the result lands the tool_use is gone.
         pending: dict[str, str] = {}
@@ -2259,6 +2508,7 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
         # tool_result (available only after the fact) can be patched onto the
         # edit event already appended at tool_use time.
         pending_edits: dict[str, int] = {}
+        TRACE.file(src, "events")
         for lineno, raw in enumerate(src.read_text(errors="replace").splitlines(), start=1):
             try:
                 rec = json.loads(raw)
@@ -2363,6 +2613,11 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
                             events.append(_Event(ts, agent, "output", head + out[-400:]))
     # Stable, so a record's own blocks stay in the order they were emitted.
     events.sort(key=lambda e: e.when)
+    TRACE.step("_events_since", anchor_line=anchor_line, anchor_ts=anchor_ts,
+               until=until_ts or "(none)", events=len(events),
+               sidecars=len(sources) - 1,
+               span=f"{events[0].when}→{events[-1].when}" if events else "—",
+               failed=sum(1 for e in events if e.kind == "failed"))
     return events
 
 
@@ -2389,6 +2644,10 @@ class _Turn:
     when: str
     kind: str  # "said" | "answered"
     text: str
+    # The record's own uuid, which a fork copy preserves where a line number
+    # does not — the name a stored breakdown is filed under. "" for a turn
+    # rebuilt from an anchor rather than read off a record.
+    uuid: str = ""
 
 
 def _answered(rec: dict) -> str:
@@ -2409,6 +2668,7 @@ def _your_turns(path: pathlib.Path) -> list[_Turn]:
     """Every turn of yours in a transcript, in order, for `recap`'s range picker."""
     turns = []
     lines = path.read_text(errors="replace").splitlines()
+    TRACE.file(path, "turns", records=len(lines))
     command_ids = _command_prompt_ids(_parsed(lines))
     for lineno, raw in enumerate(lines, start=1):
         try:
@@ -2420,12 +2680,18 @@ def _your_turns(path: pathlib.Path) -> list[_Turn]:
             continue
         ts = str(rec.get("timestamp") or "")
         text = _typed_text(rec)
+        uid = str(rec.get("uuid") or "")
         if isinstance(text, str) and is_typed_prompt(text):
-            turns.append(_Turn(lineno, ts, "said", text.strip()))
+            turns.append(_Turn(lineno, ts, "said", text.strip(), uid))
             continue
         answered = _answered(rec)
         if answered:
-            turns.append(_Turn(lineno, ts, "answered", answered))
+            turns.append(_Turn(lineno, ts, "answered", answered, uid))
+    TRACE.step("_your_turns", turns=len(turns),
+               said=sum(1 for t in turns if t.kind == "said"),
+               answered=sum(1 for t in turns if t.kind == "answered"),
+               skill_bodies=len(command_ids),
+               first=turns[0].line if turns else 0, last=turns[-1].line if turns else 0)
     return turns
 
 
@@ -2517,7 +2783,200 @@ def _chunk_events(events: list[_Event], boundaries: list[str],
     for bucket in buckets:
         if bucket:
             chunks.extend(_split_to_fit(bucket, max_chars))
+    TRACE.step("_chunk_events", events=len(events), boundaries=len(boundaries),
+               buckets=sum(1 for b in buckets if b), chunks=len(chunks), max_chars=max_chars)
     return chunks
+
+
+# ---------------------------------------------------------------------------
+# the turn store
+# ---------------------------------------------------------------------------
+# One file per turn, holding every breakdown written for it. Named by the turn
+# record's own `uuid`: a fork copy preserves `uuid` verbatim, rewrites
+# `sessionId` on every copied row, and linearizes the rows in a different order,
+# so neither of the other two names the same turn across two branch files.
+
+_CLOSING_REASONS = frozenset({"end_turn", "stop_sequence", "refusal"})
+
+
+def _fingerprint(*parts: str) -> str:
+    """Twelve hex of a sha256 over `parts`. Names what produced a breakdown (the
+    chunk prompt and the model) and what it was produced from (one chunk's
+    material), so a stored breakdown is checked against both rather than taken
+    on the strength of the file existing."""
+    h = hashlib.sha256()
+    for part in parts:
+        h.update(part.encode("utf-8", "replace"))
+        h.update(b"\0")
+    return h.hexdigest()[:12]
+
+
+def _turn_path(project_dir: str, uuid: str) -> pathlib.Path:
+    """Where one turn's breakdowns live. `project_dir` is the transcript's own
+    parent directory name — the slugified cwd, which both branches of a fork
+    share, so a forked session reads the breakdowns its parent wrote."""
+    return TURNS_DIR / project_dir / f"{uuid}.json"
+
+
+def _turn_closers(path: pathlib.Path, spine: list[_Turn], until_ts: str) -> list[str]:
+    """Per turn, the uuid of the last assistant record in its gap once that gap
+    is closed, else "". A gap still open takes more records after the ones a
+    breakdown was built from, so nothing derived from it is storable.
+
+    Two ways a gap closes, and either is enough. A later boundary bounds it: the
+    transcript is append-only and a record timestamped inside a bounded gap has
+    nowhere to arrive. Otherwise the gap's last assistant record carries a
+    closing `stop_reason`, which bounds the far end of the window itself. The
+    boundary test is what covers an interrupted turn, whose stretch ends on
+    `tool_use` and never closes on its own — measured 38 of 634.
+
+    The last assistant record, not the first closing value in the gap: a
+    `<task-notification>` re-invokes the assistant with nothing typed, which
+    appends work after a closing value in 14 of 645 measured stretches."""
+    if not spine:
+        return []
+    stamps = [t.when for t in spine]
+    last_uuid = [""] * len(spine)
+    last_when = [""] * len(spine)
+    last_reason = [""] * len(spine)
+    for rec in _parsed(path.read_text(errors="replace").splitlines()):
+        if rec.get("type") != "assistant":
+            continue
+        when = str(rec.get("timestamp") or "")
+        if not when or when < stamps[0] or (until_ts and when > until_ts):
+            continue
+        i = bisect.bisect_right(stamps, when) - 1
+        # A fork linearizes the same rows in a different order, so the latest
+        # record in a gap is the latest by timestamp, not the last one read.
+        if i < 0 or when < last_when[i]:
+            continue
+        msg = rec.get("message")
+        last_uuid[i] = str(rec.get("uuid") or "")
+        last_when[i] = when
+        last_reason[i] = str(msg.get("stop_reason") or "") if isinstance(msg, dict) else ""
+    bounded = lambda i: i < len(spine) - 1 or bool(until_ts)
+    out = [uid if bounded(i) or last_reason[i] in _CLOSING_REASONS else ""
+           for i, uid in enumerate(last_uuid)]
+    # The final gap of the session being appended to right now stays open
+    # whatever it closed on: the next record lands in it.
+    live = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if out and not until_ts and live and path.stem == live:
+        out[-1] = ""
+    TRACE.step("_turn_closers", turns=len(spine), closed=sum(1 for u in out if u),
+               open=sum(1 for u in out if not u),
+               by_reason=sum(1 for r in last_reason if r in _CLOSING_REASONS),
+               until=until_ts or "(end of session)")
+    return out
+
+
+def _read_breakdown(project_dir: str, turn: _Turn, instructions: str, model: str,
+                    materials: list[str]) -> list[list[str]] | None:
+    """This turn's stored bullets, one list per chunk, or None. A hit needs the
+    entry to name the same instructions and model, to hold one part per chunk,
+    and every part to name the material of the chunk it is read for — the store
+    is checked against what it claims, the same rule as `_verify_stamp`."""
+    try:
+        doc = json.loads(_turn_path(project_dir, turn.uuid).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    for entry in doc.get("summaries") or []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("instructions") != instructions or entry.get("model") != model:
+            continue
+        parts = entry.get("parts")
+        if not isinstance(parts, list) or len(parts) != len(materials):
+            return None
+        out = []
+        for part, material in zip(parts, materials):
+            if not isinstance(part, dict) or part.get("material") != material:
+                return None
+            bullets = part.get("bullets")
+            out.append([b for b in bullets if isinstance(b, str)]
+                       if isinstance(bullets, list) else [])
+        return out
+    return None
+
+
+def _write_breakdown(project_dir: str, turn: _Turn, closed_by: str,
+                     instructions: str, model: str, parts: list[dict]) -> None:
+    """One turn's breakdown onto disk. An entry written under different
+    instructions stays beside the new one rather than being dropped: the text a
+    past recap printed remains findable after `_CHUNK_PROMPT` changes."""
+    target = _turn_path(project_dir, turn.uuid)
+    doc: dict = {}
+    try:
+        loaded = json.loads(target.read_text())
+        if isinstance(loaded, dict):
+            doc = loaded
+    except (OSError, ValueError):
+        doc = {}
+    doc.update({"uuid": turn.uuid, "when": turn.when, "kind": turn.kind,
+                "closed_by": closed_by})
+    kept = [e for e in (doc.get("summaries") or [])
+            if isinstance(e, dict) and (e.get("instructions") != instructions
+                                        or e.get("model") != model)]
+    doc["summaries"] = kept + [{
+        "instructions": instructions, "model": model,
+        "written": datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds").replace("+00:00", "Z"),
+        "parts": parts}]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Written whole and moved into place, so a concurrent read never opens half a file.
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=1))
+    tmp.replace(target)
+
+
+def _turn_chunks(chunks: list[list[_Event]], boundaries: list[str]) -> list[list[int]]:
+    """Chunk indices per turn, in order — the same rightmost-turn-at-or-before
+    bisect `_chunk_events` bucketed them with, so a turn owns exactly the chunks
+    built from its own gap."""
+    stamps = sorted(boundaries)
+    per: list[list[int]] = [[] for _ in stamps]
+    for i, chunk in enumerate(chunks):
+        j = max(0, bisect.bisect_right(stamps, chunk[0].when) - 1)
+        per[j].append(i)
+    return per
+
+
+def _cached_turns(project_dir: str, spine: list[_Turn], chunks: list[list[_Event]],
+                  boundaries: list[str], instructions: str,
+                  model: str) -> tuple[list[list[list[str]] | None], set[int]]:
+    """(stored bullets per turn or None, the chunk indices already on disk).
+    A turn is a hit or a miss whole: a partial hit would call for some of its
+    chunks and read the rest, and the two orderings would have to be merged."""
+    per_turn = _turn_chunks(chunks, boundaries)
+    hits: list[list[list[str]] | None] = []
+    done: set[int] = set()
+    for turn, idxs in zip(spine, per_turn):
+        materials = [_fingerprint(_chunk_material(chunks[i])) for i in idxs]
+        got = (_read_breakdown(project_dir, turn, instructions, model, materials)
+               if turn.uuid and idxs else None)
+        hits.append(got)
+        if got is not None:
+            done.update(idxs)
+    TRACE.step("_cached_turns", turns=len(spine),
+               hits=sum(1 for h in hits if h is not None),
+               misses=sum(1 for h in hits if h is None),
+               chunks_cached=len(done), chunks=len(chunks),
+               instructions=instructions, model=model, dir=str(TURNS_DIR / project_dir))
+    return hits, done
+
+
+def _store_turn(project_dir: str, turn: _Turn, closed_by: str, parts: list[dict],
+                failed: bool, instructions: str, model: str) -> bool:
+    """One finished turn onto disk, the moment its own chunks are in — a run
+    killed part-way keeps every turn that completed. A turn holding a failed
+    call is not written, or the missing part would come back as a hit."""
+    if failed or not turn.uuid or not closed_by:
+        return False
+    if not any(part["bullets"] for part in parts):
+        return False
+    _write_breakdown(project_dir, turn, closed_by, instructions, model, parts)
+    return True
 
 
 _KIND_LABELS = {"said": "what Claude said", "edit": "file edits",
@@ -2567,12 +3026,18 @@ def _checkpoint_shas(project_dir: pathlib.Path | None, session_uuid: str) -> lis
     handling, even though no model call is involved."""
     if not project_dir:
         return []
+    started = time.monotonic()
     try:
         proc = subprocess.run(
             ["git", "reflog", "show", "HEAD", "--format=%H %gs"],
             cwd=project_dir, capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as e:
+        TRACE.step("_checkpoint_shas", repo=str(project_dir), git=type(e).__name__,
+                   checkpoints=0, fallback="_files_touched")
         return []
+    TRACE.proc(["git", "-C", str(project_dir), "reflog", "show", "HEAD"],
+               proc.returncode, time.monotonic() - started,
+               f"{len(proc.stdout.splitlines())} reflog entries")
     if proc.returncode != 0:
         return []
     out: list[tuple[str, str]] = []
@@ -2590,6 +3055,9 @@ def _checkpoint_shas(project_dir: pathlib.Path | None, session_uuid: str) -> lis
         if m and m.group(1) == session_uuid:
             out.append((m.group(2), sha))
     out.reverse()
+    TRACE.step("_checkpoint_shas", repo=str(project_dir), session=session_uuid[:8],
+               checkpoints=len(out),
+               span=f"{out[0][0]}→{out[-1][0]}" if out else "—")
     return out
 
 
@@ -2609,12 +3077,15 @@ def _checkpoint_diff_files(project_dir: pathlib.Path | None, prev_ref: str, cur_
     unparseable diff all degrade to `[]`."""
     if not project_dir:
         return []
+    started = time.monotonic()
     try:
         proc = subprocess.run(
             ["git", "diff", "-U0", prev_ref, cur_ref],
             cwd=project_dir, capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return []
+    TRACE.proc(["git", "-C", str(project_dir), "diff", "-U0", prev_ref, cur_ref],
+               proc.returncode, time.monotonic() - started, f"{len(proc.stdout)} chars")
     if proc.returncode != 0:
         return []
     by_path: dict[str, list[str]] = {}
@@ -2656,30 +3127,28 @@ def _checkpoint_diff_files(project_dir: pathlib.Path | None, prev_ref: str, cur_
     return out
 
 
-def _turn_files(turn_events: list[list[_Event]], spine: list[_Turn], until_ts: str,
-                project_dir: pathlib.Path | None, session_uuid: str) -> list[list[str]]:
-    """Per-turn files-touched, one entry per turn — preferring a git checkpoint
-    diff over the transcript-based `_files_touched` wherever a checkpoint
-    covers that turn's time window, since a checkpoint sees every change
-    regardless of how it was made and is never stale. Falls back to
-    `_files_touched` turn-by-turn (today's behaviour, byte-identical) when no
-    checkpoint exists for this session at all, or per-turn when a given turn
-    just isn't covered by one.
+def _turn_checkpoints(spine: list[_Turn], until_ts: str,
+                      project_dir: pathlib.Path | None, session_uuid: str) -> list[str]:
+    """Per turn, the sha of the checkpoint covering its window, or "". The
+    reflog arithmetic alone — no diffs — so the counts are available before the
+    model calls that `_turn_files` runs after, and the reflog is read once.
 
     `spine[i].when` to `spine[i+1].when` (or `until_ts` for the last turn) is
     each turn's window — same rightmost-boundary convention `_turn_activity`
-    bisects on. A window with more than one checkpoint in it (shouldn't
-    normally happen — one hook firing per turn) still just diffs from the
-    running pointer to the *last* checkpoint in that window."""
+    bisects on. A window holding more than one checkpoint (shouldn't normally
+    happen — one hook firing per turn) takes the last."""
+    covers = [""] * len(spine)
+    if not spine:
+        return covers
     checkpoints = _checkpoint_shas(project_dir, session_uuid)
     if not checkpoints:
-        return [_files_touched(evs) for evs in turn_events]
-    out: list[list[str]] = []
-    last_sha: str | None = None
+        TRACE.step("_turn_checkpoints", turns=len(spine), checkpoint=0,
+                   transcript=len(spine), reason="no checkpoint for this session")
+        return covers
     ci, n = 0, len(checkpoints)
-    for i, evs in enumerate(turn_events):
+    for i in range(len(spine)):
         start = spine[i].when
-        is_last = i == len(turn_events) - 1
+        is_last = i == len(spine) - 1
         while ci < n and checkpoints[ci][0] < start:
             ci += 1  # a checkpoint stamped before this window opened isn't this turn's
         j = ci
@@ -2688,21 +3157,63 @@ def _turn_files(turn_events: list[list[_Event]], spine: list[_Turn], until_ts: s
         while j < n and ((not until_ts or checkpoints[j][0] <= until_ts) if is_last
                           else checkpoints[j][0] < spine[i + 1].when):
             j += 1
-        in_window = checkpoints[ci:j]
+        if j > ci:
+            covers[i] = checkpoints[j - 1][1]
         ci = j
-        if in_window:
-            sha = in_window[-1][1]
-            # The very first checkpoint seen has no prior checkpoint to diff
-            # from, so its baseline is its own first parent — the branch tip
-            # right before checkpointing started, not "nothing".
-            prev = last_sha if last_sha is not None else f"{sha}^"
-            files = _checkpoint_diff_files(project_dir, prev, sha)
-            out.append([f"- checkpoint `{sha[:12]}` — `git show {sha[:12]}` for this "
-                        "turn's exact snapshot"] + files)
-            last_sha = sha
-        else:
+    covered = sum(1 for c in covers if c)
+    TRACE.step("_turn_checkpoints", turns=len(spine), checkpoints=n,
+               checkpoint=covered, transcript=len(covers) - covered,
+               until=until_ts or "(none)")
+    return covers
+
+
+def _turn_files(turn_events: list[list[_Event]], covers: list[str],
+                project_dir: pathlib.Path | None) -> list[list[str]]:
+    """Per-turn files-touched, one entry per turn — a real `git diff` between
+    checkpoints wherever `covers[i]` names one, since a checkpoint sees every
+    change regardless of how it was made (a raw `sed -i`, not just
+    Edit/Write/MultiEdit) and is never stale; `_files_touched`'s transcript
+    scan for every other turn."""
+    out: list[list[str]] = []
+    last_sha: str | None = None
+    diffs = 0
+    for i, evs in enumerate(turn_events):
+        sha = covers[i] if i < len(covers) else ""
+        if not sha:
             out.append(_files_touched(evs))
+            continue
+        # The very first checkpoint seen has no prior checkpoint to diff
+        # from, so its baseline is its own first parent — the branch tip
+        # right before checkpointing started, not "nothing".
+        prev = last_sha if last_sha is not None else f"{sha}^"
+        out.append([f"- checkpoint `{sha[:12]}` — `git show {sha[:12]}` for this "
+                    "turn's exact snapshot"] + _checkpoint_diff_files(project_dir, prev, sha))
+        last_sha = sha
+        diffs += 1
+    TRACE.step("_turn_files", turns=len(turn_events), diffs=diffs)
     return out
+
+
+def _checkpoint_source(covers: list[str]) -> list[str]:
+    """Which source produced each turn's files, as counts chsum measured. A
+    turn whose files came from the transcript scan must not read as one backed
+    by a checkpoint — the two differ in what they can see and in whether their
+    line ranges are current. Computed and printed above the model-written
+    timeline, same placement rule as `_compaction_section`."""
+    if not covers:
+        return []
+    covered = sum(1 for c in covers if c)
+    out = [f"## Files touched — {covered} of {_plural(len(covers), 'turn')} "
+           "from a checkpoint\n"]
+    rest = len(covers) - covered
+    if rest:
+        # "the other N" only reads right when some turn was covered; at zero
+        # there is no other, and the sentence would imply one.
+        which = f"the other {_plural(rest, 'turn')}" if covered else f"all {_plural(rest, 'turn')}"
+        out.append(f"*Files for {which} come from the transcript scan, which sees "
+                   "`Edit`/`Write`/`MultiEdit` only and carries each edit's line "
+                   "range as recorded at the time.*")
+    return out + [""]
 
 
 def _compaction_section(events: list[_Event]) -> list[str]:
@@ -2812,19 +3323,22 @@ def _interleaved(turns: list[_Turn], buckets: list[list[str]],
     return out
 
 
-def _cost_rows(events: list[_Event], boundaries: list[str]):
+def _cost_rows(events: list[_Event], boundaries: list[str],
+               cached: set[int] | frozenset[int] = frozenset()):
     """`events` chunked exactly as a live run would, then sized off exactly what
     each chunk's call would send. Shared by `_dry_run_report` and the wizard's
     cost step so the two can't drift into quoting different numbers.
 
     Returns `(rows, by_kind)`: `rows` is one `(chunk, material_chars, called)`
     per chunk, `called` from `_chunk_activity` so "chunks called" matches what
-    a real run would spend. `by_kind` aggregates only the called chunks."""
+    a real run would spend. `cached` names the chunk indices the turn store
+    already holds, which a live run would not call for either. `by_kind`
+    aggregates only the called chunks."""
     chunks = _chunk_events(events, boundaries, _CHUNK_MAX_CHARS)
     by_kind: dict[str, list[int]] = {}
     rows: list[tuple[list[_Event], int, bool]] = []
-    for chunk in chunks:
-        called = _chunk_activity(chunk)
+    for i, chunk in enumerate(chunks):
+        called = _chunk_activity(chunk) and i not in cached
         chars = 0
         if called:
             for e in chunk:
@@ -2837,14 +3351,15 @@ def _cost_rows(events: list[_Event], boundaries: list[str]):
 
 
 def _dry_run_report(events: list[_Event], boundaries: list[str],
-                    cmd: str = "last --here") -> str:
+                    cmd: str = "last --here",
+                    cached: set[int] | frozenset[int] = frozenset()) -> str:
     """`--dry-run`'s answer to "what is this going to cost, and why". Prices it
     the way a live run actually spends it, via `_cost_rows`, so totals reconcile
     to what a real run would send rather than approximating it. Characters are
     the computed fact; tokens carry `~` since `_est_tokens` is chars/4."""
-    rows, by_kind = _cost_rows(events, boundaries)
+    rows, by_kind = _cost_rows(events, boundaries, cached)
     called = [(chunk, chars) for chunk, chars, ok in rows if ok]
-    n_called, n_total = len(called), len(rows)
+    n_called = len(called)
 
     prompt_chars = len(_CHUNK_PROMPT) * n_called
     material_chars = sum(chars for _, chars in called)
@@ -2856,10 +3371,17 @@ def _dry_run_report(events: list[_Event], boundaries: list[str],
            "*No model call was made. Every figure below is measured off the exact "
            f"text `{cmd}` would split into chunks and pipe to "
            f"`claude -p --model {HaikuSummariser.model}`, one call per chunk.*\n"]
-    skipped = n_total - n_called
+    # Two reasons a chunk is not called, named apart: a quiet gap was never
+    # worth a call, where a stored one was already paid for.
+    quiet = sum(1 for i, (_c, _n, ok) in enumerate(rows) if not ok and i not in cached)
+    why = []
+    if quiet:
+        why.append(f"{_plural(quiet, 'chunk')} skipped — nothing in them "
+                   "but your own turns")
+    if cached:
+        why.append(f"{_plural(len(cached), 'chunk')} already in the turn store")
     out.append(f"{_plural(n_called, 'call')} would be made"
-               + (f" ({_plural(skipped, 'chunk')} skipped — nothing in them but "
-                  "your own turns)" if skipped else "") + ".\n")
+               + (f" ({'; '.join(why)})" if why else "") + ".\n")
     if called:
         sizes = sorted(c for _, c in called)
         mid = sizes[len(sizes) // 2]
@@ -2993,8 +3515,12 @@ def _pick_transcript(live_only: bool = True) -> pathlib.Path:
     except EOFError:
         raw = ""
     if not raw:
+        TRACE.step("_pick_transcript", offered=len(ranked), picked="default",
+                   uuid=ranked[default - 1].stem)
         return ranked[default - 1]
     if raw.isdigit() and 1 <= int(raw) <= len(ranked):
+        TRACE.step("_pick_transcript", offered=len(ranked), picked=raw,
+                   uuid=ranked[int(raw) - 1].stem)
         return ranked[int(raw) - 1]
     raise SystemExit(f"not a session number: {raw!r}")
 
@@ -3129,7 +3655,7 @@ def cmd_catchup(args) -> int:
 
 def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: str,
                    prompt_text: str, until_ts: str, args, turns: list[_Turn] | None = None,
-                   live: bool = True) -> int:
+                   live: bool = True, anchor_uuid: str = "") -> int:
     """The document, for a window with a start and an optional end. One body
     for `last --here` and `recap` — they differ only in how the window was
     chosen. `live` says which: `last --here` runs to now, `recap` to a chosen
@@ -3213,6 +3739,19 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
     since += _compaction_section(events)
     since += _failures_section(events)
 
+    # Built off `turns`/`live` directly, not `interleave`, so a dry run still
+    # prices the chunks a real run would make. Computed here rather than after
+    # the block prints, because the checkpoint counts belong in it and a dry
+    # run reaches it.
+    spine = ([_Turn(anchor_line, anchor_ts, "said", prompt_text, anchor_uuid)]
+             + list(turns or []) if turns and not live else [])
+    boundaries = [t.when for t in spine]
+    project_dir = pathlib.Path(meta.project) if meta.project else None
+    covers = _turn_checkpoints(spine, until_ts, project_dir, meta.uuid)
+    # Last of the computed sections: it describes the per-turn bullets in the
+    # timeline below, so it sits nearest them while staying above the heading.
+    since += _checkpoint_source(covers)
+
     said = [e for e in events if e.kind == "said"]
     if said:
         last = said[-1]
@@ -3223,15 +3762,17 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
     _clear_status()
     out("\n".join(since), flush=True)
 
-    # Built off `turns`/`live` directly, not `interleave`, so a dry run still
-    # prices the chunks a real run would make.
-    spine = ([_Turn(anchor_line, anchor_ts, "said", prompt_text)] + list(turns or [])
-             if turns and not live else [])
-    boundaries = [t.when for t in spine]
-
     if getattr(args, "dry_run", False):
         _clear_status()
-        out(_dry_run_report(events, boundaries, "last --here" if live else "recap"))
+        cached: set[int] = set()
+        if spine and not getattr(args, "no_cache", False):
+            _, cached = _cached_turns(
+                path.parent.name, spine,
+                _chunk_events(events, boundaries, _CHUNK_MAX_CHARS), boundaries,
+                _fingerprint(_CHUNK_PROMPT, HaikuSummariser.model),
+                HaikuSummariser.model)
+        out(_dry_run_report(events, boundaries,
+                            "last --here" if live else "recap", cached))
         return 0
 
     # One call per chunk, run independently and in parallel — no chunk's call
@@ -3253,18 +3794,73 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
         finally:
             done.bump()  # counted whichever way it ended, or the line stalls short
 
+    # The store is read only where the document slices onto turns: `last --here`
+    # names its chunks by nothing durable, and its tail gap is open by construction.
+    instructions = _fingerprint(_CHUNK_PROMPT, HaikuSummariser.model)
+    use_store = interleave and not getattr(args, "no_cache", False)
+    hits: list[list[list[str]] | None] = [None] * len(spine)
+    cached: set[int] = set()
+    if use_store:
+        hits, cached = _cached_turns(path.parent.name, spine, chunks, boundaries,
+                                     instructions, HaikuSummariser.model)
+
+    # Which turn owns which chunk, and how many of its chunks are still to come.
+    per_turn = _turn_chunks(chunks, boundaries) if spine else []
+    turn_of = [0] * len(chunks)
+    for j, idxs in enumerate(per_turn):
+        for i in idxs:
+            turn_of[i] = j
+    pending = [i for i in range(len(chunks)) if i not in cached]
+    # Read once, ahead of the first call rather than after the last: a turn is
+    # written the moment it finishes, and its gap has to already be known closed.
+    closers = ([] if not use_store or all(h is not None for h in hits)
+               else _turn_closers(path, spine, until_ts))
+    outstanding = [sum(1 for i in idxs if i in pending) for idxs in per_turn]
+    parts_by_turn: list[list[dict]] = [[] for _ in spine]
+    turn_failed = [False] * len(spine)
+    stored = 0
+    active = [chunks[i] for i in pending if _chunk_activity(chunks[i])]
     chunk_est = sum(_est_tokens(_CHUNK_PROMPT) + _est_tokens(_chunk_material(c))
-                    for c in chunks if _chunk_activity(c))
-    workers = max(1, min(_CHUNK_WORKERS, len(chunks)))
+                    for c in active)
+    workers = max(1, min(_CHUNK_WORKERS, len(pending)))
     # A real ceiling, not an estimate: each call is capped at `_CALL_TIMEOUT`, so
     # the phase cannot outlast one timeout per wave of `workers`.
-    ceiling = _fmt_secs(-(-len(chunks) // workers) * _CALL_TIMEOUT)
+    ceiling = _fmt_secs(-(-len(pending) // workers) * _CALL_TIMEOUT)
+    from_store = f" · {len(cached)} from the store" if cached else ""
     done = _Counter()
-    with _Ticker(lambda: f"haiku: {done.value}/{len(chunks)} chunks · "
-                         f"{_fmt_tokens(chunk_est)} tokens · at most {ceiling}"):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            # `map` preserves submission order, so chunk order stays chronological.
-            results = list(ex.map(_run_chunk, chunks))
+    # A cached chunk was charged nothing on this run, so it carries no usage and
+    # no seconds — `_note` states what this run spent, not what the file cost.
+    results: list[tuple[str, dict, float, str]] = [("", {}, 0.0, "")] * len(chunks)
+    if pending:
+        with _Ticker(lambda: f"haiku: {done.value}/{len(pending)} chunks · "
+                             f"{_fmt_tokens(chunk_est)} tokens · at most {ceiling}"
+                             + from_store):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                # `map` preserves submission order, so chunk order stays
+                # chronological and a turn is written after every earlier one.
+                for i, got in zip(pending, ex.map(_run_chunk,
+                                                  [chunks[i] for i in pending])):
+                    results[i] = got
+                    if not closers:
+                        continue
+                    idx = turn_of[i]
+                    text, usage, seconds, err = got
+                    parts_by_turn[idx].append({
+                        "material": _fingerprint(_chunk_material(chunks[i])),
+                        "bullets": _chunk_bullets(text) if text else [],
+                        "usage": usage or {}, "seconds": round(seconds, 3)})
+                    turn_failed[idx] = turn_failed[idx] or bool(err)
+                    outstanding[idx] -= 1
+                    if outstanding[idx] == 0 and hits[idx] is None and _store_turn(
+                            path.parent.name, spine[idx], closers[idx],
+                            parts_by_turn[idx], turn_failed[idx], instructions,
+                            HaikuSummariser.model):
+                        stored += 1
+    if closers:
+        TRACE.step("turn_store", written=stored, turns=len(spine),
+                   closed=sum(1 for c in closers if c),
+                   open_gaps=sum(1 for c in closers if not c),
+                   dir=str(TURNS_DIR / path.parent.name))
 
     total_usage: dict = {}
     total_seconds = 0.0
@@ -3274,11 +3870,18 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
             if isinstance(v, (int, float)):
                 total_usage[k] = total_usage.get(k, 0) + v
 
-    # Every chunk failing degrades to verbatim sections plus a one-line notice;
-    # a mix of hits and misses gives each failed gap its own notice.
-    all_failed = bool(results) and all(err for *_, err in results)
-    unavailable = (f"*Timeline unavailable — {results[0][3]}. Everything above "
+    # Every call failing degrades to verbatim sections plus a one-line notice;
+    # a mix of hits and misses gives each failed gap its own notice. Bullets read
+    # off disk are a timeline, so a run that made no successful call still has one.
+    attempted = [results[i] for i in pending]
+    all_failed = bool(attempted) and all(err for *_, err in attempted) and not cached
+    unavailable = (f"*Timeline unavailable — {attempted[0][3]}. Everything above "
                    "is still verbatim.*" if all_failed else "")
+    errs = [err for *_, err in attempted if err]
+    TRACE.step("_run_chunk", chunks=len(chunks), called=len(pending), workers=workers,
+               from_store=len(cached), skipped=len(pending) - len(active),
+               failed=len(errs), seconds=round(total_seconds, 1),
+               est_tokens=chunk_est, first_error=_clip_line(errs[0], 90) if errs else "—")
 
     sliced: list[str] = []
     written = ""
@@ -3286,10 +3889,15 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
         stamps = sorted(boundaries)
         turn_bullets: list[list[str]] = [[] for _ in spine]
         turn_events: list[list[_Event]] = [[] for _ in spine]
-        for chunk, (text, _, _, err) in zip(chunks, results):
+        for i, hit in enumerate(hits):
+            if hit is not None:
+                turn_bullets[i] = [b for part in hit for b in part]
+        for i, (chunk, (text, _, _, err)) in enumerate(zip(chunks, results)):
             # Re-derives which turn this chunk belongs to via its first event's timestamp.
             idx = max(0, bisect.bisect_right(stamps, chunk[0].when) - 1)
             turn_events[idx] += chunk
+            if i in cached:
+                continue
             if err:
                 turn_bullets[idx].append(
                     f"*Digest unavailable for part of this gap — {err}. The "
@@ -3300,9 +3908,7 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
         # beside, same reasoning as `_failures_section`/`_compaction_section`.
         # Prefers a git checkpoint diff over the transcript scan per turn,
         # wherever the `chsum_checkpoint.py` Stop hook covered it — see `_turn_files`.
-        project_dir = pathlib.Path(meta.project) if meta.project else None
-        for idx, files in enumerate(_turn_files(turn_events, spine, until_ts,
-                                                project_dir, meta.uuid)):
+        for idx, files in enumerate(_turn_files(turn_events, covers, project_dir)):
             if files:
                 turn_bullets[idx] = files + turn_bullets[idx]
         sliced = _interleaved(spine, turn_bullets, [])
@@ -3399,8 +4005,10 @@ class _Wizard:
         3: "enter run the recap · esc back to end",
     }
 
-    def __init__(self, cands: list[pathlib.Path]):
+    def __init__(self, cands: list[pathlib.Path], args=None):
         self.cands = cands
+        # Held for the cost step alone: `--no-cache` has to price the same way it runs.
+        self.args = args
         self.step = 0
         self.cursor = 0
         self.top = 0
@@ -3559,8 +4167,17 @@ class _Wizard:
         events += [_Event(t.when, "", "you", t.text) for t in inner]
         events.sort(key=lambda e: e.when)
         # Mirrors `_render_window`'s `spine`, so this prices the N calls a real run would make.
-        boundaries = [t.when for t in [a] + inner]
-        rows, by_kind = _cost_rows(events, boundaries)
+        spine = [a] + inner
+        boundaries = [t.when for t in spine]
+        cached: set[int] = set()
+        consulted = not getattr(self.args, "no_cache", False)
+        if consulted:
+            _, cached = _cached_turns(
+                self.path.parent.name, spine,
+                _chunk_events(events, boundaries, _CHUNK_MAX_CHARS), boundaries,
+                _fingerprint(_CHUNK_PROMPT, HaikuSummariser.model),
+                HaikuSummariser.model)
+        rows, by_kind = _cost_rows(events, boundaries, cached)
         called = [(chunk, chars) for chunk, chars, ok in rows if ok]
         n_called, n_total = len(called), len(rows)
         prompt_chars = len(_CHUNK_PROMPT) * n_called
@@ -3571,7 +4188,11 @@ class _Wizard:
             f"turns {lo + 1}–{hi + 1}   {_hhmm(a.when)} → "
             f"{_hhmm(b.when) if until else 'end of session'}"
             f"   {_plural(len(events), 'event')}   {_plural(n_called, 'call')}"
-            + (f" ({n_total - n_called} skipped)" if n_total > n_called else ""),
+            # Stated at zero too: a silent line cannot be told apart from a
+            # store that was never read.
+            + (f"   {len(cached)} of {n_total} chunks stored" if consulted else "")
+            + (f"   {n_total - n_called - len(cached)} quiet"
+               if n_total - n_called - len(cached) > 0 else ""),
             "",
         ]
         kind_rows = sorted(((_KIND_LABELS.get(k, k), v[1], v[0]) for k, v in by_kind.items()),
@@ -3730,7 +4351,7 @@ def _run_wizard(args):
     cands = sorted(cands, key=recency)[-40:]
     try:
         with _tty_curses() as scr:
-            picked = _Wizard(cands).run(scr)
+            picked = _Wizard(cands, args).run(scr)
         return ("ok", picked) if picked else ("quit", None)
     except (curses.error, OSError):
         # Falls back rather than failing the command; CHSUM_TUI_DEBUG surfaces why.
@@ -3763,9 +4384,19 @@ def cmd_recap(args) -> int:
     inner = [t for t in turns if start.when < t.when <= end.when]
     # Ending on the last turn bounds the window by nothing: that turn's own work
     # is what follows it, and a bound at its timestamp would cut all of it.
-    until = "" if end is turns[-1] else end.when
+    # Compared by value, not identity: the wizard picked its turn out of its own
+    # `_your_turns` list and this one is read again, so the last turn of the
+    # window and the last turn of the file are equal objects and never the same one.
+    until = "" if end == turns[-1] else end.when
+    # The interactively-picked range as flags, or the range can't be typed again.
+    TRACE.reproduce(f"chsum recap {ch_ref_for_path(path)} "
+                    f"--from {turns.index(start) + 1} --to {turns.index(end) + 1}")
+    TRACE.step("cmd_recap", turns=len(turns), start_turn=turns.index(start) + 1,
+               end_turn=turns.index(end) + 1, start_line=start.line,
+               until=until or "(end of session)", inner=len(inner),
+               picked_by="wizard" if picked else "flags/prompt")
     return _render_window(path, meta, start.line, start.when, start.text,
-                          until, args, inner, live=False)
+                          until, args, inner, live=False, anchor_uuid=start.uuid)
 
 
 def cmd_last(args) -> int:
@@ -4050,7 +4681,7 @@ class HaikuSummariser(Summariser):
         exe = shutil.which("claude")
         if not exe:
             raise SummariserError("claude CLI not on PATH")
-        cwd = DIGEST_DIR.parent
+        cwd = CHSUM_DIR
         cwd.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
         try:
@@ -4062,8 +4693,13 @@ class HaikuSummariser(Summariser):
                 capture_output=True, text=True, timeout=_CALL_TIMEOUT, cwd=cwd,
             )
         except subprocess.TimeoutExpired:
+            TRACE.proc([exe, "-p", "--model", self.model], 124, time.monotonic() - started,
+                       f"timeout, {len(material)} chars in")
             raise SummariserError("claude -p timed out after 240s") from None
         self.seconds = time.monotonic() - started
+        TRACE.proc([exe, "-p", "--model", self.model, "--output-format", "json",
+                    "--tools", "", "--setting-sources", ""],
+                   proc.returncode, self.seconds, f"{len(material)} chars in")
         if proc.returncode != 0 or not proc.stdout.strip():
             err = (proc.stderr or proc.stdout).strip().splitlines()
             raise SummariserError(err[0][:200] if err else "claude -p printed nothing")
@@ -4095,16 +4731,23 @@ def main(argv=None) -> int:
     )
     ap.add_argument("--out", type=pathlib.Path, default=DIGEST_DIR,
                     help=f"digest directory (default: {DIGEST_DIR})")
+    # A parent, not a top-level flag: `--out` sits on `ap` and so has to precede
+    # the subcommand, and `--debug` is typed at the end of whatever you just ran.
+    dbg = argparse.ArgumentParser(add_help=False)
+    dbg.add_argument("--debug", action="store_true",
+                     help="print what this run read, ran and resolved, for pasting "
+                          "into a chsum session to reproduce from")
     sub = ap.add_subparsers(dest="cmd")
 
-    p = sub.add_parser("sessions", help="one line per conversation in this project (the default)")
+    p = sub.add_parser("sessions", parents=[dbg],
+                       help="one line per conversation in this project (the default)")
     p.add_argument("-n", "--limit", type=int, default=5, metavar="N",
                    help="how many to list, 0 for all (default: 5)")
     p.add_argument("--since", default=None, help="window, e.g. 7d, 24h, 2w (default: all time)")
     p.add_argument("--all", action="store_true", help="all projects (default: this one)")
     p.set_defaults(func=cmd_sessions)
 
-    p = sub.add_parser("last", help="context for your most recent conversation")
+    p = sub.add_parser("last", parents=[dbg], help="context for your most recent conversation")
     p.add_argument("-n", "--nth", type=int, default=1, metavar="N",
                    help="Nth most recent instead of the last (default: 1)")
     p.add_argument("--all", action="store_true", help="all projects (default: this one)")
@@ -4116,7 +4759,7 @@ def main(argv=None) -> int:
                         "breakdown of what would be sent, and make no model call")
     p.set_defaults(func=cmd_last)
 
-    p = sub.add_parser("find", help="search conversations")
+    p = sub.add_parser("find", parents=[dbg], help="search conversations")
     p.add_argument("query", nargs="?")
     p.add_argument("--all", action="store_true", help="all workspaces (default: this one)")
     p.add_argument("--top", type=int, default=8)
@@ -4126,7 +4769,7 @@ def main(argv=None) -> int:
         p.add_argument(f"--{mode}", dest="mode", action="store_const", const=mode)
     p.set_defaults(mode="hybrid", func=cmd_find)
 
-    p = sub.add_parser("recap", help="summarise a chosen range of one conversation")
+    p = sub.add_parser("recap", parents=[dbg], help="summarise a chosen range of one conversation")
     p.add_argument("ref", nargs="?", help="ch_... ref (default: pick a session)")
     p.add_argument("--file", help="transcript path")
     p.add_argument("--from", dest="from_", type=int, default=0, metavar="N",
@@ -4139,21 +4782,23 @@ def main(argv=None) -> int:
                    help="typed prompts instead of the arrow-key picker")
     p.add_argument("--dry-run", action="store_true",
                    help="size breakdown of what would be sent; no model call")
+    p.add_argument("--no-cache", dest="no_cache", action="store_true",
+                   help=f"call for every chunk; neither read nor write {TURNS_DIR}")
     p.set_defaults(func=cmd_recap)
 
-    p = sub.add_parser("digest", help="deterministic digest of one conversation")
+    p = sub.add_parser("digest", parents=[dbg], help="deterministic digest of one conversation")
     p.add_argument("ref", nargs="?", help="ch_... ref from `chsum find`")
     p.add_argument("--file", help="transcript path (derives the ref)")
     p.add_argument("--stdout", action="store_true", help="print instead of writing a file")
     p.set_defaults(func=cmd_digest)
 
-    p = sub.add_parser("context", help="reload artifact for pasting back into Claude")
+    p = sub.add_parser("context", parents=[dbg], help="reload artifact for pasting back into Claude")
     p.add_argument("ref", nargs="?")
     p.add_argument("--file")
     p.set_defaults(func=cmd_context)
 
     p = sub.add_parser(
-        "mark", help="flag this moment as notable, for the digest to pick up",
+        "mark", parents=[dbg], help="flag this moment as notable, for the digest to pick up",
         description="Prints a marker. Nothing is written: run through Claude Code's "
                     "`!` prefix, the harness records the run itself, so the mark lands "
                     "in the transcript where you typed it.",
@@ -4183,7 +4828,7 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_mark)
 
     p = sub.add_parser(
-        "name", help="rename a conversation to what it actually was",
+        "name", parents=[dbg], help="rename a conversation to what it actually was",
         description="Records the name in chsum's own store and appends one "
                     "`ai-title` record to the transcript, so /resume shows it too. "
                     "Nothing is invented: the title is your argv, verbatim.",
@@ -4199,7 +4844,7 @@ def main(argv=None) -> int:
     p.add_argument("--file", help="transcript path (default: the session you're in)")
     p.set_defaults(func=cmd_name)
 
-    p = sub.add_parser("journal", help="chronological work log")
+    p = sub.add_parser("journal", parents=[dbg], help="chronological work log")
     p.add_argument("--since", default="7d", help="window, e.g. 7d, 24h, 2w")
     p.add_argument("--all", action="store_true", help="all projects (default: this one)")
     p.set_defaults(func=cmd_journal)
@@ -4213,15 +4858,41 @@ def main(argv=None) -> int:
     if args.cmd in ("digest", "context") and not args.ref and not args.file:
         ap.error(f"{args.cmd}: need a ch_... ref or --file")
 
+    # Reset, not just enable: `main()` is callable more than once in a process
+    # (tests do), and a second run must not inherit the first one's files.
+    TRACE.reset(bool(getattr(args, "debug", False)), ["chsum", *raw])
+    # The same run without the flag — what someone reproducing types first.
+    TRACE.reproduce(shlex.join(["chsum", *(t for t in raw if t != "--debug")]))
+
     try:
-        return args.func(args)
+        code = args.func(args)
     except HistoryError as e:
         print(f"error: {e}", file=sys.stderr)
-        return 2
+        code = 2
     except BrokenPipeError:
-        return 0
+        return 0  # the pipe is gone, so the block has nowhere to print either
     except KeyboardInterrupt:
-        return 130
+        code = 130
+    except SystemExit as e:
+        # Its message is printed here rather than by the interpreter, so the
+        # block lands after the error instead of above it.
+        if e.code is None:
+            code = 0
+        elif isinstance(e.code, int):
+            code = e.code
+        else:
+            print(e.code, file=sys.stderr)
+            code = 1
+        sys.stderr.flush()
+    except BaseException:
+        # A crash is the case a trace is most wanted in, so it prints before the
+        # traceback rather than being lost to it.
+        if TRACE.on:
+            print(TRACE.render(1), flush=True)
+        raise
+    if TRACE.on:
+        print(TRACE.render(code))
+    return code
 
 
 if __name__ == "__main__":

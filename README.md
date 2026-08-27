@@ -77,7 +77,7 @@ back in the conversation. Two things do work:
 ```
 
 The whole command, not just `mark`: everything chsum does is read transcripts you
-already have, and `digest`'s file lands in `~/.claude/chsum/digests/`. Narrow it
+already have, and `digest`'s file lands in `~/.chsum/digests/`. Narrow it
 to `Bash(chsum mark:*)` if you'd rather approve the reading commands case by case.
 
 The plugin can't set this for you — permissions come from settings files, and a
@@ -190,7 +190,7 @@ haiku: 5,974 in (5,042 cache read) · 4,866 out · 56.0s · extract estimated ~3
 ```
 
 Everything scopes to the current project; `--all` widens. Digests land in
-`~/.claude/chsum/digests/<uuid>.md` (`--out` to change).
+`~/.chsum/digests/<uuid>.md` (`--out` to change).
 
 ### Recap
 
@@ -219,11 +219,40 @@ chsum recap                                    # pick session, then start and en
 chsum recap --from 3 --to 10                   # same window, no prompts
 chsum recap ch_3654a13c --from 3 --to 10       # a specific session
 chsum recap --from 3 --to 10 --dry-run         # what it would cost, no model call
+chsum recap --from 3 --to 10 --no-cache        # call for every chunk, store nothing
 ```
+
+Each turn's bullets are kept, so recapping a window twice costs nothing the
+second time. The breakdown lands in `~/.chsum/turns/<project>/<turn-uuid>.json`
+once that turn's gap has closed — a later turn bounds it, or its last reply
+carries a `stop_reason` that ends the exchange. Measured on one 3-turn window:
+30.1s and two model calls, then 0.4s and none, the same document both times.
+
+Existing is not enough to reuse. A stored breakdown is read back only when it
+names the same instructions, the same model, and the same events it was written
+from; change any of the three and the turn is summarised again, with the old
+breakdown kept beside the new one. `--dry-run` prices only what is missing, so
+`0 calls would be made` means the window is already on disk.
 
 A turn is something you typed *or* an answer you gave the question tool — those
 are marked `?` in the list, because a decision made by menu choice is still a
 turn that steered the session.
+
+The per-turn files-touched bullets come from one of two sources, and the recap
+says which, counted:
+
+```
+## Files touched — 4 of 6 turns from a checkpoint
+
+*Files for the other 2 turns come from the transcript scan, which sees
+`Edit`/`Write`/`MultiEdit` only and carries each edit's line range as recorded
+at the time.*
+```
+
+A git checkpoint sees every change however it was made and its line ranges are
+current; the transcript scan sees neither. The counts are measured — `0 of 6`
+says no checkpoint covered any turn, and does not say why, because a hook that
+never ran and a reflog entry that aged out look the same from here.
 
 A recap spans several of your turns, so its timeline is sliced onto them: each
 turn quoted verbatim, and beneath it the bullets covering what happened before
@@ -271,7 +300,7 @@ to the transcript as the conversation grows, dozens per session, last one wins;
 already written — the one thing chsum adds to a transcript, and it is added the
 way Claude Code adds it.
 
-That is why the name is also kept in `~/.claude/chsum/names.json`: rename a
+That is why the name is also kept in `~/.chsum/names.json`: rename a
 session that is still running and Claude Code will title it again ten minutes
 later. chsum keeps yours; `/resume` may drift back.
 
@@ -394,6 +423,53 @@ both directions: the parent can drop a mark its agent made, and vice versa.
 tens of seconds warm, and **several minutes on the very first run** while the
 embedding index builds. Use `--lexical` (sub-second) for identifiers, filenames,
 and error strings, or `--exact` for exact tokens.
+
+### Reporting something that looks wrong
+
+`--debug` goes on the end of any command. It prints what that run read, ran and
+resolved, beneath the normal output:
+
+```sh
+chsum digest ch_8b0a671d… --stdout --debug
+```
+
+```
+--- chsum debug ---
+invocation: chsum digest ch_8b0a671d… --stdout --debug
+cwd: ~/Documents/Code/chsum
+projects: ~/.claude/projects/  (…/ below)
+chsum 1.2.0 (9162a1d dirty) · python 3.10.11 · darwin · exit 0
+files (1)
+  ch_8b0a671d…  meta,marks  947.1K  671 recs  …/-Users-…-chsum/9a9e9ac5-….jsonl
+procs (3)
+  0   0.03s  claude-history agent outline ch_8b0a671d… --no-budget  (1005 chars out)
+  0   0.01s  claude-history agent read ch_8b0a671d…:m1..m27 --no-budget  (11084 chars out)
+steps (4)
+  resolve_ref    via=argv ref=ch_8b0a671d…
+  _parent_path   ref=ch_8b0a671d… uuid=9a9e9ac5-…
+  scan_marks     file=9a9e9ac5-….jsonl marks=0 sentinel=absent
+  read_messages  ref=ch_8b0a671d… asked=m1..m27 messages=7 got=m1..m27
+reproduce
+  chsum digest ch_8b0a671d… --stdout
+  claude-history agent read ch_8b0a671d… --no-budget
+--- end chsum debug ---
+```
+
+No transcript text is copied — only paths, refs, record ids and counts — so the
+block names the record behind a line that looks wrong rather than carrying it.
+It assumes the reader is on the same machine: paste it into a session in the
+chsum checkout and the files it names are still there to open.
+
+`steps` is where a wrong line usually comes from. Each one is a resolution with
+its inputs and its result, including the fallbacks that print nothing during a
+normal run: `_verify_stamp … match=no fallback=walk` (a mark's stamp disagreed
+with the record it named), `_turn_checkpoints … checkpoint=4 transcript=2` (two
+turns had no checkpoint covering them), `_run_chunk … failed=1` (one summariser call
+died and its gap says so). Repeated steps collapse in the middle, and `files`
+and `procs` cap at 24 rows with the remainder counted.
+
+Without the flag nothing is recorded and nothing is printed — verified
+byte-identical against the previous release across thirteen invocations.
 
 ## What a digest contains
 

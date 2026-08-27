@@ -40,6 +40,59 @@ defect and it was structural, not prose — `messages_from_jsonl` holds the raw
 record, so `_tool_injected` reaches it directly. Three sampled sidecars dropped
 7,804 / 7,804 / 5,201 chars of quoted skill.
 
+## 2026-08-20 — the turn store
+
+Governing sentence: every turn whose gap has closed carries a breakdown file on
+disk, named by the turn's own record `uuid`, holding each summary written for
+that turn beside the instructions and model that produced it; a recap reads that
+store first and calls the model only for the turns absent from it.
+
+### Built 2026-08-20
+
+- **chsum's state moved to `~/.chsum`.** `CHSUM_DIR` is the one place the path
+  is written; `DIGEST_DIR`, `NAMES_PATH`, `TURNS_DIR` and `HaikuSummariser`'s
+  cwd hang off it. No fallback read of `~/.claude/chsum` — the files moved once.
+- **One file per turn, named by the record `uuid`.** A fork preserves `uuid`,
+  rewrites `sessionId`, and reorders the rows, so neither of the other two names
+  one turn across two branch files.
+- **A gap closes on a later boundary or on a closing `stop_reason`**, either
+  alone being insufficient: the boundary test cannot close the last turn of a
+  window running to the session end, and the closing value cannot close an
+  interrupted turn, whose stretch ends on `tool_use` (38 of 634 measured).
+- **Existing is not a hit; matching is.** Instructions, model, part count and
+  each part's material are all checked before a stored breakdown is read back.
+- **`summaries` is an array.** A breakdown written under a different
+  `_CHUNK_PROMPT` stays beside the new one rather than being orphaned.
+- **`--dry-run` and the wizard's cost step price only the misses**, and name a
+  stored chunk apart from a quiet one. The cost screen states the stored count
+  at zero too, or a silent line reads the same as a store never consulted.
+- **A turn reaches disk as its own chunks land** (`_store_turn`), not at the end
+  of the run. Source: a 660.9s run over 24 chunks, where a kill at any point
+  before the final step stored nothing. Killed at 75s of a 20-chunk window, 3
+  turns survived and read back as hits. `_turn_closers` moved ahead of the calls.
+- **The recap far edge is compared by value, not identity** (`end == turns[-1]`).
+  The wizard picks out of its own `_your_turns` list and `cmd_recap` reads the
+  file again, so `is` sent every picker-chosen recap down the bounded branch:
+  `ch_ebc493cb` cut at 11:33:12 against a session running to 11:33:22,
+  `ch_78b9c150` cut at 15:02:55. The flags path was fixed 2026-08-19; the picker
+  path carried it until now. No stored breakdown was invalidated — in both cases
+  the affected turn was the session's last, whose gap was open and never written.
+
+Measured, session `c77196cc` turns 1–3: 30.1s and two `claude -p` calls, then
+0.4s and none, the two documents byte-identical. `--no-cache` on the same
+window still prices 2 calls.
+
+### Deferred, not ruled dead
+
+- **A sidecar appending after the parent stretch closes.** Closure is judged on
+  the parent transcript; 1 session in 101 has a sidecar ending later than its
+  parent. That turn's stored breakdown is short by whatever the sidecar wrote.
+  `closed_by` is the uuid a later check would resolve against.
+- **The destination screen.** Spoken 2026-08-19 16:26 and not built: recap
+  finishing to a choice of clipboard, disk or terminal, in markdown, plain
+  text, HTML or JSON, where the JSON describes everything used to produce the
+  document. Three of the four formats fall out of `_md_ansi`'s line classifier.
+
 ## 2026-08-19 — mark provenance and `--show`
 
 Source: an investigation into session `fbccf4aa` (devharness) that cost sixteen

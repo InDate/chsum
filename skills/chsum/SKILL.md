@@ -91,7 +91,7 @@ agent itself, or afterwards from the session with `--match "<phrase it said>"`.
 session: your turns in that range verbatim, with a model-written timeline
 sliced under each one. Run non-interactively with `--no-tui` plus both
 `--from`/`--to` — without a terminal there's no session/turn picker to fall
-back on. `--dry-run` prices the call without making it.
+back on. `--dry-run` prices the call without making it — `0 calls would be made` means the window is already in the turn store and rerunning it is free. Each turn's bullets are kept under `~/.chsum/turns/` once that turn's gap has closed; `--no-cache` bypasses the store in both directions.
 
 `chsum last --here` is the live case — what's happened in the *current*
 session since the last typed prompt. It's a second-terminal tool for the
@@ -101,6 +101,19 @@ already inside.
 
 Both end in one clearly-labelled non-verbatim section: a timeline written by
 `claude -p --model haiku` from the verbatim record printed above it.
+
+## When output looks wrong
+
+Append `--debug` to any command. It prints, beneath the normal output, what
+that run read (transcripts and sidecars, with refs and record counts), ran
+(subprocesses with exit codes), and resolved (each step with its inputs and
+result, including the fallbacks a normal run prints nothing about). No
+transcript text is copied — the block names records rather than carrying them,
+so it assumes the reader is on the same machine.
+
+Ask the user to re-run the failing command with `--debug` on the end and paste
+the block. Its `reproduce` lines are the command to run again and, where one
+was resolved, the `claude-history agent read` that opens the conversation.
 
 ## Per-turn git checkpoints (offer once, per project)
 
