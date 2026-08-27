@@ -1,0 +1,82 @@
+[12:14:03] output:
+  def _hhmmss(ts: str) -> str:
+      """Local clock, seconds included — the extract's per-event stamps, so a time
+      the model copies out of it agrees with `_hhmm`'s local-clock headers beside
+      it instead of the raw UTC the JSONL stores."""
+      t = _parse_ts(ts)
+      return t.astimezone().strftime("%H:%M:%S") if t else "??:??:??"
+[12:14:07] ran: F=~/.claude/projects/-Users-joshua-Documents-Code-chsum/55289a68-edaf-4c4a-86db-468b3d976a2e.jsonl; python3 -m py_compile chsum.py && python3 chsum.py mark --show dd109e32 --context 1 --file $F 2>&1 | …
+[12:15:18] output:
+  [tail of 1457 chars] not something to rely on.
+  
+      Folding agent marks in would match the repo's own rule — delegated work is the
+      session's work, same as edits and commands. Costs: they'd carry an agent id instead
+      of `mN`/`ma_`, since sidecars can't mint anchors (same constraint as agent digests).
+  
+      Want it wired in?
+  
+       397  15:31:14  you
+      sorry, I mean if the main session agent, like if you run mark
+[12:15:28] ran: F=~/.claude/projects/-Users-joshua-Documents-Code-chsum/55289a68-edaf-4c4a-86db-468b3d976a2e.jsonl; python3 chsum.py mark --recent 4 --file $F 2>&1 | head -8; echo "--- at:"; python3 chsum.py mark --a …
+[12:15:30] output:
+  [tail of 785 chars] ull | tail -3 
+  abbff94c  08:02  claude          Quote is dim now, everything else default. Two guards: escapes only when stdout is a ter
+  --- at:
+  ⚑ chsum-mark v1 at=27e2695f-cabb-42cf-9667-dbcb437cb25d line=389 | stamped test
+  --- bare:
+  ⚑ chsum-mark v1 at=abbff94c-1bb0-49bb-8b46-4b920fd5f845 line=958 | bare test
+  --- match:
+  ⚑ chsum-mark v1 at=0245d613-78a7-4b50-a58e-3cf71b61e6b4 line=419 | match test
+[12:15:41] ran: cd /private/tmp/claude-501/-Users-joshua-Documents-Code-chsum/1f271ca8-59d0-42f9-9640-e8acebff4321/scratchpad && python3 - <<'PY'
+[12:15:43] output:
+  good.jsonl appended
+  wrong.jsonl appended
+  bad.jsonl appended
+  Shell cwd was reset to /Users/joshua/Documents/Code/chsum
+[12:15:46] ran: S=/private/tmp/claude-501/-Users-joshua-Documents-Code-chsum/1f271ca8-59d0-42f9-9640-e8acebff4321/scratchpad; for f in good wrong bad; do echo "=== $f"; python3 chsum.py mark --show deadbeef --context …
+[12:15:48] output:
+  [tail of 842 chars]  17:00:00  ·  record 27e2695f
+  
+  ▸    389  15:29:27  claude
+      Currently **no** — and worth knowing exactly where it dies.
+  === bad
+  deadbeef  stamped test
+    /private/tmp/claude-501/-Users-joshua-Documents-Code-chsum/1f271ca8-59d0-42f9-9640-e8acebff4321/scratchpad/bad.jsonl:389  ·  17:00:00  ·  record 27e2695f
+  
+  ▸    389  15:29:27  claude
+      Currently **no** — and worth knowing exactly where it dies.
+[12:16:00] ran: S=/private/tmp/claude-501/-Users-joshua-Documents-Code-chsum/1f271ca8-59d0-42f9-9640-e8acebff4321/scratchpad; python3 - <<PY
+[12:16:10] failed:
+  S=/private/tmp/claude-501/-Users-joshua-Documents-Code-chsum/1f271ca8-59d0-42f9-9640-e8acebff4321/scratchpad; python3 - …
+  [from 12 chars in] Traceback (most recent call last):
+    File "<stdin>", line 3, in <module>
+    File "<frozen importlib._bootstrap_external>", line 883, in exec_module
+    File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+    File "/Users/joshua/Documents/Code/chsum/chsum.py", line 113, in <module>
+      class Hit:
+    File "/Library/Frameworks/Python.framework/Versions/3.10/lib/python3.10/dataclass…
+[12:16:18] ran: S=/private/tmp/claude-501/-Users-joshua-Documents-Code-chsum/1f271ca8-59d0-42f9-9640-e8acebff4321/scratchpad; python3 - <<PY
+[12:16:27] failed:
+  S=/private/tmp/claude-501/-Users-joshua-Documents-Code-chsum/1f271ca8-59d0-42f9-9640-e8acebff4321/scratchpad; python3 - …
+  [from 12 chars in] Traceback (most recent call last):
+    File "<stdin>", line 9, in <module>
+  AttributeError: 'NoneType' object has no attribute 'group'
+[12:16:37] ran: S=/private/tmp/claude-501/-Users-joshua-Documents-Code-chsum/1f271ca8-59d0-42f9-9640-e8acebff4321/scratchpad; python3 - <<PY
+[12:16:40] output:
+  good   stamp=389     verify=True  expected=True  OK  resolved_line=389
+  wrong  stamp=12      verify=False expected=False OK  resolved_line=389
+  bad    stamp=999999  verify=False expected=False OK  resolved_line=389
+[12:16:47] ran: F=~/.claude/projects/-Users-joshua-Documents-Code-chsum/55289a68-edaf-4c4a-86db-468b3d976a2e.jsonl; echo "=== list --full (first 12)"; python3 chsum.py mark --list --full --file $F 2>&1 | head -12; ec …
+[12:16:58] output:
+  [tail of 829 chars]  No second store, no injection into a file Claude Code is appending to.
+  
+      **Commands**
+      ```sh
+      ! chsum mark "the shrinkwrap approach, after two dead ends"
+  
+  === revoke
+  ⚑ chsum-mark v1 revoke=dd109e32-3938-47ef-9128-697b131ceca9 | dropped: where subagent marks die: sidecar Bash never reaches the parent transcript
+  === revoke unknown
+  no live mark 'zzzz' — `chsum mark --list` shows them
+  exit=1
+[12:17:02] ran: F=~/.claude/projects/-Users-joshua-Documents-Code-chsum/55289a68-edaf-4c4a-86db-468b3d976a2e.jsonl; echo "=== show missing id"; python3 chsum.py mark --show ffff --file $F; echo "exit=$?"; echo "=== f …

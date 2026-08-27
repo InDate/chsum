@@ -1,0 +1,151 @@
+[17:23:45] ran: cd /private/tmp/claude-501/-Users-joshua-Documents-Code-chsum/f1b9bbc6-51dd-4796-a5da-ae2ffd05672a/scratchpad && sed '/^--- chsum debug ---$/,$d' run2.md > run2.clean.md && diff run1.md run2.clean.md …
+[17:23:47] output:
+  IDENTICAL
+        70 run1.md
+        70 run2.clean.md
+       140 total
+  Shell cwd was reset to /Users/joshua/Documents/Code/chsum
+[17:23:59] ran: python3 chsum.py recap ch_c77196cc541381aa0b41513b2936eefd --from 1 --to 3 --dry-run 2>&1 | sed -n '1,10p'
+[17:24:01] output:
+  [tail of 753 chars] == --no-cache dry-run ===
+  ## You said (11:30)
+  
+  > Which thread do you want acted on now? → Governing sentence + plan for items 1&2
+  === store round-trip under changed instructions ===
+  same instructions : True
+  other instructions: True
+  other model       : True
+  material mismatch : True
+  part count wrong  : True
+  entries after second fingerprint: 2 ['b5aa05f6a8c8', 'deadbeef0000']
+  old entry survives: True
+[17:24:07] ran: for f in "" "--no-cache"; do echo "--- $f"; python3 chsum.py recap ch_c77196cc541381aa0b41513b2936eefd --from 1 --to 3 --dry-run $f 2>&1 | grep -E "would be made|extract across"; done
+[17:24:10] output:
+  --- 
+  0 calls would be made (1 chunk skipped — nothing in them but your own turns; 2 chunks already in the turn store).
+  - extract across 0 calls — 0 chars · ~0 tokens
+  --- --no-cache
+  2 calls would be made (1 chunk skipped — nothing in them but your own turns).
+  - extract across 2 calls — 10,687 chars · ~2.7k tokens
+  === remove the test entry ===
+  entries now: 1
+[17:24:15] ran: python3 chsum.py last --here --dry-run 2>&1 | grep -E "would be made|Dry run" ; echo "exit=$?"
+[17:24:18] output:
+  [tail of 422 chars] as sent
+  2 calls would be made.
+  exit=0
+  === journal ===
+  # Work log — last 2d · this project
+  
+  *4 sessions · 2 days · 11 files changed*
+  
+  ## Wed 19 Aug 2026
+  === digest ===
+  ---
+  ref: ch_c77196cc541381aa0b41513b2936eefd
+  uuid: 1f271ca8-59d0-42f9-9640-e8acebff4321
+  === marks list ===
+  nothing marked in /Users/joshua/.claude/projects/-Users-joshua-Documents-Code-chsum/f1b9bbc6-51dd-4796-a5da-ae2ffd05672a.jsonl
+[17:24:25] ran: grep -n "^## " CLAUDE.md
+[17:24:25] output:
+  [tail of 499 chars] 3:## Recap (`recap`)
+  259:## Checkpoints, for the per-turn files-touched section
+  348:## Catch-up (`last --here`)
+  449:## What went wrong is computed, not summarised
+  529:## `--debug` names, never carries
+  583:## Marks write nothing
+  640:## A mark carries where it landed
+  674:## Names are the one thing we append
+  705:## Layout
+  717:## Delegated work is the session's work
+  739:## Releasing
+  754:## Conventions
+[17:24:53] ran: python3 - <<'PYEOF'
+[17:24:53] output:
+  [tail of 572 chars] s/`. Narrow it
+  README.md:193:`~/.claude/chsum/digests/<uuid>.md` (`--out` to change).
+  README.md:290:That is why the name is also kept in `~/.claude/chsum/names.json`: rename a
+  80:already have, and `digest`'s file lands in `~/.claude/chsum/digests/`. Narrow it
+  193:`~/.claude/chsum/digests/<uuid>.md` (`--out` to change).
+  290:That is why the name is also kept in `~/.claude/chsum/names.json`: rename a
+[17:24:58] ran: python3 - <<'PYEOF'
+[17:24:58] output:
+  [tail of 553 chars] digests/`. Narrow it
+  to `Bash(chsum mark:*)` if you'd rather approve the reading commands case by case.
+  
+  Everything scopes to the current project; `--all` widens. Digests land in
+  `~/.chsum/digests/<uuid>.md` (`--out` to change).
+  
+  
+  That is why the name is also kept in `~/.chsum/names.json`: rename a
+  session that is still running and Claude Code will title it again ten minutes
+  === remaining ===
+  none
+[17:25:01] ran: grep -n "recap" README.md | head -20
+[17:25:01] output:
+  [tail of 648 chars] 19:chsum recap --from 3 --to 10                   # same window, no prompts
+  220:chsum recap ch_3654a13c --from 3 --to 10       # a specific session
+  221:chsum recap --from 3 --to 10 --dry-run         # what it would cost, no model call
+  228:The per-turn files-touched bullets come from one of two sources, and the recap
+  244:A recap spans several of your turns, so its timeline is sliced onto them: each
+[17:25:03] ran: sed -n '215,260p' README.md
+[17:25:03] output:
+  [tail of 1703 chars] e bullets covering what happened before
+  you spoke again.
+  
+  ```
+  ### You said (21:43)
+  
+  > ok
+  
+  - **21:45** Created a new `is_typed_prompt()` helper that filters out
+    `<bash-…>` records, and updated five call sites to use it.
+  - **21:47** Tested the fix against the live airtouch session; chsum now
+    reports `prompts: 0` for the dead 2-second session and skips it.
+  
+  ### You said (21:50)
+  
+  > commit the work
+[17:25:11] ran: python3 - <<'PYEOF'
+[17:25:13] output:
+  ok
+    --to N       end at your Nth turn (default: ask)
+    --all-turns  list every turn when asking, not just the last 30
+    --no-tui     typed prompts instead of the arrow-key picker
+    --dry-run    size breakdown of what would be sent; no model call
+    --no-cache   call for every chunk; neither read nor write
+                 /Users/joshua/.chsum/turns
+[17:25:21] ran: grep -n "_Wizard(" chsum.py; echo "=== SKILL recap mentions ==="; grep -n "recap" skills/chsum/SKILL.md | head
+[17:25:21] output:
+  [tail of 491 chars] chsum recap <ref> --from N --to M` | Reload a specific turn range from a past session |
+  90:`chsum recap <ref> --from N --to M` reloads a specific window of a past
+  123:recoverable via `git reflog` — so `recap`'s files-touched section can read
+  131:checkpointing enabled here, for more accurate file/line tracking in recaps?
+  148:- A specific stretch of a past session, not the whole thing → `recap <ref>
+[17:25:23] ran: sed -n '86,96p' skills/chsum/SKILL.md
+[17:25:23] output:
+  [tail of 518 chars] from N --to M` reloads a specific window of a past
+  session: your turns in that range verbatim, with a model-written timeline
+  sliced under each one. Run non-interactively with `--no-tui` plus both
+  `--from`/`--to` — without a terminal there's no session/turn picker to fall
+  back on. `--dry-run` prices the call without making it.
+  
+  `chsum last --here` is the live case — what's happened in the *current*
+[17:25:40] ran: python3 - <<'PYEOF'
+[17:25:40] output:
+  ok
+  ok
+   CLAUDE.md             | 177 ++++++++++-
+   PLAN.md               |  41 +++
+   README.md             |  82 ++++-
+   chsum.py              | 834 ++++++++++++++++++++++++++++++++++++++++++++------
+   skills/chsum/SKILL.md |  15 +-
+   5 files changed, 1045 insertions(+), 104 deletions(-)
+[17:25:51] ran: SP=/private/tmp/claude-501/-Users-joshua-Documents-Code-chsum/f1b9bbc6-51dd-4796-a5da-ae2ffd05672a/scratchpad
+[17:26:31] output:
+  [tail of 1082 chars] efd --from 1 --to 6     0.18s user 0.09s system 77% cpu 0.347 total
+    _cached_turns  turns=6 hits=5 misses=1 chunks_cached=5 chunks=6 instructions=b5aa05f6a8c8 model=haiku dir=/Users/joshua/.chsum/turns/-Users-joshua-Documents-Code-chsum
+    _run_chunk  chunks=6 called=1 workers=1 from_store=5 skipped=1 failed=0 seconds=0.0 est_tokens=0 first_error=—
+    _store_window  written=0 candidates=0
+  IDENTICAL
+[17:26:38] ran: ls; echo "=== tests ==="; find . -name "test*" -not -path "./.git/*" | head

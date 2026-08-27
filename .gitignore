@@ -3,3 +3,7 @@ __pycache__/
 .venv/
 .DS_Store
 .devharness/*
+
+# Bench outputs: per-run artefacts, read locally. The material and variants
+# are committed, which is what makes two runs comparable.
+bench/out/

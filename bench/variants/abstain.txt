@@ -1,0 +1,4 @@
+- Report outcomes only as recorded ("pytest printed 4 passed"), never as a
+  judgement ("successfully", "correctly", "works"). Where the extract does not
+  record how something turned out, say that it does not — an unrecorded
+  outcome is a fact about the extract, not a gap for you to fill.

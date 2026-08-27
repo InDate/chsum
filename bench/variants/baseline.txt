@@ -1,0 +1,2 @@
+- Report outcomes only as recorded ("pytest printed 4 passed"), never as a
+  judgement ("successfully", "correctly", "works").

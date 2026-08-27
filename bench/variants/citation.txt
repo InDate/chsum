@@ -1,0 +1,4 @@
+- Every bullet reporting an outcome cites the clock time of the event it came
+  from, in square brackets, and quotes what that event recorded:
+  "[17:23:47] the diff printed IDENTICAL". A bullet with no citation states
+  what was done, never how it turned out.

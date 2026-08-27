@@ -1,0 +1,4 @@
+- You are transcribing, not assessing. An outcome appears as the text or number
+  the extract recorded ("pytest printed 4 passed", "exit code 1"), with no word
+  evaluating it. Where a bullet would say a thing succeeded, worked, was
+  correct or was verified, quote the evidence and stop there.
