@@ -36,7 +36,9 @@ branch, files, commands — is parsed straight out of the transcript.
 
 ## Requirements
 
-- [`claude-history`](https://github.com/) on your `PATH`
+- [`claude-history`](https://github.com/) on your `PATH` — for `chsum find`'s
+  `--semantic` and `--hybrid` search only. Every other command reads the
+  transcripts directly and spends no subprocess.
 - Python 3.10+. No third-party packages, no model, no network.
 
 ## Install
@@ -98,6 +100,8 @@ chsum find "text to speech playback speed"     # locate a conversation
 chsum digest <ch_ref>                          # write a digest file
 chsum digest <ch_ref> --stdout                 # print it instead
 chsum digest --file path/to/session.jsonl      # address by file
+chsum digest <ch_ref> --commands               # every Bash call in order, unfiltered
+chsum digest <ch_ref> --command <id>           # one of them whole, with its output
 chsum context <ch_ref>                         # reload artifact, for pasting into Claude
 chsum context <ch_ref>/<agent-id>              # one subagent's own digest
 chsum journal --since 7d                       # work log for this project
@@ -360,8 +364,7 @@ so you can mark the edit or the command rather than the sentence near it. Tool
 results are left out — a mark resolves to the message containing the action
 either way.
 
-Ids come from the transcript itself rather than claude-history, which lags a
-live session by some minutes. `--at mN` works too, once it has caught up.
+Ids come from the transcript itself. `--at <line>` takes a bare row number too.
 
 Or name the message by something it said:
 
@@ -401,7 +404,7 @@ points at the message it followed — its own output record says nothing about w
 you were marking.
 
 `--show` takes the same id and answers where: the file, the row in it, the time,
-the agent when the message is a subagent's, the `mN` where claude-history has
+the agent when the message is a subagent's, the row it sits on where the
 caught up, then the marked message whole and `--context N` records either side
 (3 by default). The location is stamped into the mark as it is made, so this is a
 lookup rather than a fresh search of the conversation and every sidecar. A stamp
@@ -482,14 +485,52 @@ byte-identical against the previous release across thirteen invocations.
 | **Delegated** — one line per subagent, with its address | parsed from sidecars |
 | **Where I left off** — last prompt and last reply, verbatim | copied |
 | — *found by two separate backward scans, so they may be far apart and are not a Q&A pair* | |
-| **Drill down** — `mN → ma_…` anchor map | computed |
+| **Drill down** — transcript and sidecar paths, and the `sed` that opens a row | computed |
 
 An agent digest has the same shape minus the intent trail — an agent gets one
-instruction, so **Task** is a single block — and no anchor map (see below).
+instruction, so **Task** is a single block.
+
+Every reference in a digest is a row: `1f271ca8:441` is line 441 of session
+`1f271ca8…`'s transcript, and `1f271ca8/a190d601:87` is line 87 of that session's
+`a190d601…` sidecar. **Drill down** expands both to full paths. Nothing needs a
+second tool to resolve.
 
 Output is budgeted, because it lands in a future context window: quotes clip,
 lists cap. Every truncation is marked (`[+N chars, read the anchor]`, `…and N
 more`) so you always know when you're seeing a fragment.
+
+**Commands run** shows ten, and it shows them after a filter that drops
+look-only commands (`ls`, `cat`, `grep`, and 27 more) and after a dedupe. Its
+overflow line therefore carries two numbers and the invocation that opens the
+rest:
+
+```
+- …and 25 more of these — `chsum digest ch_c77196cc… --commands` lists all 60 in order
+```
+
+`--messages`, `--tools` and `--commands` each print one line per row — the id
+where there is one, a `<session>:<line>` locator, local time, the role or tool
+name, and the first line of the text — in timestamp order across the transcript
+and its sidecars, with nothing filtered, deduplicated or collapsed. An agent ref
+(`<ref>/<agent-id>`) narrows any of them to that sidecar. `--call <id>` prints one
+tool call and its captured output whole.
+
+A `## Sources` block at the top expands every locator to a full path and gives a
+worked `sed` line, so a row reaches its raw record without chsum:
+
+```
+## Sources
+
+- `f1b9bbc6` — `~/.claude/projects/…/f1b9bbc6-….jsonl`
+- `f1b9bbc6/a190d601` — `~/.claude/projects/…/f1b9bbc6-…/subagents/agent-a190d601….jsonl`
+
+Open a record: `sed -n '18p' ~/.claude/projects/…/f1b9bbc6-….jsonl`
+
+- `01CPKjYaSD`  `f1b9bbc6:26`  11:30:28  Bash  `ls && wc -l chsum.py`
+```
+`--command <id>` prints one of them whole with its captured output, which is
+where the text the row clipped actually lives. Both print rather than writing a
+file: they are lookups reached from a hint, not artifacts to keep.
 
 ## Notes on correctness
 
@@ -510,8 +551,7 @@ Several things here are non-obvious and were established by measuring, not assum
   in the listing, matching `claude-history`'s discovery rules.
 - **`claude-history` has no per-agent ref.** `--subagents` inlines agent messages
   into the parent read untagged, so they can't be sliced apart. Sidecars are
-  parsed directly, which is why agent digests carry no `ma_` anchors — those are
-  claude-history's to mint, and a fabricated one is worse than none.
+  parsed directly. Every digest reads the JSONL this way now, parent included.
 - **An agent's last message isn't necessarily its conclusion**, so the section is
   *Last thing it said*. An interrupted agent ends mid-thought.
 - **Agent counts take the larger of two sources** — `Agent`/`Task` calls in the

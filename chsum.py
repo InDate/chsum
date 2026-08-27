@@ -324,71 +324,12 @@ def search(query: str, *, local: bool, mode: str, top: int) -> list[Hit]:
     return hits
 
 
-def last_message_number(ref: str) -> int:
-    """Highest message ordinal, the upper bound for a full read. Handles both
-    `outline` shapes (segmented and bare), or short conversations read as empty."""
-    end = 0
-    for line in _history("agent", "outline", ref, "--no-budget").splitlines():
-        if line.startswith("seg "):
-            m = re.search(r"m(\d+)\.\.m(\d+)", line)
-            if m:
-                end = max(end, int(m.group(2)))
-        elif m := re.match(r"m(\d+)\s", line):
-            end = max(end, int(m.group(1)))
-    return end
-
-
-def uuid_for_ref(ref: str) -> str:
-    for line in _history("agent", "outline", ref, "--no-budget").splitlines():
-        if line.startswith("conversation "):
-            return _fields(line).get("uuid", "")
-    return ""
-
-
 @dataclass
 class Message:
     n: int
     role: str
-    anchor: str
     text: str
     line: int = 0  # 1-based line of its first record in the JSONL; 0 when unknown
-
-
-def read_messages(ref: str, start: int = 1, end: int | None = None) -> list[Message]:
-    """Parses `agent read` output (already stripped of tool sludge) into
-    messages with their mN ordinal and ma_ anchor."""
-    end = end or last_message_number(ref)
-    if not end:
-        TRACE.step("read_messages", ref=ref, end=0, messages=0)
-        return []
-    raw = _history("agent", "read", f"{ref}:m{start}..m{end}", "--no-budget")
-    msgs: list[Message] = []
-    cur: Message | None = None
-    body: list[str] = []
-    for line in raw.splitlines():
-        if line.startswith("message "):
-            if cur:
-                cur.text = "\n".join(body).strip()
-                msgs.append(cur)
-            f = _fields(line)
-            # Bare positional token ("message m17 ..."), not key=value — read off directly.
-            m = re.match(r"message\s+m(\d+)", line)
-            cur = Message(
-                n=int(m.group(1)) if m else 0,
-                role=f.get("role", "?"),
-                anchor=f.get("anchor", ""),
-                text="",
-                line=int(f["line"]) if f.get("line", "").isdigit() else 0,
-            )
-            body = []
-        elif line.startswith("| ") or line == "|":
-            body.append(line[2:] if len(line) > 1 else "")
-    if cur:
-        cur.text = "\n".join(body).strip()
-        msgs.append(cur)
-    TRACE.step("read_messages", ref=ref, asked=f"m{start}..m{end}", messages=len(msgs),
-               got=f"m{msgs[0].n}..m{msgs[-1].n}" if msgs else "—")
-    return msgs
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +473,7 @@ class AgentRun:
     duration: str = ""
     edited: list[str] = field(default_factory=list)
     commands: list[str] = field(default_factory=list)
+    command_total: int = 0  # every Bash call, before the notable filter and dedupe
     marks: list[Mark] = field(default_factory=list)
     revoked: set[str] = field(default_factory=set)  # reconciled with the parent's
     path: pathlib.Path | None = None
@@ -557,6 +499,7 @@ class Meta:
     edited: list[str] = field(default_factory=list)
     read: list[str] = field(default_factory=list)
     commands: list[str] = field(default_factory=list)
+    command_total: int = 0  # every Bash call the session and its agents made
     agent_only: set[str] = field(default_factory=set)  # files no parent turn touched
     marks: list[Mark] = field(default_factory=list)  # `chsum mark` calls, parent-only
     path: pathlib.Path | None = None
@@ -688,8 +631,6 @@ class Mark:
     # Kept apart from `agent`: a mark typed in the parent can point into a running
     # agent's sidecar, and only the target's side decides whether an mN exists.
     at_agent: str = ""  # sidecar the marked record lives in
-    n: int = 0  # message ordinal, only on the digest path
-    anchor: str = ""
 
 
 @dataclass
@@ -1007,16 +948,17 @@ def extract_agent(side: pathlib.Path) -> AgentRun:
             run.model = str(d.get("model") or "")
             run.description = str(d.get("description") or "")
             run.spawn_depth = int(d.get("spawnDepth") or 1)
-    stamps, edited, read, cmds = [], [], [], []
+    stamps, edited, read, cmds, all_cmds = [], [], [], [], []
     for rec in _records(side):
         if rec.get("timestamp"):
             stamps.append(rec["timestamp"])
         if rec.get("type") in ("user", "assistant"):
-            _collect_tools(rec, edited, read, cmds)
+            _collect_tools(rec, edited, read, cmds, all_cmds)
     if stamps:
         stamps.sort()
         run.duration = _fmt_secs(active_seconds(stamps))
     run.edited, run.commands = edited, _dedupe(cmds)
+    run.command_total = len(all_cmds)
     run.marks, run.revoked = _scan_marks_raw(side)
     for mk in run.marks:
         mk.agent = run.id
@@ -1025,7 +967,7 @@ def extract_agent(side: pathlib.Path) -> AgentRun:
 
 def extract_meta(path: pathlib.Path) -> Meta:
     meta = Meta(uuid=path.stem, path=path)
-    stamps, edited, read, cmds = [], [], [], []
+    stamps, edited, read, cmds, all_cmds = [], [], [], [], []
     # One read, held: the command ids a body is matched against are only complete
     # once the whole file is seen, and this path stays off a second pass.
     recs = list(_records(path))
@@ -1042,7 +984,7 @@ def extract_meta(path: pathlib.Path) -> Meta:
             meta.branch = rec["gitBranch"]
         if rec.get("type") in ("user", "assistant"):
             meta.records += 1
-            meta.spawned += _collect_tools(rec, edited, read, cmds)
+            meta.spawned += _collect_tools(rec, edited, read, cmds, all_cmds)
         if rec.get("type") == "user" and _is_typed_prompt(rec, command_ids):
             meta.prompts += 1
     # Yours wins over Claude Code's own later `ai-title` appends.
@@ -1053,6 +995,9 @@ def extract_meta(path: pathlib.Path) -> Meta:
 
     # Fold subagent tool use into the parent; prompts stay parent-only.
     meta.agents = [extract_agent(s) for s in subagent_transcripts(path)]
+    # Delegated work is the session's work, the same rule the edits and the
+    # notable commands already follow.
+    meta.command_total = len(all_cmds) + sum(a.command_total for a in meta.agents)
     for run in meta.agents:
         edited.extend(run.edited)
         cmds.extend(run.commands)
@@ -1150,8 +1095,11 @@ def _dedupe(items) -> list[str]:
     return out
 
 
-def _collect_tools(rec: dict, edited: list, read: list, cmds: list) -> int:
-    """Append this record's tool use to the accumulators; return agents spawned."""
+def _collect_tools(rec: dict, edited: list, read: list, cmds: list,
+                   all_cmds: list | None = None) -> int:
+    """Append this record's tool use to the accumulators; return agents spawned.
+    `all_cmds` takes every Bash call before the notable filter and the dedupe, so
+    the digest can state what its own section left out without a second read."""
     content = (rec.get("message") or {}).get("content")
     if not isinstance(content, list):
         return 0
@@ -1168,6 +1116,8 @@ def _collect_tools(rec: dict, edited: list, read: list, cmds: list) -> int:
             read.append(inp["file_path"])
         elif name == "Bash" and isinstance(inp.get("command"), str):
             cmd = inp["command"].strip().splitlines()[0]
+            if all_cmds is not None:
+                all_cmds.append(cmd)
             if _is_notable_command(cmd):
                 cmds.append(cmd[:120])
     return spawned
@@ -1194,18 +1144,29 @@ def _bullets(items: list[str], limit: int) -> list[str]:
     return out
 
 
-def _timed_bullets(pairs: list[tuple[str, str]], limit: int) -> list[str]:
-    """Same shape as `_bullets`, stamped: `pairs` is (when, text), the overflow
-    line hand-built because `_bullets` itself has no room for a time column."""
-    out = [f"- {_hhmm(when)}  `{text}`" for when, text in pairs[:limit]]
+def _timed_bullets(pairs: list[tuple[str, str, str]], limit: int) -> list[str]:
+    """Same shape as `_bullets`, stamped and located: `pairs` is (when, locator,
+    text), the overflow line hand-built because `_bullets` itself has no room for
+    the extra columns. An empty locator prints nothing in its place."""
+    out = [f"- {_hhmm(when)}  " + (f"`{loc}`  " if loc else "") + f"`{text}`"
+           for when, loc, text in pairs[:limit]]
     if len(pairs) > limit:
         out.append(f"- …and {len(pairs) - limit} more")
     return out
 
 
-def _clip(text: str, limit: int, hint: str = "read the anchor") -> str:
-    # The hint is a parameter because agent digests have no anchors — pointing at
-    # one invites the reader to invent a ref that claude-history will reject.
+def _located_bullets(items: list[str], where: dict[str, str], limit: int) -> list[str]:
+    """`_bullets` with the row each item was first seen on. Deduplicated lists lose
+    the event behind them, so the row is carried alongside rather than recovered."""
+    out = [f"- `{i}`" + (f"  `{where[i]}`" if where.get(i) else "") for i in items[:limit]]
+    if len(items) > limit:
+        out.append(f"- …and {len(items) - limit} more")
+    return out
+
+
+def _clip(text: str, limit: int, hint: str = "sed the row above") -> str:
+    # The hint is a parameter because not every quote sits under a locator —
+    # pointing at one that isn't there invites the reader to invent it.
     text = text.strip()
     if len(text) <= limit:
         return text
@@ -1352,14 +1313,21 @@ def frontmatter(meta: Meta, ref: str) -> str:
 
 
 def messages_from_jsonl(path: pathlib.Path) -> list[Message]:
-    """Text messages straight from a transcript file. Sidecars only — claude-history
-    has no per-agent ref. Anchors stay empty: `ma_` values are claude-history's
-    to mint, and a fabricated one is worse than none."""
+    """Text messages straight from a transcript file — every digest's reader. The
+    line is recorded as it is read, so a quote can name the row it came from and a
+    reader opens it with `sed` rather than a second tool."""
     msgs: list[Message] = []
-    recs = list(_records(path))
-    TRACE.file(path, "jsonl-messages", records=len(recs))
-    command_ids = _command_prompt_ids(recs)
-    for rec in recs:
+    numbered: list[tuple[int, dict]] = []
+    for lineno, raw in enumerate(path.read_text(errors="replace").splitlines(), start=1):
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict):
+            numbered.append((lineno, rec))
+    TRACE.file(path, "jsonl-messages", records=len(numbered))
+    command_ids = _command_prompt_ids([r for _, r in numbered])
+    for lineno, rec in numbered:
         role = rec.get("type")
         if role not in ("user", "assistant"):
             continue
@@ -1377,11 +1345,11 @@ def messages_from_jsonl(path: pathlib.Path) -> list[Message]:
             continue
         text = "\n".join(t for t in texts if t.strip()).strip()
         if text:
-            msgs.append(Message(n=len(msgs) + 1, role=role, anchor="", text=text))
+            msgs.append(Message(n=len(msgs) + 1, role=role, text=text, line=lineno))
     return msgs
 
 
-_SIDECAR_HINT = "read the sidecar under Drill down"
+_SIDECAR_HINT = "sed the sidecar row named under Drill down"
 
 # Below this an assistant turn is almost always tool narration, not a finding.
 _MEATY_CHARS = 400
@@ -1450,7 +1418,7 @@ def render_agent_digest(meta: Meta, parent_ref: str, run: AgentRun) -> str:
         parts.append("*Marked by this agent with `chsum mark`. Reasons are verbatim.*\n")
         # No ordinals: sidecar messages have none, and no anchors to cite either.
         # The agent id is redundant here — the whole digest is that agent.
-        parts += _render_marks(run.marks, [], show_agent=False) + [""]
+        parts += _render_marks(run.marks, "", show_agent=False) + [""]
 
     parts.append("## Task\n")
     task = next((m.text for m in msgs if m.role == "user"), "")
@@ -1489,12 +1457,13 @@ def render_agent_digest(meta: Meta, parent_ref: str, run: AgentRun) -> str:
 
     parts.append("## Drill down\n")
     parts.append(f"Full sidecar: `{run.path}`\n")
-    parts.append("Inlined into the parent read (untagged, all agents at once): "
-                 f"`claude-history agent read {parent_ref}:mN..mN --subagents --no-budget`\n")
+    parts.append(f"Its rows, addressable: `chsum digest {parent_ref}/{run.id} --messages`  ·  "
+                 "`--tools`  ·  `--commands`\n")
     return "\n".join(parts).rstrip() + "\n"
 
 
 def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
+                  path: pathlib.Path | None = None,
                   prompt_clip: int = 300, max_prompts: int = 25) -> str:
     typed = [m for m in msgs if m.role == "user" and is_typed_prompt(m.text)]
     prompts = [m for m in typed if is_substantive(m.text)]
@@ -1512,7 +1481,7 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
         parts.append("## Notable\n")
         parts.append("*Marked during the session with `chsum mark`. "
                      "Reasons are verbatim.*\n")
-        parts += _render_marks(meta.marks, msgs) + [""]
+        parts += _render_marks(meta.marks, meta.uuid) + [""]
 
     # The intent trail: verbatim, in order. This is the summary, uninvented.
     parts.append("## What I asked for\n")
@@ -1521,7 +1490,9 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
     else:
         shown = prompts[:max_prompts]
         for m in shown:
-            parts.append(f"**m{m.n}**\n")
+            # The row it sits on, not an ordinal: a reader opens this with `sed`.
+            parts.append(f"**`{meta.uuid[:8]}:{m.line}`**\n" if m.line
+                         else f"**message {m.n}**\n")
             parts.append(_quote(_clip(m.text, prompt_clip)) + "\n")
         trailer = []
         if len(prompts) > len(shown):
@@ -1562,7 +1533,15 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
 
     if meta.commands:
         parts.append("## Commands run\n")
-        parts += _bullets(meta.commands, 10) + [""]
+        shown = meta.commands[:10]
+        parts += [f"- `{c}`" for c in shown]
+        if len(meta.commands) > len(shown):
+            # Both counts: the bullets are filtered and deduplicated and the
+            # timeline is neither, so one number cannot stand for the other.
+            parts.append(f"- …and {len(meta.commands) - len(shown)} more of these — "
+                         f"`chsum digest {ref} --commands` lists all "
+                         f"{meta.command_total} in order")
+        parts.append("")
 
     parts.append("## Where I left off\n")
     tail = _last_exchange(msgs)
@@ -1575,55 +1554,47 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
         for m in tail:
             label = ("Last thing I asked" if m.role == "user"
                      else "Last thing Claude said")
-            parts.append(f"**{label}** (m{m.n})\n")
+            where = f"`{meta.uuid[:8]}:{m.line}`" if m.line else f"message {m.n}"
+            parts.append(f"**{label}** ({where})\n")
             parts.append(_quote(_clip(m.text, 600)) + "\n")
     else:
         parts.append("*Nothing recorded.*\n")
 
-    parts.append("## Drill down\n")
-    parts.append(f"Read any message: `claude-history agent read {ref}:mN..mN --no-budget`\n")
-    cited = _citable_anchors(msgs, prompts[:max_prompts] + (tail or []))
-    if cited:
-        parts.append("Durable anchors (survive renumbering if the transcript changes):\n")
-        parts += [f"- m{n} → `{a}`" for n, a in cited[:12]] + [""]
+    parts += _drill_block(ref, path)
     return "\n".join(parts).rstrip() + "\n"
 
 
-def _locate_mark(mark: Mark, msgs: list[Message]) -> None:
-    """Give a mark its mN and anchor only on an exact line match; unplaced marks
-    fall back to their record id, and the quote carries the content either way."""
-    # The file the line belongs to decides: a target's line is in the target's file,
-    # and only the parent's lines number against a ref.
-    target, in_agent = ((mark.at_line, mark.at_agent) if mark.at_line
-                        else (mark.line, mark.agent))
-    # A sidecar has no per-agent ref to number lines against, so it gets its agent id instead.
-    if not target or in_agent:
-        TRACE.step("_locate_mark", mark=mark.rec[:8], line=target,
-                   agent=in_agent[:8] if in_agent else "—", placed="no")
-        return
-    for m in msgs:
-        if m.line == target:
-            mark.n, mark.anchor = m.n, m.anchor
-            TRACE.step("_locate_mark", mark=mark.rec[:8], line=target,
-                       placed=f"m{m.n}", anchor=m.anchor or "—")
-            return
-    TRACE.step("_locate_mark", mark=mark.rec[:8], line=target, placed="no",
-               lines_read=len(msgs), reason="no message at that row")
+def _drill_block(ref: str, path: pathlib.Path | None) -> list[str]:
+    """Where the conversation is, and how to open a row of it. Every locator above
+    expands here, and `sed` resolves them — nothing in this document requires a
+    second tool to be installed before it can be read."""
+    if not path:
+        return []
+    out = ["## Drill down\n", f"Transcript: `{path}`"]
+    sides = subagent_transcripts(path)
+    out += [f"- subagent `{sc.stem.removeprefix('agent-')}` — `{sc}`" for sc in sides]
+    out += ["",
+            f"One row: `sed -n '<line>p' {path} | jq`",
+            f"Every message: `chsum digest {ref} --messages`  ·  "
+            f"every tool call: `--tools`  ·  every command: `--commands`\n"]
+    return out
 
 
-def _render_marks(marks: list[Mark], msgs: list[Message],
+def _render_marks(marks: list[Mark], session: str,
                   show_agent: bool = True) -> list[str]:
+    """A mark names the row it points at. The mark already carries that row and the
+    file it is in, so nothing is looked up and nothing needs claude-history to
+    resolve what comes out."""
     out = []
     for mk in marks:
-        _locate_mark(mk, msgs)
         where = []
-        if mk.n:
-            where.append(f"m{mk.n}")
-        if mk.anchor:
-            where.append(f"`{mk.anchor}`")
-        # The target's file first: that is what the reader has to open.
+        # The target's file decides: a target's line is a line of the target's file.
         agent = mk.at_agent or mk.agent
-        if agent and show_agent:
+        target = mk.at_line or mk.line
+        if target and session:
+            who = f"{session[:8]}/{agent[:8]}" if agent else session[:8]
+            where.append(f"`{who}:{target}`")
+        elif agent and show_agent:
             where.append(f"agent `{agent}`")
         head = f"- **{_clip_line(mk.reason, 300)}**"
         if where:
@@ -1636,20 +1607,6 @@ def _render_marks(marks: list[Mark], msgs: list[Message],
         if mk.quote:
             out.append(f"  > {_clip_line(mk.quote, 160)}")
     return out
-
-
-def _citable_anchors(all_msgs: list[Message], cited: list[Message]) -> list[tuple[int, str]]:
-    """Anchors safe to publish: present, unique, one per message."""
-    counts: dict[str, int] = {}
-    for m in all_msgs:
-        if m.anchor:
-            counts[m.anchor] = counts.get(m.anchor, 0) + 1
-    out, seen = [], set()
-    for m in cited:
-        if m.anchor and counts.get(m.anchor) == 1 and m.n not in seen:
-            seen.add(m.n)
-            out.append((m.n, m.anchor))
-    return sorted(out)
 
 
 def _last_exchange(msgs: list[Message]) -> list[Message]:
@@ -1680,13 +1637,15 @@ def resolve_ref(args) -> str:
         if not path.exists():
             raise SystemExit(f"no such transcript: {path}")
         ref = ch_ref_for_path(path)
-        got = uuid_for_ref(ref)
-        if got != path.stem:
+        # A derived value is checked against what it claims, the same rule as
+        # `_verify_stamp`: the ref has to resolve back to the file it came from.
+        got = path_for_ref(ref)
+        if got != path:
             raise SystemExit(
-                f"derived ref resolved to {got or '(nothing)'}, expected {path.stem}.\n"
-                "claude-history's ref scheme has probably changed — use `chsum find` instead."
+                f"derived ref resolved to {got or '(nothing)'}, expected {path}.\n"
+                "the ref scheme has probably changed — use `chsum find` instead."
             )
-        TRACE.step("resolve_ref", via="--file", ref=ref, uuid=got, verified="yes")
+        TRACE.step("resolve_ref", via="--file", ref=ref, uuid=path.stem, verified="yes")
         return ref
     TRACE.step("resolve_ref", via="argv", ref=args.ref or "—")
     return args.ref
@@ -1743,15 +1702,222 @@ def _split_agent_ref(ref: str) -> tuple[str, str]:
 
 
 def _parent_path(ref: str) -> pathlib.Path:
-    uuid = uuid_for_ref(ref)
-    if not uuid:
-        raise HistoryError(f"{ref} did not resolve to a conversation")
-    path = _path_for_uuid(uuid)
-    if not path:
-        raise HistoryError(f"no transcript on disk for {uuid}")
-    TRACE.step("_parent_path", ref=ref, uuid=uuid)
-    TRACE.reproduce(f"claude-history agent read {ref} --no-budget")
+    """Locally, over the transcripts on disk. The listing printed these same
+    derived refs, so a paste from it resolves by construction and no subprocess
+    is spent."""
+    path = path_for_ref(ref)
+    TRACE.step("_parent_path", ref=ref, uuid=path.stem)
+    TRACE.reproduce(f"chsum digest {ref} --stdout")
     return path
+
+
+@dataclass
+class _Row:
+    """One addressable thing in a transcript: a message, a tool call, or the Bash
+    subset of those. `_Event` clips its text and carries neither an id nor a line,
+    so it can address neither the record nor the result that answers it."""
+    when: str  # ISO timestamp, verbatim
+    agent: str  # sidecar id; "" for the parent transcript
+    kind: str  # message / tool / command
+    tool_id: str  # the `tool_use` id its `tool_result` names back; "" on a message
+    text: str  # the message, or the command, unclipped
+    label: str  # role for a message, tool name for a call
+    line: int = 0  # 1-based row of the record holding it, in `source`
+    source: pathlib.Path | None = None  # the file that row is in
+
+
+# What each flag selects. A Bash call is its own kind rather than a filter applied
+# over `tool`, so both flags read the same rows without a second test per row.
+_ROW_KINDS = {
+    "messages": ("message",),
+    "tools": ("tool", "command"),
+    "commands": ("command",),
+}
+
+
+def _short_id(tool_id: str) -> str:
+    """Display form of a `tool_use` id. `toolu_` is on every one of them, so the
+    prefix carries no information and costs six columns on every row."""
+    return tool_id.removeprefix("toolu_")[:10]
+
+
+def collect_rows(path: pathlib.Path, kinds: tuple[str, ...],
+                 only_agent: str = "") -> list[_Row]:
+    """Every row of the selected kinds, the conversation's own and its agents', in
+    timestamp order. Nothing filtered, deduplicated or clipped: the digest's own
+    sections do all three, and these views are what they point at. `only_agent`
+    narrows to one sidecar, for an agent ref."""
+    out: list[_Row] = []
+    for src, agent in mark_sources(path):
+        if only_agent and agent != only_agent:
+            continue
+        TRACE.file(src, "rows")
+        parsed: list[tuple[int, dict]] = []
+        for lineno, raw in enumerate(src.read_text(errors="replace").splitlines(), start=1):
+            try:
+                rec = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(rec, dict):
+                parsed.append((lineno, rec))
+        # A body a tool loaded is not a message, the same guard every other reader
+        # here carries; the call that loaded it is a `tool` row instead.
+        command_ids = _command_prompt_ids([r for _, r in parsed])
+        for lineno, rec in parsed:
+            role = rec.get("type")
+            if role not in ("user", "assistant"):
+                continue
+            ts = str(rec.get("timestamp") or "")
+            content = (rec.get("message") or {}).get("content")
+            texts: list[str] = []
+            if isinstance(content, str):
+                texts = [content]
+            elif isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") == "text":
+                        texts.append(part.get("text", ""))
+                    elif part.get("type") == "tool_use":
+                        name = str(part.get("name") or "?")
+                        cmd = (part.get("input") or {}).get("command")
+                        bash = name == "Bash" and isinstance(cmd, str) and cmd.strip()
+                        kind = "command" if bash else "tool"
+                        if kind not in kinds:
+                            continue
+                        text = cmd.strip() if bash else _tool_event(part)[1]
+                        out.append(_Row(ts, agent, kind, str(part.get("id") or ""),
+                                        text, name, lineno, src))
+            if "message" not in kinds:
+                continue
+            if role == "user" and _tool_injected(rec, command_ids):
+                continue
+            text = "\n".join(t for t in texts if t.strip()).strip()
+            if text:
+                out.append(_Row(ts, agent, "message", "", text, role, lineno, src))
+    # A parent's line numbers and a sidecar's don't order against each other;
+    # only a clock does. Same reason `mark_sources`' readers sort by timestamp.
+    out.sort(key=lambda r: r.when)
+    TRACE.step("collect_rows", kinds=",".join(kinds), rows=len(out),
+               agent=only_agent or "(all)",
+               span=f"{out[0].when}→{out[-1].when}" if out else "—")
+    return out
+
+
+def _locator(row: _Row, session: str) -> str:
+    """`<session>:<line>`, or `<session>/<agent>:<line>` for a sidecar. Eight
+    characters of the session: unique over 700 sessions measured, and the agent
+    part alone is not — a fork copies a sidecar under the same name."""
+    who = f"{session[:8]}/{row.agent[:8]}" if row.agent else session[:8]
+    return f"{who}:{row.line}"
+
+
+def _sources_block(rows: list[_Row], session: str) -> list[str]:
+    """Full path per source, a `sed` line, and the loop that reads a stretch. The
+    locator on a row is short enough to read across hundreds of rows; the path it
+    expands to has to be stated somewhere, or the row reaches nothing on its own."""
+    if not rows:
+        return []
+    seen: dict[str, pathlib.Path | None] = {}
+    for r in rows:
+        seen.setdefault(_locator(r, session).rsplit(":", 1)[0], r.source)
+    first = rows[0]
+    some = " ".join(str(r.line) for r in rows[:3])
+    return (["## Sources\n"]
+            + [f"- `{k}` — `{p}`" for k, p in seen.items()]
+            + [f"\nOne record: `sed -n '{first.line}p' {first.source} | jq`",
+               "A stretch: `for l in " + some + "; do sed -n \"${l}p\" "
+               f"{first.source} | jq -r '.message.content'; done`\n"])
+
+
+def find_row(path: pathlib.Path, spec: str) -> tuple[_Row, str]:
+    """The row an id prefix names, with the captured output where it has one. An
+    ambiguity lists candidates rather than picking, same rule as `_find_mark`: the
+    id is copied off a row, so a prefix matching two rows is a typo."""
+    hits = [r for r in collect_rows(path, ("tool", "command"))
+            if r.tool_id.startswith(spec) or _short_id(r.tool_id).startswith(spec)]
+    if not hits:
+        raise SystemExit(f"no tool call {spec!r} — `chsum digest <ref> --tools` lists them")
+    if len(hits) > 1:
+        listed = "\n".join(f"  {_short_id(r.tool_id)}  {_hhmmss(r.when)}  "
+                            f"{_clip_line(r.text, 60)}" for r in hits[:8])
+        more = f"\n  … and {len(hits) - 8} more" if len(hits) > 8 else ""
+        raise SystemExit(f"{spec!r} matches {len(hits)} calls:\n{listed}{more}")
+    row = hits[0]
+    src = row.source or path
+    out = ""
+    for raw in src.read_text(errors="replace").splitlines():
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        content = (rec.get("message") or {}).get("content") if isinstance(rec, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not (isinstance(part, dict) and part.get("type") == "tool_result"
+                    and part.get("tool_use_id") == row.tool_id):
+                continue
+            body = part.get("content")
+            if isinstance(body, list):
+                body = "\n".join(b.get("text", "") for b in body
+                                 if isinstance(b, dict) and b.get("type") == "text")
+            if isinstance(body, str):
+                out = body
+    TRACE.step("find_row", tool_id=row.tool_id, agent=row.agent or "(parent)",
+               output_chars=len(out))
+    return row, out
+
+
+def render_rows(meta: Meta, ref: str, rows: list[_Row], what: str) -> str:
+    """One line per row. A call's first line, not a flattened clip: a heredoc
+    squashed onto one line is 120 chars of its own source, where `python3 - <<'PY'`
+    identifies it at a glance. The whole text sits one `sed` away, which is what
+    the locator on each row is for."""
+    _, agent_id = _split_agent_ref(ref)
+    # The scope is stated, not inferred from whether the locators carry an agent
+    # part: a session whose agents ran nothing renders identically to one scoped away.
+    scope = (f"Every {what[:-1]} row in subagent `{agent_id}`."
+             if agent_id else f"Every {what[:-1]} row in this conversation, its own and its agents'.")
+    out = [f"# {what.capitalize()} — {_plural(len(rows), 'row')}, in order\n",
+           f"*{meta.title}*\n",
+           f"*{scope}",
+           "Nothing is filtered, deduplicated or clipped away here — the digest's",
+           "own sections do all three; this section does none.*\n"]
+    if not rows:
+        out.append(f"*No {what} recorded.*\n")
+        return "\n".join(out)
+    out += _sources_block(rows, meta.uuid)
+    day = ""
+    for r in rows:
+        if r.when[:10] != day:
+            day = r.when[:10]
+            out.append(f"\n## {day}\n")
+        ident = f"`{_short_id(r.tool_id)}`  " if r.tool_id else ""
+        first = next(iter(r.text.splitlines()), "")
+        out.append(f"- {ident}`{_locator(r, meta.uuid)}`  {_hhmmss(r.when)}  "
+                   f"{r.label}  `{_clip_line(first, 120)}`")
+    if any(r.tool_id for r in rows):
+        out.append(f"\nOne call whole, with its output: `chsum digest {ref} --call <id>`\n")
+    return "\n".join(out)
+
+
+def render_row_detail(row: _Row, out: str, ref: str) -> str:
+    """One call whole and its output whole. Both whole: a reader who followed an id
+    here asked for what the row's single clipped line could not hold. Blockquoted
+    rather than fenced — output carrying a fence would close the block and forge
+    document structure below it."""
+    where = f"agent {row.agent}" if row.agent else "the parent transcript"
+    parts = [f"# {row.label} `{_short_id(row.tool_id)}`\n",
+             f"- id: `{row.tool_id}`",
+             f"- when: {_hhmmss(row.when)}  ({row.when})",
+             f"- where: {where}",
+             f"- record: `{row.source}` line {row.line}",
+             f"- open it: `sed -n '{row.line}p' {row.source} | jq`",
+             f"- conversation: `{ref}`\n",
+             "## Call\n", _quote(row.text) + "\n", "## Output\n"]
+    parts.append(_quote(out) + "\n" if out.strip() else "*No output recorded.*\n")
+    return "\n".join(parts)
 
 
 def _digest_for(ref: str) -> tuple[Meta, str]:
@@ -1764,11 +1930,24 @@ def _digest_for(ref: str) -> tuple[Meta, str]:
             known = ", ".join(a.id for a in meta.agents) or "none"
             raise HistoryError(f"no subagent {agent_id} in {parent_ref} (has: {known})")
         return meta, render_agent_digest(meta, parent_ref, run)
-    return meta, render_digest(meta, ref, read_messages(ref))
+    return meta, render_digest(meta, ref, messages_from_jsonl(path), path=path)
 
 
 def cmd_digest(args) -> int:
     ref = resolve_ref(args)
+    view = next((k for k in _ROW_KINDS if getattr(args, k, False)), "")
+    if args.call or view:
+        # Lookups reached from a hint in the digest, not artifacts to keep, so
+        # they print where the digest itself writes a file.
+        parent_ref, agent_id = _split_agent_ref(ref)
+        path = _parent_path(parent_ref)
+        if args.call:
+            row, out = find_row(path, args.call)
+            sys.stdout.write(render_row_detail(row, out, ref))
+            return 0
+        sys.stdout.write(render_rows(extract_meta(path), ref,
+                                     collect_rows(path, _ROW_KINDS[view], agent_id), view))
+        return 0
     meta, md = _digest_for(ref)
     if args.stdout:
         sys.stdout.write(md)
@@ -1790,10 +1969,9 @@ def cmd_context(args) -> int:
     print("<!-- Extracted verbatim from the transcript by chsum. No model wrote this;")
     print("     nothing here is paraphrased. Quotes may be clipped — full text is in")
     if agent_id:
-        # chsum's own address, not a claude-history one — `agent read` would fail.
         print("     the sidecar named under Drill down. -->")
     else:
-        print(f"     the transcript: claude-history agent read {ref}:mN..mN --no-budget -->")
+        print(f"     the transcript, at the rows named: sed -n '<line>p' <file> | jq -->")
     print()
     sys.stdout.write(md)
     return 0
@@ -1818,20 +1996,12 @@ def live_transcript() -> pathlib.Path:
 
 
 def _mark_target(path: pathlib.Path, spec: str) -> _MarkTarget:
-    """Resolve `--at` to a full record uuid, its row and its file: either a uuid prefix from
-    `chsum mark --recent` (looked for in sidecars too, since `--recent` lists
-    them), or an mN, which needs claude-history to place it and stays parent-only."""
-    if re.fullmatch(r"m\d+", spec):
-        ref = ch_ref_for_path(path)
-        want = int(spec[1:])
-        msg = next((m for m in read_messages(ref) if m.n == want and m.line), None)
-        if not msg:
-            raise SystemExit(
-                f"claude-history can't place {spec} in this transcript yet — its view of a "
-                "live session lags behind the file.\nPick from `chsum mark --recent 20` "
-                "and pass the record id instead."
-            )
-        line = msg.line
+    """Resolve `--at` to a full record uuid, its row and its file: either a uuid
+    prefix from `chsum mark --recent` (looked for in sidecars too, since `--recent`
+    lists them), or a bare row number, which stays parent-only — only the parent's
+    rows number against the transcript a bare mark is made in."""
+    if spec.isdigit():
+        line = int(spec)
     else:
         line = 0
     prefix = spec.lower()
@@ -2040,15 +2210,8 @@ def _show_mark(path: pathlib.Path, marks: list[Mark], context: int, cols: int) -
     agent = mk.at_agent or mk.agent
     if agent:
         where.append(f"agent {agent}")
-    if mk.at_line and not agent:
-        # Only the parent's lines number against a ref, and a live transcript
-        # often has no mN for them yet — the message itself prints either way.
-        try:
-            _locate_mark(mk, read_messages(ch_ref_for_path(path)))
-        except HistoryError:
-            pass
-        if mk.n:
-            where.append(f"m{mk.n}")
+    if mk.at_line:
+        where.append(f"line {mk.at_line}")
     for one in marks:
         print(f"{one.rec[:8]}  {one.reason}")
     print(_dim("  " + "  ·  ".join(where)))
@@ -2383,6 +2546,11 @@ class _Event:
     agent: str  # sidecar id; "" for the parent transcript
     kind: str  # said / ran / edit / output / failed / spawn / tool
     text: str
+    # Where the record sits. Carried for the verbatim sections only: the extract
+    # `_event_block` renders is read by a model, and a number in it is a number
+    # that can be copied out wrong.
+    line: int = 0
+    source: pathlib.Path | None = None
 
 
 # `is_error` also flags a tool use *you* declined — not a failure of the work.
@@ -2531,7 +2699,8 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
                              else "token counts unrecorded")
                     events.append(_Event(ts, agent, "compacted",
                                          f"Conversation compacted — {stats}, "
-                                         f"{cm.get('trigger', 'trigger unrecorded')}"))
+                                         f"{cm.get('trigger', 'trigger unrecorded')}",
+                                         lineno, src))
                 continue
             if rec.get("type") == "user" and live:
                 # The command you typed, kept as an event where its loaded body
@@ -2543,12 +2712,14 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
                     detail = cargs.group(1).strip() if cargs else ""
                     events.append(_Event(ts, agent, "command",
                                          _clip_line(cmd.group(1)
-                                                    + (f" {detail}" if detail else ""), 200)))
+                                                    + (f" {detail}" if detail else ""), 200),
+                                         lineno, src))
                     continue
             content = (rec.get("message") or {}).get("content")
             if isinstance(content, str) and live and rec["type"] == "assistant":
                 if content.strip() and not notice_kind(content):
-                    events.append(_Event(ts, agent, "said", _clip(content, 600, "clipped")))
+                    events.append(_Event(ts, agent, "said", _clip(content, 600, "clipped"),
+                                     lineno, src))
                 continue
             if not isinstance(content, list):
                 continue
@@ -2558,7 +2729,8 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
                 if part.get("type") == "text" and live and rec["type"] == "assistant":
                     t = part.get("text", "").strip()
                     if t and not notice_kind(t):
-                        events.append(_Event(ts, agent, "said", _clip(t, 600, "clipped")))
+                        events.append(_Event(ts, agent, "said", _clip(t, 600, "clipped"),
+                                             lineno, src))
                 elif part.get("type") == "tool_use":
                     if part.get("name") == "Bash":
                         cmd = (part.get("input") or {}).get("command")
@@ -2568,7 +2740,7 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
                         pending[str(part.get("id") or "")] = _clip_line(
                             cmd.strip().splitlines()[0], 120) if isinstance(cmd, str) and cmd.strip() else ""
                     if live:
-                        events.append(_Event(ts, agent, *_tool_event(part)))
+                        events.append(_Event(ts, agent, *_tool_event(part), lineno, src))
                         if (part.get("name") in _FILE_TOOLS
                                 and isinstance((part.get("input") or {}).get("file_path"), str)):
                             pending_edits[str(part.get("id") or "")] = len(events) - 1
@@ -2590,7 +2762,8 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
                             lines = ev.text.splitlines()
                             if lines:
                                 lines[0] = f"{lines[0]} (lines {min(starts)}-{max(ends)})"
-                                events[idx] = _Event(ev.when, ev.agent, ev.kind, "\n".join(lines))
+                                events[idx] = _Event(ev.when, ev.agent, ev.kind,
+                                                     "\n".join(lines), ev.line, ev.source)
                 elif (part.get("type") == "tool_result" and live
                         and part.get("tool_use_id") in pending):
                     # Bash results only: they carry verdicts (tests, builds). Read
@@ -2608,9 +2781,11 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
                         if _failed(out, bool(part.get("is_error"))):
                             cmd = pending.get(part["tool_use_id"], "")
                             events.append(_Event(ts, agent, "failed",
-                                                 f"{cmd}\n{_fail_excerpt(out)}"))
+                                                 f"{cmd}\n{_fail_excerpt(out)}",
+                                                 lineno, src))
                         else:
-                            events.append(_Event(ts, agent, "output", head + out[-400:]))
+                            events.append(_Event(ts, agent, "output", head + out[-400:],
+                                                 lineno, src))
     # Stable, so a record's own blocks stay in the order they were emitted.
     events.sort(key=lambda e: e.when)
     TRACE.step("_events_since", anchor_line=anchor_line, anchor_ts=anchor_ts,
@@ -3231,7 +3406,7 @@ def _compaction_section(events: list[_Event]) -> list[str]:
     return out + [""]
 
 
-def _failures_section(events: list[_Event]) -> list[str]:
+def _failures_section(events: list[_Event], session: str = "") -> list[str]:
     """What went wrong, computed and quoted verbatim — never the summariser's
     job, so it doesn't ride on a model's discretion."""
     failures = [e for e in events if e.kind == "failed"]
@@ -3242,6 +3417,9 @@ def _failures_section(events: list[_Event]) -> list[str]:
         cmd, _, body = e.text.partition("\n")
         who = f" (agent {e.agent[:8]})" if e.agent else ""
         head = f"- {_hhmm(e.when)}{who}"
+        if session and e.line:
+            loc = f"{session[:8]}/{e.agent[:8]}" if e.agent else session[:8]
+            head += f"  `{loc}:{e.line}`"
         out.append(f"{head}  `{cmd}`" if cmd else head)
         # 600, above `_fail_excerpt`'s own 400-char bound: clipping twice cuts a
         # marked excerpt a second time and prints "[+1 chars]" at the seam.
@@ -3699,6 +3877,13 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
 
     edited, cmds, agents_seen = [], [], []
     cmd_times: dict[str, str] = {}  # first occurrence's time — a rerun keeps its earliest stamp
+    # First occurrence's row too: a deduplicated list has no event left to ask.
+    where: dict[str, str] = {}
+    def _loc(e: _Event) -> str:
+        if not e.line or not meta.uuid:
+            return ""
+        who = f"{meta.uuid[:8]}/{e.agent[:8]}" if e.agent else meta.uuid[:8]
+        return f"{who}:{e.line}"
     for e in events:
         if e.kind == "edit":
             # This list dedupes by path (`_dedupe` below) — strip the line
@@ -3706,10 +3891,15 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
             # edited twice at different lines stops deduping at all.
             head = e.text.splitlines()[0]
             m = _EDIT_LINES_RE.match(head)
-            edited.append(m.group(1) if m else head)
+            name = m.group(1) if m else head
+            edited.append(name)
+            # Keyed on the form `keep()` below produces, not the raw path: the
+            # list is made project-relative before these rows are looked up.
+            where.setdefault(_relpath(name, meta.project), _loc(e))
         elif e.kind == "ran" and _is_notable_command(e.text):
             cmds.append(e.text)
             cmd_times.setdefault(e.text, e.when)
+            where.setdefault(e.text, _loc(e))
         if e.agent and e.agent not in agents_seen:
             agents_seen.append(e.agent)
     keep = lambda fs: _dedupe(_relpath(f, meta.project) for f in fs if _is_project_file(f))
@@ -3726,10 +3916,10 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
              + (f" over {span}" if span else "") + "\n"]
     if edited:
         since.append("Files changed:")
-        since += _bullets(edited, 12) + [""]
+        since += _located_bullets(edited, where, 12) + [""]
     if cmds:
         since.append("Commands:")
-        since += _timed_bullets([(cmd_times[c], c) for c in cmds], 8) + [""]
+        since += _timed_bullets([(cmd_times[c], where.get(c, ""), c) for c in cmds], 8) + [""]
     if agents_seen:
         desc = {r.id: r.description for r in meta.agents}
         since.append("Agents at work:")
@@ -3737,7 +3927,7 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
         since.append("")
 
     since += _compaction_section(events)
-    since += _failures_section(events)
+    since += _failures_section(events, meta.uuid)
 
     # Built off `turns`/`live` directly, not `interleave`, so a dry run still
     # prices the chunks a real run would make. Computed here rather than after
@@ -4790,6 +4980,14 @@ def main(argv=None) -> int:
     p.add_argument("ref", nargs="?", help="ch_... ref from `chsum find`")
     p.add_argument("--file", help="transcript path (derives the ref)")
     p.add_argument("--stdout", action="store_true", help="print instead of writing a file")
+    p.add_argument("--messages", action="store_true",
+                   help="every message in order, unfiltered, each locating its record")
+    p.add_argument("--tools", action="store_true",
+                   help="every tool call in order, unfiltered")
+    p.add_argument("--commands", action="store_true",
+                   help="every Bash invocation in order, unfiltered")
+    p.add_argument("--call", metavar="ID",
+                   help="one tool call whole, with its output")
     p.set_defaults(func=cmd_digest)
 
     p = sub.add_parser("context", parents=[dbg], help="reload artifact for pasting back into Claude")

@@ -21,6 +21,10 @@ on as fact.
 | `chsum context <ref>` | Full digest, for reloading into the conversation |
 | `chsum context <ref>/<agent-id>` | One subagent's own digest |
 | `chsum digest <ref>` | Same, written to a file (`--stdout` to print) |
+| `chsum digest <ref> --commands` | Every Bash call in order, unfiltered, each with a `<session>:<line>` locator into the raw JSONL |
+| `chsum digest <ref> --messages` | Every message in order, each locating its own record |
+| `chsum digest <ref> --tools` | Every tool call in order, unfiltered |
+| `chsum digest <ref> --call <id>` | One tool call whole, with its captured output |
 | `chsum journal --since 7d` | Chronological work log across sessions |
 | `chsum recap <ref> --from N --to M` | Reload a specific turn range from a past session |
 | `chsum last --here` | Catch up on *this* session since your last prompt (second terminal) |

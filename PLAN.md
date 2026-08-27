@@ -3,6 +3,73 @@
 Decisions spoken but not executed. A decision leaves this file only by being
 built or by being ruled dead in writing here.
 
+## 2026-08-27 — every reference is a row
+
+Governing sentence: no document chsum prints needs claude-history to resolve —
+messages, tools and commands become views built from raw JSONL and addressed by
+`<session>:<line>`, `mN` and `ma_…` leave the output entirely, and claude-history
+remains only inside `chsum find`, where the embedding index has no local
+equivalent.
+
+### Built 2026-08-27
+
+- **One path, three views.** `_Row`, `collect_rows`, `render_rows`, `find_row`,
+  `render_row_detail`, `_ROW_KINDS`; `--messages`, `--tools`, `--commands`.
+- **`messages_from_jsonl` is every digest's reader**, recording each message's
+  row. Measured a superset of what it replaced: 676 messages against
+  `claude-history agent read`'s 544 over twelve sessions, and 0 of the 86 it
+  dropped appear anywhere in the text claude-history returned.
+- **Every reference is a locator.** Quoted prompts, marks, the last exchange and
+  `_failures_section` all name `<session>:<line>`; `_drill_block` states the full
+  paths and the `sed`. 16 of 16 locators in one digest resolved to a record.
+- **Removed:** `read_messages`, `last_message_number`, `uuid_for_ref`,
+  `_locate_mark`, `_citable_anchors`, `Message.anchor`, `Mark.n`, `Mark.anchor`.
+  Closes devharness #12 — a digest now reports `procs (0)`.
+- **Recap and catch-up rows locate themselves.** Every `_Event` records its row;
+  `_failures_section`, and the `since` block's files and commands via
+  `_located_bullets` and a widened `_timed_bullets`, print it.
+
+### Deferred, not ruled dead
+
+- `_event_block` deliberately carries no locator: a model reads that extract.
+
+## 2026-08-27 — the commands timeline
+
+Governing sentence: the digest's `Commands run` section keeps the ten it prints
+today, its overflow line names a `chsum` invocation that outputs every Bash
+command the session and its agents ran, in timestamp order, unfiltered and
+uncollapsed, and each command in that output names a further invocation that
+prints that command's own captured output.
+
+### Built 2026-08-27
+
+- **`chsum digest <ref> --commands`** — every Bash call in timestamp order
+  across the transcript and its sidecars, one clipped line each, nothing
+  filtered or deduplicated. `_Command`, `collect_commands`, `render_commands`.
+  An agent ref narrows to that sidecar and the header names the scope.
+- **`chsum digest <ref> --command <id>`** — one command and its captured output
+  whole, `find_command` + `render_command_output`, prefix-matched on the id with
+  an ambiguity list rather than a pick.
+- **The overflow line carries both counts and the invocation.**
+  `meta.command_total` / `AgentRun.command_total`, counted in `_collect_tools`
+  on the read `extract_meta` already does.
+- **`_short_id`** — display form of a `tool_use` id, added during the build and
+  not in the approved plan's identifier list.
+- **Every row locates its own record.** `_Command.line` / `_Command.source`,
+  `_locator` (`<session>:<line>`, `<session>/<agent>:<line>`), `_sources_block`
+  (full path per source, plus a worked `sed` line). `render_command_output`
+  states the file, the line and the `sed` that opens it. Verified by resolving
+  every row of four documents through `sed`: 370 of 370 landed on a record
+  carrying that row's tool id.
+
+### Deferred, not ruled dead
+
+- The same `…and N more` dead-end at `chsum.py:1466` (subagent digest commands)
+  and in catch-up's `since` block. Parked by decision on 2026-08-27.
+- The hint appears only where the ten overflow. A session with fewer than ten
+  notable commands and many raw ones shows no pointer to the timeline. Follows
+  the governing sentence as approved; not raised as a defect.
+
 ## 2026-08-19 — recap far edge and Skill bodies
 
 Source: a recap of session `4ac57141` that ended at the chsum skill body, quoted
