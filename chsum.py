@@ -1046,13 +1046,40 @@ _INSPECTION_CMDS = {
 }
 
 
+# `cd somewhere` before the real work is not a look at anything: 3,936 of 19,751
+# Bash calls in the corpus lead with `cd` and exactly one of them is a bare `cd`,
+# so judging by that first word dropped 19.9% of every digest's commands.
+_CMD_SEP_RE = re.compile(r"&&|\|\||;|\n")
+
+
+def _first_command(cmd: str) -> str:
+    """The part of a command worth showing: the first line that does something.
+    `cd repo` then `python3 build.py` is the build, and a reader wants to see it."""
+    for line in cmd.strip().splitlines():
+        head = line.strip()
+        if not head:
+            continue
+        word = head.split()[0].rsplit("/", 1)[-1] if head.split() else ""
+        rest = _CMD_SEP_RE.split(head, maxsplit=1)
+        # A line that is only `cd somewhere` positions the next line; skip past it.
+        if word == "cd" and (len(rest) == 1 or not rest[1].strip()):
+            continue
+        return head
+    return next((l.strip() for l in cmd.strip().splitlines() if l.strip()), "")
+
+
 def _is_notable_command(cmd: str) -> bool:
     """Did this command change something, build, or test?"""
+    cmd = _first_command(cmd)
     first = cmd.split()[0] if cmd.split() else ""
     first = first.rsplit("/", 1)[-1]
     if first in ("sudo", "time", "nohup"):
         parts = cmd.split()
         first = parts[1].rsplit("/", 1)[-1] if len(parts) > 1 else first
+    if first == "cd":
+        rest = _CMD_SEP_RE.split(cmd, maxsplit=1)
+        if len(rest) > 1 and rest[1].strip():
+            return _is_notable_command(rest[1])
     return first not in _INSPECTION_CMDS
 
 
@@ -1115,10 +1142,11 @@ def _collect_tools(rec: dict, edited: list, read: list, cmds: list,
         elif name in _READ_TOOLS and isinstance(inp.get("file_path"), str):
             read.append(inp["file_path"])
         elif name == "Bash" and isinstance(inp.get("command"), str):
-            cmd = inp["command"].strip().splitlines()[0]
+            whole = inp["command"].strip()
+            cmd = _first_command(whole)
             if all_cmds is not None:
                 all_cmds.append(cmd)
-            if _is_notable_command(cmd):
+            if _is_notable_command(whole):
                 cmds.append(cmd[:120])
     return spawned
 
@@ -2660,10 +2688,10 @@ def _tool_event(part: dict) -> tuple[str, str]:
     """(kind, text) for one tool_use block."""
     name, inp = str(part.get("name") or "?"), part.get("input") or {}
     if name == "Bash" and isinstance(inp.get("command"), str):
-        # First line, not a flattened clip: a heredoc squashed onto one line is
-        # 200 chars of its own source, where `python3 - <<'PY'` identifies it.
-        first = next(iter(inp["command"].strip().splitlines()), "")
-        return "ran", _clip_line(first, 200)
+        # The first line that does something, not a flattened clip: a heredoc
+        # squashed onto one line is 200 chars of its own source, where
+        # `python3 - <<'PY'` identifies it, and a leading `cd` names no work.
+        return "ran", _clip_line(_first_command(inp["command"]), 200)
     if name in _FILE_TOOLS and isinstance(inp.get("file_path"), str):
         # Edited text rides along verbatim — what the summariser reads function
         # names out of, instead of chsum parsing code. `content` (a Write) is
