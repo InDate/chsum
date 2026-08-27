@@ -6,7 +6,7 @@ Work logs and reload-ready context from your Claude Code conversations.
 is either copied verbatim from a transcript or computed from it, so nothing can be
 invented. That matters because the output is designed to be pasted back into a
 future Claude session, where a plausible-but-wrong sentence would become ground
-truth. The one exception is labelled where it appears: `chsum last --here` ends in
+truth. The one exception is labelled where it appears: `chsum recap` ends in
 a timeline written by a model, printed beneath the verbatim record it was written
 from.
 
@@ -93,9 +93,11 @@ chsum                                          # the five most recent in this pr
 chsum -n 25                                    # more of them; 0 for all
 chsum --since 7d                               # only the last week
 chsum --all                                    # across every project
-chsum last                                     # most recent real session, as context
-chsum last -n 2                                # the one before that
-chsum last --here                              # the running session: what's happened since your last prompt
+chsum recap                                    # this session, since the last recap
+chsum recap --full                             # this session, all of it
+chsum recap --last                             # the most recent session that isn't this one
+chsum context --last                           # that session verbatim, no timeline
+chsum context --last -n 2                      # the one before that
 chsum find "text to speech playback speed"     # locate a conversation
 chsum digest <ch_ref>                          # write a digest file
 chsum digest <ch_ref> --stdout                 # print it instead
@@ -143,11 +145,11 @@ session that delegated its work — and the id is the one `chsum context
 listing is usually read into a context window, and `-n 0 --all` is the whole
 corpus.
 
-`chsum last` is `chsum context` on the most recent session with activity, ordered
+`chsum context --last` is `chsum context` on the most recent session with activity, ordered
 by last activity so one you resumed yesterday beats one you started last week.
 Run from inside Claude Code, the session doing the running is excluded.
 
-`chsum last --here` is the opposite case: the session that's excluded above,
+`chsum recap` with no arguments is the opposite case: the session that's excluded above,
 caught mid-run. Run it from a second terminal while Claude works. It anchors on
 the last thing you typed, then shows everything since — files changed, commands
 run, agents at work, and what went wrong — each verbatim or computed, same as
@@ -180,7 +182,7 @@ cost down to ~158 tokens *per call*, counted once for every chunk that
 actually runs.
 
 ```sh
-chsum last --here --dry-run                    # what would this cost, and why
+chsum recap --dry-run                          # what would this cost, and why
 ```
 
 After a real run, the terminal gets one line of what it actually cost, summed
@@ -563,7 +565,7 @@ Several things here are non-obvious and were established by measuring, not assum
 ## Prose, and where it's allowed
 
 The `Summariser` seam at the bottom of `chsum.py` has its first backend:
-`HaikuSummariser`, used only by `last --here`, via `claude -p --model haiku` — no
+`HaikuSummariser`, used only by `recap`, via `claude -p --model haiku` — no
 SDK, no key handling, your existing Claude Code auth signs the call. A TL;DR is
 the one thing extraction can't produce, and a running session is where you're
 most likely to want one before the transcript catches up.

@@ -16,7 +16,8 @@ on as fact.
 | Command | For |
 |---|---|
 | `chsum` | List this project's five most recent sessions (default). `-n 25`, `--since 7d`, `--all` |
-| `chsum last` | Digest of the most recent session with activity. `-n 2` for the one before |
+| `chsum recap` | This session, from wherever the last recap stopped. `--full` for all of it |
+| `chsum context --last` | The most recent session that isn't this one. `-n 2` for the one before |
 | `chsum find "<query>"` | Find a session by content. `--lexical` for identifiers/filenames/errors |
 | `chsum context <ref>` | Full digest, for reloading into the conversation |
 | `chsum context <ref>/<agent-id>` | One subagent's own digest |
@@ -27,7 +28,7 @@ on as fact.
 | `chsum digest <ref> --call <id>` | One tool call whole, with its captured output |
 | `chsum journal --since 7d` | Chronological work log across sessions |
 | `chsum recap <ref> --from N --to M` | Reload a specific turn range from a past session |
-| `chsum last --here` | Catch up on *this* session since your last prompt (second terminal) |
+| `chsum recap --last` | Recap the most recent session that isn't this one, whole |
 | `chsum mark "<reason>"` | Flag this moment as notable, for the digest |
 | `chsum mark --show <id>` | Where a mark landed: file, row, time, agent, message |
 | `chsum find --marks [query]` | What's been marked, across sessions |
@@ -97,7 +98,7 @@ sliced under each one. Run non-interactively with `--no-tui` plus both
 `--from`/`--to` — without a terminal there's no session/turn picker to fall
 back on. `--dry-run` prices the call without making it — `0 calls would be made` means the window is already in the turn store and rerunning it is free. Each turn's bullets are kept under `~/.chsum/turns/` once that turn's gap has closed; `--no-cache` bypasses the store in both directions.
 
-`chsum last --here` is the live case — what's happened in the *current*
+`chsum recap` with no arguments is the live case — what's happened in the *current*
 session since the last typed prompt. It's a second-terminal tool for the
 user to watch progress, not something to invoke on your own turn: it reads
 the transcript of the session it's run from, which mid-turn is the one you're

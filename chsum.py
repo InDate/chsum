@@ -1936,8 +1936,19 @@ def _digest_for(ref: str) -> tuple[Meta, str]:
     return meta, render_digest(meta, ref, messages_from_jsonl(path), path=path)
 
 
+def _resolve_or_live(args) -> str:
+    """The ref a digest is about. Bare means the session you are in, `--last`
+    the most recent one that isn't — the same rule `chsum last` used before it
+    became this flag."""
+    if not args.ref and not args.file:
+        path = (latest_transcript(local=not args.all, nth=args.nth)
+                if args.last else live_transcript())
+        args.file = str(path)
+    return resolve_ref(args)
+
+
 def cmd_digest(args) -> int:
-    ref = resolve_ref(args)
+    ref = _resolve_or_live(args)
     view = next((k for k in _ROW_KINDS if getattr(args, k, False)), "")
     if args.call or view:
         # Lookups reached from a hint in the digest, not artifacts to keep, so
@@ -1952,7 +1963,9 @@ def cmd_digest(args) -> int:
                                      collect_rows(path, _ROW_KINDS[view], agent_id), view))
         return 0
     meta, md = _digest_for(ref)
-    if args.stdout:
+    # A no-argument command that silently writes a file is a surprise: the bare
+    # form prints, and naming a session is what asks for one on disk.
+    if args.stdout or not (args.ref or args.file_given or args.last):
         sys.stdout.write(md)
         return 0
     args.out.mkdir(parents=True, exist_ok=True)
@@ -1966,7 +1979,7 @@ def cmd_digest(args) -> int:
 def cmd_context(args) -> int:
     """Reload artifact. Same content as the digest, with a provenance header so a
     future reader knows exactly how much to trust it (answer: it's verbatim)."""
-    ref = resolve_ref(args)
+    ref = _resolve_or_live(args)
     meta, md = _digest_for(ref)
     parent_ref, agent_id = _split_agent_ref(ref)
     print("<!-- Extracted verbatim from the transcript by chsum. No model wrote this;")
@@ -2536,7 +2549,7 @@ def latest_transcript(local: bool = True, nth: int = 1) -> pathlib.Path:
 
 
 # ---------------------------------------------------------------------------
-# Catch-up: `last --here`
+# The live window: a bare `chsum recap`
 # ---------------------------------------------------------------------------
 # The running session, since the last thing you typed. Raw JSONL throughout —
 # claude-history's read of a live transcript lags the file, and this view
@@ -3535,7 +3548,7 @@ def _cost_rows(events: list[_Event], boundaries: list[str],
 
 
 def _dry_run_report(events: list[_Event], boundaries: list[str],
-                    cmd: str = "last --here",
+                    cmd: str = "recap",
                     cached: set[int] | frozenset[int] = frozenset()) -> str:
     """`--dry-run`'s answer to "what is this going to cost, and why". Prices it
     the way a live run actually spends it, via `_cost_rows`, so totals reconcile
@@ -3645,7 +3658,7 @@ def _local_when(ts: str, mtime: float) -> str:
 
 
 def _pick_transcript(live_only: bool = True) -> pathlib.Path:
-    """`last --here`'s picker — used only here; `live_transcript` itself stays
+    """The bare-`recap` picker — used only here; `live_transcript` itself stays
     untouched since `mark`/`name` depend on its silent newest-file fallback.
     Non-interactive (no tty on stdin or stderr) falls through to
     `live_transcript()` byte-for-byte, since blocking on `input()` would hang a script."""
@@ -3823,27 +3836,12 @@ class _Ticker:
         _clear_status()
 
 
-def cmd_catchup(args) -> int:
-    # Pick before the status line starts, or `_status`'s stderr writes garble the picker.
-    path = _pick_transcript()
-    _status("reading the live transcript…")
-    meta = extract_meta(path)
-    anchor = _last_prompt(path)
-    if not anchor:
-        _clear_status()
-        raise SystemExit("nothing typed in this conversation yet — no prompt to catch up from")
-    anchor_line, anchor_rec = anchor
-    return _render_window(path, meta, anchor_line, str(anchor_rec.get("timestamp") or ""),
-                          _typed_text(anchor_rec), "", args)
-
-
 def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: str,
                    prompt_text: str, until_ts: str, args, turns: list[_Turn] | None = None,
                    live: bool = True, anchor_uuid: str = "") -> int:
     """The document, for a window with a start and an optional end. One body
-    for `last --here` and `recap` — they differ only in how the window was
-    chosen. `live` says which: `last --here` runs to now, `recap` to a chosen
-    end. An empty `until_ts` bounds the window by nothing, which is "to now"
+    for a bare `recap` and a ranged one — they differ only in how the window was
+    chosen. `live` says which: bare runs to now, a chosen range to its end. An empty `until_ts` bounds the window by nothing, which is "to now"
     live and "to the end of the session" in a recap — so `live` is passed in
     rather than derived from it."""
     def out(text: str, **kw) -> None:
@@ -3971,7 +3969,7 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
                 _fingerprint(_CHUNK_PROMPT, HaikuSummariser.model),
                 HaikuSummariser.model)
         out(_dry_run_report(events, boundaries,
-                            "last --here" if live else "recap", cached))
+                            "recap", cached))
         return 0
 
     # One call per chunk, run independently and in parallel — no chunk's call
@@ -3993,7 +3991,7 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
         finally:
             done.bump()  # counted whichever way it ended, or the line stalls short
 
-    # The store is read only where the document slices onto turns: `last --here`
+    # The store is read only where the document slices onto turns: a bare recap
     # names its chunks by nothing durable, and its tail gap is open by construction.
     instructions = _fingerprint(_CHUNK_PROMPT, HaikuSummariser.model)
     use_store = interleave and not getattr(args, "no_cache", False)
@@ -4560,22 +4558,74 @@ def _run_wizard(args):
         return "unavailable", None
 
 
+def _recap_start(path: pathlib.Path, turns: list[_Turn]) -> int | None:
+    """Index of the first turn the store holds no breakdown for — where a bare
+    `chsum recap` picks up. `None` when every turn is stored, which is "nothing
+    new since the last one" rather than a window of zero turns.
+
+    Existence, not the fingerprint match `_read_breakdown` demands: a stored
+    file means a recap covered that turn, and editing `_CHUNK_PROMPT` should not
+    silently reset every session to its beginning. The strict check still
+    governs whether that turn's bullets are *reused* — this only decides where
+    to start reading."""
+    project_dir = path.parent.name
+    stored = [bool(t.uuid) and _turn_path(project_dir, t.uuid).exists() for t in turns]
+    first_new = next((i for i, done in enumerate(stored) if not done), None)
+    TRACE.step("_recap_start", turns=len(turns), stored=sum(stored),
+               start_turn=(first_new + 1) if first_new is not None else "(all stored)")
+    return first_new
+
+
+def _recap_target(args) -> pathlib.Path:
+    """Which conversation a recap is about. Bare means the one you are in — the
+    same context-awareness `--here` had, now the default."""
+    if args.file:
+        return pathlib.Path(args.file)
+    if args.last:
+        return latest_transcript(local=not args.all)
+    ref = args.session or args.ref
+    if ref:
+        return path_for_ref(ref)
+    return live_transcript()
+
+
 def cmd_recap(args) -> int:
-    """Any session, any range of your turns — `last --here` with both ends
-    chosen instead of "since the last thing I typed, to now"."""
-    verdict, picked = _run_wizard(args)
-    if verdict == "quit":
-        return 0  # you escaped out: nothing chosen, nothing to print
+    """A window of one conversation, verbatim, with a model-written timeline
+    sliced under each of your turns.
+
+    Bare: the session you are in, from the turn after the last one the store
+    covers. `--full` takes the whole of it, `--session`/`--last`/`--file` name a
+    different one, `--from/--to` name the ends. Only a named session with no
+    ends asks."""
+    named = bool(args.file or args.last or args.session or args.ref)
+    if args.here or (not named and not args.full and not (args.from_ and args.to)):
+        return _recap_since_last(args)
+
+    picked = None
+    if named or args.full:
+        path = _recap_target(args)
+    else:
+        # Ends given for the session you are in.
+        path = live_transcript()
+    # `--last` names a whole conversation, the way `chsum last` did; only
+    # `--session`/a bare ref leaves the ends open for the picker.
+    whole = args.full or (args.last and not (args.from_ and args.to))
+    if not (whole or (args.from_ and args.to)):
+        # A named session with no ends: the picker, as before.
+        verdict, picked = _run_wizard(args)
+        if verdict == "quit":
+            return 0  # you escaped out: nothing chosen, nothing to print
     if picked:
         path, start, end = picked
         turns = _your_turns(path)
     else:
-        path = pathlib.Path(args.file) if args.file else (
-            path_for_ref(args.ref) if args.ref else _pick_transcript(live_only=False))
         turns = _your_turns(path)
         if not turns:
             raise SystemExit("nothing typed in that conversation — no turns to pick from")
-        start, end = _pick_range(turns, args)
+        if whole:
+            start, end = turns[0], turns[-1]
+        else:
+            start, end = _pick_range(turns, args)
     _status("reading the transcript…")
     meta = extract_meta(path)
     # The end turn bounds the window; the turns strictly between the two are
@@ -4588,33 +4638,49 @@ def cmd_recap(args) -> int:
     # window and the last turn of the file are equal objects and never the same one.
     until = "" if end == turns[-1] else end.when
     # The interactively-picked range as flags, or the range can't be typed again.
-    TRACE.reproduce(f"chsum recap {ch_ref_for_path(path)} "
+    TRACE.reproduce(f"chsum recap --session {ch_ref_for_path(path)} "
                     f"--from {turns.index(start) + 1} --to {turns.index(end) + 1}")
     TRACE.step("cmd_recap", turns=len(turns), start_turn=turns.index(start) + 1,
                end_turn=turns.index(end) + 1, start_line=start.line,
                until=until or "(end of session)", inner=len(inner),
-               picked_by="wizard" if picked else "flags/prompt")
+               picked_by="wizard" if picked else ("whole session" if whole else "flags"))
     return _render_window(path, meta, start.line, start.when, start.text,
                           until, args, inner, live=False, anchor_uuid=start.uuid)
 
 
-def cmd_last(args) -> int:
-    if args.here:
-        return cmd_catchup(args)
-    # There is no model call on this path, so there is nothing to not-make: say
-    # so rather than accepting the flag and silently ignoring it.
-    if getattr(args, "dry_run", False):
-        raise SystemExit("--dry-run only means something with --here "
-                         "(nothing else in `last` calls a model)")
-    args.file = str(latest_transcript(local=not args.all, nth=args.nth))
-    args.ref = None
-    return cmd_context(args)
+def _recap_since_last(args) -> int:
+    """`chsum recap` with nothing else: the session you are in, from the turn
+    after the last one the store covers. No picker — the window is already
+    decided, and asking would be asking a question with one answer."""
+    # `_pick_transcript` asks when several sessions are live and falls back to
+    # `live_transcript` off a tty — the behaviour `cmd_catchup` had here.
+    path = _pick_transcript()
+    turns = _your_turns(path)
+    if not turns:
+        raise SystemExit("nothing typed in this conversation yet — no turns to recap")
+    first_new = _recap_start(path, turns)
+    if first_new is None:
+        print(f"nothing new since the last recap ({_plural(len(turns), 'turn')} "
+              f"already covered) — `chsum recap --full` for the whole session",
+              file=sys.stderr)
+        return 0
+    start, end = turns[first_new], turns[-1]
+    _status("reading the transcript…")
+    meta = extract_meta(path)
+    inner = [t for t in turns if start.when < t.when <= end.when]
+    TRACE.reproduce(f"chsum recap {ch_ref_for_path(path)} "
+                    f"--from {first_new + 1} --to {len(turns)}")
+    TRACE.step("_recap_since_last", turns=len(turns), start_turn=first_new + 1,
+               covered=first_new)
+    # The last turn bounds the window by nothing: its own work is what follows it.
+    return _render_window(path, meta, start.line, start.when, start.text,
+                          "", args, inner, live=False, anchor_uuid=start.uuid)
 
 
 def cmd_sessions(args) -> int:
     """One line per conversation, newest first. Triage: which were real work.
     Empty sessions are listed, not hidden, and so is the one running right now
-    (tagged) — `last` skips that one, since you're already in it."""
+    (tagged) — `--last` skips that one, since you're already in it."""
     cutoff = _parse_since(args.since) if args.since else None
     live = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     metas = []
@@ -4692,7 +4758,7 @@ def cmd_sessions(args) -> int:
                 print(_dim(f"      {line}"))
         print()
     sys.stdout.flush()
-    print("Read one: `chsum context <ref>`   Most recent real session: `chsum last`",
+    print("Read one: `chsum context <ref>`   Most recent real session: `chsum context --last`",
           file=sys.stderr)
     return 0
 
@@ -4934,7 +5000,7 @@ def main(argv=None) -> int:
         prog="chsum",
         description="Work logs and reload-ready context from Claude Code conversations. "
                     "Deterministic: nothing invented. The one model-written section "
-                    "(`last --here`'s timeline) is labelled as such.",
+                    "(`recap`'s timeline) is labelled as such.",
     )
     ap.add_argument("--out", type=pathlib.Path, default=DIGEST_DIR,
                     help=f"digest directory (default: {DIGEST_DIR})")
@@ -4954,18 +5020,6 @@ def main(argv=None) -> int:
     p.add_argument("--all", action="store_true", help="all projects (default: this one)")
     p.set_defaults(func=cmd_sessions)
 
-    p = sub.add_parser("last", parents=[dbg], help="context for your most recent conversation")
-    p.add_argument("-n", "--nth", type=int, default=1, metavar="N",
-                   help="Nth most recent instead of the last (default: 1)")
-    p.add_argument("--all", action="store_true", help="all projects (default: this one)")
-    p.add_argument("--here", action="store_true",
-                   help="the session running right now: what has happened since "
-                        "your last prompt, ending in a model-written timeline")
-    p.add_argument("--dry-run", action="store_true",
-                   help="with --here: print the verbatim record and a size "
-                        "breakdown of what would be sent, and make no model call")
-    p.set_defaults(func=cmd_last)
-
     p = sub.add_parser("find", parents=[dbg], help="search conversations")
     p.add_argument("query", nargs="?")
     p.add_argument("--all", action="store_true", help="all workspaces (default: this one)")
@@ -4976,8 +5030,19 @@ def main(argv=None) -> int:
         p.add_argument(f"--{mode}", dest="mode", action="store_const", const=mode)
     p.set_defaults(mode="hybrid", func=cmd_find)
 
-    p = sub.add_parser("recap", parents=[dbg], help="summarise a chosen range of one conversation")
-    p.add_argument("ref", nargs="?", help="ch_... ref (default: pick a session)")
+    p = sub.add_parser("recap", parents=[dbg],
+                       help="summarise this session since the last recap, or a chosen range")
+    p.add_argument("ref", nargs="?", help="ch_... ref (same as --session)")
+    p.add_argument("--session", metavar="REF",
+                   help="recap this conversation instead of the one you're in")
+    p.add_argument("--last", action="store_true",
+                   help="the most recent conversation that isn't this one")
+    p.add_argument("--full", action="store_true",
+                   help="the whole session, not just since the last recap")
+    p.add_argument("--all", action="store_true",
+                   help="with --last: all projects (default: this one)")
+    # The old spelling. `recap` with no arguments is now what this meant.
+    p.add_argument("--here", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--file", help="transcript path")
     p.add_argument("--from", dest="from_", type=int, default=0, metavar="N",
                    help="start at your Nth turn (default: ask)")
@@ -4997,6 +5062,12 @@ def main(argv=None) -> int:
     p.add_argument("ref", nargs="?", help="ch_... ref from `chsum find`")
     p.add_argument("--file", help="transcript path (derives the ref)")
     p.add_argument("--stdout", action="store_true", help="print instead of writing a file")
+    p.add_argument("--last", action="store_true",
+                   help="the most recent conversation that isn't this one")
+    p.add_argument("-n", "--nth", type=int, default=1, metavar="N",
+                   help="with --last: Nth most recent instead of the last (default: 1)")
+    p.add_argument("--all", action="store_true",
+                   help="with --last: all projects (default: this one)")
     p.add_argument("--messages", action="store_true",
                    help="every message in order, unfiltered, each locating its record")
     p.add_argument("--tools", action="store_true",
@@ -5009,6 +5080,12 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("context", parents=[dbg], help="reload artifact for pasting back into Claude")
     p.add_argument("ref", nargs="?")
+    p.add_argument("--last", action="store_true",
+                   help="the most recent conversation that isn't this one")
+    p.add_argument("-n", "--nth", type=int, default=1, metavar="N",
+                   help="with --last: Nth most recent instead of the last (default: 1)")
+    p.add_argument("--all", action="store_true",
+                   help="with --last: all projects (default: this one)")
     p.add_argument("--file")
     p.set_defaults(func=cmd_context)
 
@@ -5020,7 +5097,7 @@ def main(argv=None) -> int:
     )
     p.add_argument("reason", nargs="*", help="why this matters — quoted verbatim later")
     p.add_argument("--at", metavar="ID",
-                   help="mark an earlier message: a record id from --recent, or mN")
+                   help="mark an earlier message: a record id from --recent, or a row number")
     p.add_argument("--match", metavar="TEXT",
                    help="mark the one message containing TEXT; lists candidates if "
                         "more than one matches")
@@ -5070,8 +5147,10 @@ def main(argv=None) -> int:
     if not any(tok in sub.choices or tok in ("-h", "--help") for tok in raw):
         raw = ["sessions"] + raw
     args = ap.parse_args(raw)
-    if args.cmd in ("digest", "context") and not args.ref and not args.file:
-        ap.error(f"{args.cmd}: need a ch_... ref or --file")
+    # `--file` is consumed by the live-session fallback, so record whether the
+    # caller gave one before that happens: it decides print-vs-write.
+    if args.cmd == "digest":
+        args.file_given = bool(args.file)
 
     # Reset, not just enable: `main()` is callable more than once in a process
     # (tests do), and a second run must not inherit the first one's files.
