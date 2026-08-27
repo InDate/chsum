@@ -4817,6 +4817,11 @@ consecutive run of recorded events — assistant messages, tool calls, file
 edits (with the edited text), commands and the tail of their output, subagent
 activity — oldest first.
 
+Who did what, by event kind. `said:`, `ran:`, `edit:`, `tool:`, `output:`,
+`failed:` and `spawn:` are all Claude's own work. Only two kinds are the
+user's: `you:` is something the user typed, and `command:` is a slash command
+the user ran. An event tagged `agent <id>` is a subagent Claude spawned.
+
 Write a plain-language account of what happened in this slice, for someone
 who stepped away from the screen and is coming back to it. Markdown bullet
 list, oldest first.
@@ -4837,6 +4842,9 @@ How to write it:
 Hard rules:
 - State only what the extract shows. If it is not in the extract, it does not
   go in the account.
+- Attribute by the kinds above. Claude ran the commands and made the edits:
+  write "Claude ran …" or leave the subject out ("the file was rewritten").
+  Never "the user ran" for a `ran:`, `edit:` or `tool:` event.
 - Report outcomes only as recorded ("pytest printed 4 passed"), never as a
   judgement ("successfully", "correctly", "works").
 - No opinions, no advice, no closing summary, and no guesses about intent
