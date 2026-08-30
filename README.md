@@ -120,7 +120,10 @@ chsum digest <ch_ref>                          # write a digest file
 chsum digest <ch_ref> --stdout                 # print it instead
 chsum digest --file path/to/session.jsonl      # address by file
 chsum digest <ch_ref> --commands               # every Bash call in order, unfiltered
-chsum digest <ch_ref> --command <id>           # one of them whole, with its output
+chsum digest <ch_ref> --call <id>              # one of them whole, with its output
+chsum digest <ch_ref> --agents                 # every subagent and what it reported back
+chsum digest <ch_ref> --messages -3 -1         # your last three turns, printed whole
+chsum digest --last -1                         # the previous session's last turn
 chsum context <ch_ref>                         # reload artifact, for pasting into Claude
 chsum context <ch_ref>/<agent-id>              # one subagent's own digest
 chsum journal --since 7d                       # work log for this project
@@ -534,6 +537,36 @@ name, and the first line of the text — in timestamp order across the transcrip
 and its sidecars, with nothing filtered, deduplicated or collapsed. An agent ref
 (`<ref>/<agent-id>`) narrows any of them to that sidecar. `--call <id>` prints one
 tool call and its captured output whole.
+
+One or two numbers beside any of the three narrow it to a window of your turns
+and print those rows whole, so a stretch of conversation reads without leaving
+chsum. A turn is one thing you typed — or one answer you picked from the question
+tool — together with everything that followed it up to your next turn. `1` is
+your first and `-1` your last, one number names one turn and two name a run of
+them, both ends printed, and the pair resolves before it is ordered, so `2 -2`
+and `-2 2` name the same window:
+
+```
+chsum digest --last -1              # your last turn, and everything after it
+chsum digest <ch_ref> 10 11         # your 10th and 11th turns
+chsum digest <ch_ref> --tools -5 -1 # what Claude called across your last five
+```
+
+Inside a window the rows a view steps over are listed rather than skipped
+silently, one line each with its own locator, so a jump from `2500` to `2513`
+reads as:
+
+```
+*⋯ 4 rows not in this view*
+  - `dc215bdd:2503` — thinking
+  - `dc215bdd:2504` — Bash, result 319 chars
+  - `dc215bdd:2508` — Bash, result 536 chars
+  - `dc215bdd:2512` — thinking
+```
+
+A tool call carries its tool and the size of what it returned, and its result row
+folds into it. A `thinking` row is named and nothing more — the JSONL keeps its
+signature and drops the text. Harness bookkeeping rows are left out.
 
 A `## Sources` block at the top expands every locator to a full path and gives a
 worked `sed` line, so a row reaches its raw record without chsum:

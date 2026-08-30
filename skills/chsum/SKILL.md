@@ -26,6 +26,8 @@ on as fact.
 | `chsum digest <ref> --messages` | Every message in order, each locating its own record |
 | `chsum digest <ref> --tools` | Every tool call in order, unfiltered |
 | `chsum digest <ref> --call <id>` | One tool call whole, with its captured output |
+| `chsum digest <ref> --agents` | Every subagent and each report it sent back, numbered where one returned more than once |
+| `chsum digest <ref> -3 -1` | A window of your turns, rows printed whole — `1` your first, `-1` your last, one number one turn, two a range; `--tools`/`--commands` take the same numbers |
 | `chsum journal --since 7d` | Chronological work log across sessions |
 | `chsum recap <ref> --from N --to M` | Reload a specific turn range from a past session |
 | `chsum recap --last` | Recap the most recent session that isn't this one, whole |

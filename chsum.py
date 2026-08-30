@@ -17,6 +17,7 @@ import contextlib
 import curses
 import hashlib
 import importlib.metadata
+import html
 import json
 import os
 import pathlib
@@ -1798,6 +1799,7 @@ class _Row:
     label: str  # role for a message, tool name for a call
     line: int = 0  # 1-based row of the record holding it, in `source`
     source: pathlib.Path | None = None  # the file that row is in
+    starts_turn: bool = False  # a turn of yours opens here; agents' rows never do
 
 
 # What each flag selects. A Bash call is its own kind rather than a filter applied
@@ -1837,6 +1839,8 @@ def collect_rows(path: pathlib.Path, kinds: tuple[str, ...],
         # A body a tool loaded is not a message, the same guard every other reader
         # here carries; the call that loaded it is a `tool` row instead.
         command_ids = _command_prompt_ids([r for _, r in parsed])
+        names = _tool_names([r for _, r in parsed])
+        sidecars = _sidecar_ids(path)
         for lineno, rec in parsed:
             role = rec.get("type")
             if role not in ("user", "assistant"):
@@ -1867,8 +1871,27 @@ def collect_rows(path: pathlib.Path, kinds: tuple[str, ...],
             if role == "user" and _tool_injected(rec, command_ids):
                 continue
             text = "\n".join(t for t in texts if t.strip()).strip()
+            # An answer to the question tool carries its text in a structured
+            # field and none in the body, so the view dropped it and a window
+            # numbered by turns would skip the turn a menu choice settled.
+            answered = _answered(rec) if role == "user" else ""
+            if not text:
+                text = answered
+            starts = bool(not agent and role == "user"
+                          and not rec.get("isCompactSummary")
+                          and (answered or is_typed_prompt(text)))
+            returned = ""
+            if role == "user" and text.lstrip().startswith("<task-notification>"):
+                aid = _agent_return(text, names, sidecars)
+                got = _task_fields(text)
+                via = names.get(got["tool-use-id"], "")
+                returned = (f"agent {aid} returned" if aid
+                            else f"{via or 'task'} {got['task-id'] or '?'} finished")
+                text = _report_text(text)
+                starts = False
             if text:
-                out.append(_Row(ts, agent, "message", "", text, role, lineno, src))
+                out.append(_Row(ts, agent, "message", "", text,
+                                returned or role, lineno, src, starts))
     # A parent's line numbers and a sidecar's don't order against each other;
     # only a clock does. Same reason `mark_sources`' readers sort by timestamp.
     out.sort(key=lambda r: r.when)
@@ -1886,6 +1909,187 @@ def _locator(row: _Row, session: str) -> str:
     return f"{who}:{row.line}"
 
 
+# `.message.content` is a string on a typed record and a list of parts on every
+# other, so reading it raw returns text for one and JSON for the other. This
+# takes the text where there is text and the part's kind where there is none,
+# which is what the rows and the gap notes already print.
+_STRETCH_JQ = ('jq -r \'if (.message.content|type)=="string" '
+               'then .message.content '
+               'else [.message.content[]? | .text // .name // .type] '
+               '| join("\\n") end\'')
+
+
+# A report is clipped to what a typed turn gets: the whole text sits one row away.
+_REPORT_CLIP = 2000
+_REPORT_HINT = "sed the row named beside it"
+_TASK_FIELD_RE = {
+    f: re.compile(rf"<{f}>(.*?)</{f}>", re.DOTALL)
+    for f in ("task-id", "tool-use-id", "status", "summary", "result")
+}
+# A background command notifies through the same record as a subagent. The call
+# the notification names is what separates them; the summary's wording is not.
+_AGENT_TOOLS = ("Agent", "Task")
+
+
+def _tool_names(parsed) -> dict[str, str]:
+    """`tool_use` id to the tool that made the call."""
+    names: dict[str, str] = {}
+    for rec in parsed:
+        content = (rec.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "tool_use":
+                names[str(part.get("id") or "")] = str(part.get("name") or "")
+    return names
+
+
+def _task_fields(text: str) -> dict[str, str]:
+    return {f: (m.group(1).strip() if (m := r.search(text)) else "")
+            for f, r in _TASK_FIELD_RE.items()}
+
+
+def _unescaped(text: str) -> str:
+    """A report body as the agent wrote it."""
+    return html.unescape(text)
+
+
+def _agent_return(text: str, names: dict[str, str], sidecars: set[str]) -> str:
+    """The subagent a `<task-notification>` reports for, or "". A resumed agent
+    notifies again with an empty `<tool-use-id>` — 3 of 5 such records measured —
+    so the sidecar carrying that task id is what identifies those, and the call
+    covers an agent whose sidecar was pruned."""
+    got = _task_fields(text)
+    if not got["task-id"]:
+        return ""
+    if got["task-id"] in sidecars or names.get(got["tool-use-id"]) in _AGENT_TOOLS:
+        return got["task-id"]
+    return ""
+
+
+def _sidecar_ids(path: pathlib.Path) -> set[str]:
+    """Every subagent this conversation has a transcript for."""
+    return {p.stem.removeprefix("agent-") for p in subagent_transcripts(path)}
+
+
+@dataclass(frozen=True)
+class _AgentReport:
+    """One return from a subagent. A notification fires each time an agent stops
+    and a resumed agent stops again, so one agent carries several of these."""
+    agent: str
+    when: str
+    line: int
+    status: str
+    summary: str
+    result: str
+
+
+def _agent_reports(path: pathlib.Path) -> list[_AgentReport]:
+    """Every subagent return recorded in a parent transcript, in order. The
+    `<task-notification>` record is where the report lands: an async agent's
+    `tool_result` carries launch metadata, not the work."""
+    out: list[_AgentReport] = []
+    names: dict[str, str] = {}
+    sidecars = _sidecar_ids(path)
+    for lineno, raw in enumerate(path.read_text(errors="replace").splitlines(), 1):
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        names.update(_tool_names([rec]))
+        content = (rec.get("message") or {}).get("content")
+        texts = ([content] if isinstance(content, str)
+                 else [p.get("text", "") for p in content
+                       if isinstance(p, dict) and p.get("type") == "text"]
+                 if isinstance(content, list) else [])
+        # A notification that was enqueued and removed before delivery leaves
+        # only the queue record, and the agent then reported with no message to
+        # show for it. Delivered copies win on the key below, so the queue record
+        # only ever supplies a report nothing else carries.
+        if rec.get("type") == "queue-operation" and rec.get("operation") == "enqueue":
+            body = rec.get("content")
+            texts = [body] if isinstance(body, str) else []
+        elif rec.get("type") != "user":
+            continue
+        for text in texts:
+            # Anchored at the start, and a task id required: a message *about*
+            # notifications reads back as one otherwise — a 52,293-char paste
+            # and an assistant message on the mechanism both matched a substring
+            # test, and every one of them collapsed into a single nameless agent.
+            if not text.lstrip().startswith("<task-notification>"):
+                continue
+            if not _agent_return(text, names, sidecars):
+                continue
+            got = _task_fields(text)
+            out.append((rec.get("type") == "user",
+                        _AgentReport(got["task-id"], str(rec.get("timestamp") or ""),
+                                     lineno, got["status"], got["summary"],
+                                     got["result"])))
+    kept: dict[tuple, _AgentReport] = {}
+    for delivered, rep in out:
+        key = (rep.agent, rep.status, rep.result)
+        if delivered or key not in kept:
+            kept[key] = rep
+    reports = sorted(kept.values(), key=lambda r: r.line)
+    TRACE.step("_agent_reports", reports=len(reports), records=len(out),
+               agents=len({r.agent for r in reports}))
+    return reports
+
+
+def _report_text(text: str) -> str:
+    """The report out of a `<task-notification>`, clipped. Falls back to the
+    one-line summary where the notification carries no result."""
+    got = _task_fields(text)
+    body = html.unescape(got["result"] or got["summary"])
+    return _clip(body, _REPORT_CLIP, _REPORT_HINT) if body else text.strip()
+
+
+def render_agents(meta: Meta, ref: str, reports: list[_AgentReport],
+                  path: pathlib.Path) -> str:
+    """Every subagent the session ran, and every report each sent back."""
+    by: dict[str, list[_AgentReport]] = {}
+    for r in reports:
+        by.setdefault(r.agent, []).append(r)
+    known = [a.id for a in meta.agents]
+    ids = known + [a for a in by if a not in known]
+    out = [f"# Agents — {_plural(len(ids), 'subagent')}\n",
+           f"*{meta.title}*\n"]
+    if not ids:
+        out.append("*No subagents ran.*\n")
+        return "\n".join(out)
+    out.append(f"One agent's own digest: `chsum digest {ref}/<id> --stdout`  ·  "
+               f"its rows: `chsum digest {ref}/<id> --messages`\n")
+    for aid in ids:
+        run = next((a for a in meta.agents if a.id == aid), None)
+        bits = [b for b in ((f"{run.agent_type or 'agent'}"
+                             + (f"/{run.model}" if run.model else "")) if run else "",
+                            run.duration if run else "",
+                            (f"{_plural(len(run.edited), 'file')}, "
+                             f"{_plural(len(run.commands), 'command')}") if run else "",
+                            f"depth {run.spawn_depth}"
+                            if run and run.spawn_depth > 1 else "") if b]
+        out.append(f"\n## `{aid}`\n")
+        if bits:
+            out.append(f"*{' · '.join(bits)}*\n")
+        if run and run.description:
+            out.append(f"{run.description}\n")
+        runs = by.get(aid, [])
+        if not runs:
+            out.append("*No report recorded.*\n")
+            continue
+        for i, rep in enumerate(runs, 1):
+            head = f"`{meta.uuid[:8]}:{rep.line}`  {_hhmmss(rep.when)}"
+            if len(runs) > 1:
+                head = f"**Return {i} of {len(runs)}** — {head}"
+            out.append(f"{head}  ·  {rep.status or 'status not recorded'}\n")
+            body = _unescaped(rep.result or rep.summary)
+            out.append(_quote(_clip(body, _REPORT_CLIP, _REPORT_HINT)) + "\n"
+                       if body else "*Nothing recorded.*\n")
+    return "\n".join(out)
+
+
 def _sources_block(rows: list[_Row], session: str) -> list[str]:
     """Full path per source, a `sed` line, and the loop that reads a stretch. The
     locator on a row is short enough to read across hundreds of rows; the path it
@@ -1901,7 +2105,7 @@ def _sources_block(rows: list[_Row], session: str) -> list[str]:
             + [f"- `{k}` — `{p}`" for k, p in seen.items()]
             + [f"\nOne record: `sed -n '{first.line}p' {first.source} | jq`",
                "A stretch: `for l in " + some + "; do sed -n \"${l}p\" "
-               f"{first.source} | jq -r '.message.content'; done`\n"])
+               f"{first.source} | {_STRETCH_JQ}; done`\n"])
 
 
 def find_row(path: pathlib.Path, spec: str) -> tuple[_Row, str]:
@@ -1943,34 +2147,251 @@ def find_row(path: pathlib.Path, spec: str) -> tuple[_Row, str]:
     return row, out
 
 
-def render_rows(meta: Meta, ref: str, rows: list[_Row], what: str) -> str:
-    """One line per row. A call's first line, not a flattened clip: a heredoc
+_INDEX_RE = re.compile(r"-?\d+$")
+
+
+def _split_spec(values: list[str]) -> tuple[str, list[int]]:
+    """A ref and turn numbers off one positional, separated by shape — a ref
+    starts `ch_`, a turn number is digits. `ref` at `nargs="?"` swallows a
+    bare `-1` instead of leaving it to the window."""
+    refs = [v for v in values if not _INDEX_RE.match(v)]
+    nums = [int(v) for v in values if _INDEX_RE.match(v)]
+    if len(refs) > 1:
+        raise SystemExit(f"one conversation at a time: {' '.join(refs)}")
+    if len(nums) > 2:
+        raise SystemExit(f"a turn window takes one number or two, not {len(nums)}")
+    return (refs[0] if refs else ""), nums
+
+
+@dataclass(frozen=True)
+class _Window:
+    """A turn window: the turns it names and the rows it spans. The bounds are
+    what a gap note measures against — a view holding only calls starts and ends
+    inside the span rather than on it."""
+    lo: int  # first turn of yours, 1-based
+    hi: int  # last turn of yours, 1-based
+    turns: int  # turns of yours in the whole conversation
+    nums: list[int]  # what was asked for, verbatim
+    first_line: int = 0  # row the window opens on
+    last_line: int = 0  # row it closes on; 0 where the next turn sits elsewhere
+    to_end: bool = False  # the window runs to the end of the conversation
+    # Both bounds are rows of one file. A parent's line numbers and a sidecar's
+    # do not order against each other, so each carries the file it counts in.
+    first_source: pathlib.Path | None = None
+    last_source: pathlib.Path | None = None
+
+
+def _turn_anchors(rows: list[_Row]) -> list[int]:
+    """Where each turn of yours opens, as positions in `rows`."""
+    return [i for i, r in enumerate(rows) if r.starts_turn]
+
+
+def _resolve_span(anchors: list[int], nums: list[int],
+                  total: int) -> tuple[int, int, int, int]:
+    """Signed 1-based turn numbers to a half-open row range and the turns it
+    covers. Each number resolves to a turn before the pair is ordered, so `2 -2`
+    and `-2 2` name one range; an index past either end clamps, and the header
+    then states what printed rather than the run failing."""
+    n = len(anchors)
+    ords = []
+    for v in nums:
+        if v == 0:
+            raise SystemExit("turn numbers are 1-based: 1 is your first turn, "
+                             "-1 your last")
+        i = v - 1 if v > 0 else n + v
+        ords.append(min(max(i, 0), n - 1))
+    lo, hi = min(ords), max(ords)
+    # The window runs to where your next turn opens; past the last turn it runs
+    # to the end of the conversation, which is that turn's own work.
+    stop = anchors[hi + 1] if hi + 1 < n else total
+    return anchors[lo], stop, lo + 1, hi + 1
+
+
+def _span_rows(rows: list[_Row],
+               nums: list[int]) -> tuple[list[_Row], _Window]:
+    """The rows a turn window covers, and the turns it names."""
+    anchors = _turn_anchors(rows)
+    if not anchors:
+        raise SystemExit("no turns of yours here — drop the numbers for the "
+                         "whole list")
+    start, stop, lo, hi = _resolve_span(anchors, nums, len(rows))
+    TRACE.step("_span_rows", turns=len(anchors),
+               asked=" ".join(str(v) for v in nums),
+               window=f"{lo}..{hi}", rows=f"{start}..{stop}")
+    # The far bound only names a row where the next turn sits in the same file;
+    # a parent's line numbers and a sidecar's do not order against each other.
+    last = 0
+    if start < stop < len(rows) and rows[stop].source == rows[stop - 1].source:
+        last = rows[stop].line - 1
+    return rows[start:stop], _Window(lo, hi, len(anchors), nums,
+                                     rows[start].line, last, stop >= len(rows),
+                                     rows[start].source,
+                                     rows[stop - 1].source if start < stop else None)
+
+
+@dataclass(frozen=True)
+class _Skipped:
+    """One row a view stepped over. `call` and `answers` pair a tool call with
+    its result, so the pair prints once rather than twice."""
+    line: int
+    label: str
+    call: str = ""  # the `tool_use` id this row carries
+    answers: str = ""  # the `tool_use` id this row answers
+
+
+def _result_chars(rec: dict) -> tuple[str, int]:
+    """The `tool_use` a record answers and how much it returned."""
+    content = (rec.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return "", 0
+    for part in content:
+        if not (isinstance(part, dict) and part.get("type") == "tool_result"):
+            continue
+        body = part.get("content")
+        if isinstance(body, list):
+            body = "".join(b.get("text", "") for b in body
+                           if isinstance(b, dict) and b.get("type") == "text")
+        return str(part.get("tool_use_id") or ""), len(body if isinstance(body, str) else "")
+    return "", 0
+
+
+def _skipped_rows(path: pathlib.Path) -> dict[int, _Skipped]:
+    """Every row of a transcript that a view can step over, labelled. Results are
+    sized on the same walk: a call's row is where its output is reached from, and
+    the length is what says whether reaching for it is worth it."""
+    parsed: list[tuple[int, dict]] = []
+    sizes: dict[str, int] = {}
+    for lineno, raw in enumerate(path.read_text(errors="replace").splitlines(), 1):
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        parsed.append((lineno, rec))
+        answers, chars = _result_chars(rec)
+        if answers:
+            sizes[answers] = chars
+    out: dict[int, _Skipped] = {}
+    for lineno, rec in parsed:
+        content = (rec.get("message") or {}).get("content")
+        parts = ([p for p in content if isinstance(p, dict)]
+                 if isinstance(content, list) else [])
+        calls = [p for p in parts if p.get("type") == "tool_use"]
+        if calls:
+            first = str(calls[0].get("id") or "")
+            names = ", ".join(str(c.get("name") or "?") for c in calls)
+            chars = sizes.get(first)
+            label = (f"{names}, result {chars:,} chars" if chars is not None
+                     else f"{names}, no result recorded")
+            out[lineno] = _Skipped(lineno, label, call=first)
+            continue
+        answers, chars = _result_chars(rec)
+        if answers:
+            out[lineno] = _Skipped(lineno, f"tool result, {chars:,} chars",
+                                   answers=answers)
+            continue
+        # `thinking` names the row and nothing else: the JSONL keeps the
+        # signature and drops the text.
+        if any(p.get("type") == "thinking" for p in parts):
+            out[lineno] = _Skipped(lineno, "thinking")
+            continue
+        kind = str(rec.get("type") or "record")
+        # Harness bookkeeping written beside the conversation, not part of it.
+        if kind != "attachment":
+            out[lineno] = _Skipped(lineno, kind)
+    return out
+
+
+def _gap_note(skipped: dict[int, _Skipped], session: str, agent: str,
+              lo: int, hi: int) -> list[str]:
+    """One line per row a view stepped over, each carrying its own locator."""
+    rows = [skipped[n] for n in range(lo, hi + 1) if n in skipped]
+    calls = {r.call for r in rows if r.call}
+    rows = [r for r in rows if not (r.answers and r.answers in calls)]
+    if not rows:
+        return []
+    who = f"{session[:8]}/{agent[:8]}" if agent else session[:8]
+    return ([f"\n*⋯ {_plural(len(rows), 'row')} not in this view*"]
+            + [f"  - `{who}:{r.line}` — {r.label}" for r in rows] + [""])
+
+
+def render_rows(meta: Meta, ref: str, rows: list[_Row], what: str,
+                window: _Window | None = None) -> str:
+    """One line per row, or every row whole where a turn window narrowed them —
+    a reader who named a window asked for what a single clipped line cannot hold.
+    A call's first line, not a flattened clip: a heredoc
     squashed onto one line is 120 chars of its own source, where `python3 - <<'PY'`
     identifies it at a glance. The whole text sits one `sed` away, which is what
     the locator on each row is for."""
     _, agent_id = _split_agent_ref(ref)
     # The scope is stated, not inferred from whether the locators carry an agent
     # part: a session whose agents ran nothing renders identically to one scoped away.
-    scope = (f"Every {what[:-1]} row in subagent `{agent_id}`."
-             if agent_id else f"Every {what[:-1]} row in this conversation, its own and its agents'.")
+    scope = (f"Subagent `{agent_id}` only." if agent_id
+             else "This conversation and its subagents.")
     out = [f"# {what.capitalize()} — {_plural(len(rows), 'row')}, in order\n",
            f"*{meta.title}*\n",
-           f"*{scope}",
-           "Nothing is filtered, deduplicated or clipped away here — the digest's",
-           "own sections do all three; this section does none.*\n"]
+           f"*{scope}*\n"]
+    if window:
+        which = (f"turn {window.lo}" if window.lo == window.hi
+                 else f"turns {window.lo}–{window.hi}")
+        asked = " ".join(str(v) for v in window.nums)
+        out.append(f"*{asked} — your {which} of {window.turns}.*\n")
     if not rows:
-        out.append(f"*No {what} recorded.*\n")
+        out.append(f"*No {what} in this window.*\n" if window
+                   else f"*No {what} recorded.*\n")
         return "\n".join(out)
     out += _sources_block(rows, meta.uuid)
+    # Only inside a window: unwindowed, a whole session's gaps are hundreds of
+    # lines and the view is a list rather than a stretch being read.
+    kinds: dict[pathlib.Path, dict[int, _Skipped]] = {}
+    seen: dict[pathlib.Path, int] = {}  # last printed row, per file
+    prev: _Row | None = None
     day = ""
     for r in rows:
         if r.when[:10] != day:
             day = r.when[:10]
             out.append(f"\n## {day}\n")
+        if window and r.source is not None:
+            # Per file, not per printed row: rows interleave from the parent and
+            # its sidecars by timestamp, and two files' line numbers do not order
+            # against each other. A file's own last printed row is what the next
+            # row of that file measures back to. The window's opening bound is
+            # known for one file only, so the others start at their first row.
+            last = seen.get(r.source)
+            since = (last + 1 if last is not None
+                     else window.first_line if r.source == window.first_source
+                     else 0)
+            if since and r.line > since:
+                if r.source not in kinds:
+                    kinds[r.source] = _skipped_rows(r.source)
+                out += _gap_note(kinds[r.source], meta.uuid, r.agent,
+                                 since, r.line - 1)
+            seen[r.source] = r.line
+        prev = r
         ident = f"`{_short_id(r.tool_id)}`  " if r.tool_id else ""
+        if window:
+            # Blockquoted, not fenced: text carrying a fence would close the
+            # block and forge document structure below it.
+            out.append(f"\n- {ident}`{_locator(r, meta.uuid)}`  "
+                       f"{_hhmmss(r.when)}  {r.label}\n")
+            out.append(_quote(r.text))
+            continue
         first = next(iter(r.text.splitlines()), "")
         out.append(f"- {ident}`{_locator(r, meta.uuid)}`  {_hhmmss(r.when)}  "
                    f"{r.label}  `{_clip_line(first, 120)}`")
+    # The window runs past its last printed row to where your next turn opens.
+    if window and prev is not None and prev.source is not None \
+            and prev.source == window.last_source \
+            and (window.last_line or window.to_end):
+        if prev.source not in kinds:
+            kinds[prev.source] = _skipped_rows(prev.source)
+        # A window ending on the last turn is bounded by the file, not by a next
+        # turn: that turn's own work is everything that follows it.
+        bound = window.last_line or max(kinds[prev.source] or [0])
+        if prev.line < bound:
+            out += _gap_note(kinds[prev.source], meta.uuid, prev.agent,
+                             prev.line + 1, bound)
     if any(r.tool_id for r in rows):
         out.append(f"\nOne call whole, with its output: `chsum digest {ref} --call <id>`\n")
     return "\n".join(out)
@@ -2019,8 +2440,32 @@ def _resolve_or_live(args) -> str:
 
 
 def cmd_digest(args) -> int:
+    # One view at a time, stated: two flags together printed the first and
+    # dropped the second along with any numbers attached to it.
+    picked = [f"--{k}" for k in _ROW_KINDS if getattr(args, k, None) is not None]
+    picked += ["--agents"] if args.agents is not None else []
+    picked += ["--call"] if args.call else []
+    if len(picked) > 1:
+        raise SystemExit(f"one view at a time: {' '.join(picked)}")
+    if args.call and _split_spec(list(args.spec))[1]:
+        raise SystemExit("--call names one row and takes no turn numbers")
+    view = next((k for k in _ROW_KINDS if getattr(args, k, None) is not None), "")
+    args.ref, span = _split_spec(list(args.spec)
+                                 + (list(getattr(args, view)) if view else []))
     ref = _resolve_or_live(args)
-    view = next((k for k in _ROW_KINDS if getattr(args, k, False)), "")
+    # Numbers on their own name a window of what was said, the view they are
+    # reached for; a flag beside them picks a different one.
+    if span and not view:
+        view = "messages"
+    if args.agents is not None:
+        if _split_spec(list(args.spec) + list(args.agents))[1]:
+            raise SystemExit("--agents covers the whole conversation and takes "
+                             "no turn numbers")
+        parent_ref, _ = _split_agent_ref(ref)
+        path = _parent_path(parent_ref)
+        sys.stdout.write(render_agents(extract_meta(path), parent_ref,
+                                       _agent_reports(path), path))
+        return 0
     if args.call or view:
         # Lookups reached from a hint in the digest, not artifacts to keep, so
         # they print where the digest itself writes a file.
@@ -2030,8 +2475,16 @@ def cmd_digest(args) -> int:
             row, out = find_row(path, args.call)
             sys.stdout.write(render_row_detail(row, out, ref))
             return 0
-        sys.stdout.write(render_rows(extract_meta(path), ref,
-                                     collect_rows(path, _ROW_KINDS[view], agent_id), view))
+        kinds = _ROW_KINDS[view]
+        # Turns are numbered off message rows, so a window over calls collects
+        # them to count against and drops them once the slice is taken.
+        wanted = tuple(dict.fromkeys(kinds + ("message",))) if span else kinds
+        rows = collect_rows(path, wanted, agent_id)
+        window = None
+        if span:
+            rows, window = _span_rows(rows, span)
+            rows = [r for r in rows if r.kind in kinds]
+        sys.stdout.write(render_rows(extract_meta(path), ref, rows, view, window))
         return 0
     meta, md = _digest_for(ref)
     # A no-argument command that silently writes a file is a surprise: the bare
@@ -3969,8 +4422,7 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
 
     if not events:
         _clear_status()
-        out("*Nothing recorded in that window — either it just started, or the "
-            "transcript hasn't caught up yet.*", flush=True)
+        out("*Nothing recorded in that window.*", flush=True)
         return 0
 
     edited, cmds, agents_seen = [], [], []
@@ -4172,8 +4624,8 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
     # off disk are a timeline, so a run that made no successful call still has one.
     attempted = [results[i] for i in pending]
     all_failed = bool(attempted) and all(err for *_, err in attempted) and not cached
-    unavailable = (f"*Timeline unavailable — {attempted[0][3]}. Everything above "
-                   "is still verbatim.*" if all_failed else "")
+    unavailable = (f"*Timeline unavailable — {attempted[0][3]}.*"
+                   if all_failed else "")
     errs = [err for *_, err in attempted if err]
     TRACE.step("_run_chunk", chunks=len(chunks), called=len(pending), workers=workers,
                from_store=len(cached), skipped=len(pending) - len(active),
@@ -4197,8 +4649,7 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
                 continue
             if err:
                 turn_bullets[idx].append(
-                    f"*Digest unavailable for part of this gap — {err}. The "
-                    "verbatim record above still covers it.*")
+                    f"*Digest unavailable for part of this gap — {err}.*")
             elif text:
                 turn_bullets[idx].extend(_chunk_bullets(text))
         # Computed, not model-narrated — prepended ahead of the bullets it sits
@@ -4213,8 +4664,7 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
         parts: list[str] = []
         for text, _, _, err in results:
             if err:
-                parts.append(f"*Digest unavailable for part of this window — {err}. "
-                             "The verbatim record above still covers it.*")
+                parts.append(f"*Digest unavailable for part of this window — {err}.*")
             elif text:
                 parts.extend(_chunk_bullets(text))
         written = "\n".join(parts)
@@ -5169,7 +5619,9 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_recap)
 
     p = sub.add_parser("digest", parents=[dbg], help="deterministic digest of one conversation")
-    p.add_argument("ref", nargs="?", help="ch_... ref from `chsum find`")
+    p.add_argument("spec", nargs="*", metavar="REF|N",
+                   help="ch_... ref from `chsum find`, and one or two turn "
+                        "numbers (1 your first, -1 your last)")
     p.add_argument("--file", help="transcript path (derives the ref)")
     p.add_argument("--stdout", action="store_true", help="print instead of writing a file")
     p.add_argument("--last", action="store_true",
@@ -5178,12 +5630,16 @@ def main(argv=None) -> int:
                    help="with --last: Nth most recent instead of the last (default: 1)")
     p.add_argument("--all", action="store_true",
                    help="with --last: all projects (default: this one)")
-    p.add_argument("--messages", action="store_true",
+    # The numbers sit on the flag as well as on `spec`: argparse fills one run
+    # of positionals, so `<ref> --messages -1` leaves the `-1` with nowhere to go.
+    p.add_argument("--messages", nargs="*", metavar="N",
                    help="every message in order, unfiltered, each locating its record")
-    p.add_argument("--tools", action="store_true",
+    p.add_argument("--tools", nargs="*", metavar="N",
                    help="every tool call in order, unfiltered")
-    p.add_argument("--commands", action="store_true",
+    p.add_argument("--commands", nargs="*", metavar="N",
                    help="every Bash invocation in order, unfiltered")
+    p.add_argument("--agents", nargs="*", metavar="",
+                   help="every subagent and each report it sent back")
     p.add_argument("--call", metavar="ID",
                    help="one tool call whole, with its output")
     p.set_defaults(func=cmd_digest)
