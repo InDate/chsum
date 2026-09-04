@@ -2,7 +2,7 @@
 name: chsum
 description: Recover whole past Claude Code sessions with the `chsum` CLI — list this project's sessions, digest one verbatim (prompts in order, files changed, commands run, where it left off), drill into a subagent's own work, or produce a work log across a time window. Use when the user refers to earlier work you don't have in context ("what did we do yesterday", "pick up where we left off", "which session touched this file"), or asks to reload a past session. For searching or quoting *inside* conversations, use the claude-history CLI directly.
 compatibility: Requires `chsum` on PATH (`pipx install chsum`) and `claude-history` for anything beyond the session listing.
-version: 2.1.0
+version: 2.2.0
 ---
 
 # chsum
@@ -32,9 +32,9 @@ on as fact.
 | `chsum recap <ref> --from N --to M` | Reload a specific turn range from a past session |
 | `chsum recap --last` | Recap the most recent session that isn't this one, whole |
 | `chsum recap --invalidate` | Summarise this window again, replacing what's stored for it |
-| `chsum mark "<reason>"` | Flag this moment as notable, for the digest |
-| `chsum mark --show <id>` | Where a mark landed: file, row, time, agent, message |
-| `chsum find --marks [query]` | What's been marked, across sessions |
+| `chsum note "<text>"` | Note this moment, for the digest and claude-history |
+| `chsum note --show <id>` | Where a note landed: file, row, time, agent, message |
+| `chsum find --notes [query]` | What's been noted, across sessions |
 | `chsum name "<title>"` | Rename this session; lead with a `ch_` ref to rename a past one |
 
 Scoped to the current project unless `--all`.
@@ -52,46 +52,50 @@ their behalf unless asked. Renaming the running session is the weakest case:
 Claude Code re-titles it as the conversation grows, so `/resume` may drift back
 even though chsum keeps yours.
 
-## Marking
+## Noting
 
-`chsum mark` records nothing itself — it prints a marker, and the harness's own
-recording of the run is what lands it in the transcript. So it only works when
-run *inside* a session: as `! chsum mark "…"` typed by the user, or as a normal
-Bash tool call by you. Ask before marking on the user's behalf; a mark is their
-judgement about what mattered, and it outranks everything else in the digest.
+`chsum note` files a note in chsum's own store against the message it follows,
+and prints nothing. Run it as `! chsum note "…"` typed by the user, or as a
+normal Bash tool call by you. Ask before noting on the user's behalf; a note is
+their judgement about what mattered, and it outranks everything else in the
+digest. `chsum annotate` and `chsum mark` are the same command.
 
-For something further back — "mark that bit about the sidecars":
+For something further back — "note that bit about the sidecars":
 
-- `chsum mark --match "<phrase from it>" "<reason>"` — matching ignores case,
+- `chsum note --match "<phrase from it>" "<text>"` — matching ignores case,
   punctuation, and markdown. Several matches and it lists candidates instead of
   guessing; pick one with `--at`.
-- `chsum mark --recent 20` lists the last 20 messages and tool calls with the
+- `chsum note --recent 20` lists the last 20 messages and tool calls with the
   record ids `--at` takes.
 
-`<reason>` is free text, copied verbatim into the digest — write the note you'd
+`<text>` is free text, copied verbatim into the digest — write the note you'd
 want to read cold months later, not a label.
 
-`chsum mark --list` shows this conversation's marks with ids (`--full` for the
-whole marked message); `--revoke <id>` drops one. Revoking is additive too — both records stay in the transcript, the
-mark just stops counting. Never revoke a mark the user made without being asked.
+`chsum note --list` shows this conversation's annotations with ids: the user's
+notes and the bullets `recap` wrote, tagged by kind (`--full` for the whole
+targeted message); `--delete <id>` removes one from the store. Never delete a
+note the user made without being asked.
 
-`chsum mark --show <id>` takes the same id and prints where the mark landed — the
-file, the row, the time, the agent, the `mN` where there is one — then the marked
-message whole with `--context N` records either side. Use it before writing any
-code that walks a transcript by hand: file and row are stamped into the mark as it
-is made, so this answers "where is this" without a search.
+`chsum note --show <id>` takes the same id and prints where it landed — the file,
+the row, the time, the agent — then the targeted message whole with `--context N`
+records either side. Use it before writing any code that walks a transcript by
+hand: file and row are stamped into the note as it is made, so this answers
+"where is this" without a search.
 
-Marks made by a subagent fold into the parent session, tagged `agent <id>` rather
-than an `mN`. Worth telling an agent to mark what it finds: its digest is thin,
-and a mark survives into the parent's.
+Notes made by a subagent fold into the parent session, tagged `agent <id>` with
+the row in that sidecar. Worth telling an agent to note what it finds: its digest
+is thin, and a note survives into the parent's.
 
-`--match`, `--recent` and a bare `chsum mark` search the running agents' work too,
-so something an agent just said is markable while it is still running. Those get
-`agent <id>` for the same reason — a sidecar has no `mN`.
+`--match`, `--recent` and a bare `chsum note` search the running agents' work too,
+so something an agent just said is notable while it is still running.
 
-The user can't type `! chsum mark` while addressing an agent — their text goes to
-the agent instead. So a moment worth keeping from an agent is marked either by the
+The user can't type `! chsum note` while addressing an agent — their text goes to
+the agent instead. So a moment worth keeping from an agent is noted either by the
 agent itself, or afterwards from the session with `--match "<phrase it said>"`.
+
+The same store is what claude-history reads and writes when it is registered as
+an annotator there (`chsum annotations`, in the README). A note typed in its
+viewer and one typed here are the same thing.
 
 ## Catching up
 
@@ -160,7 +164,7 @@ nudge again next session.
 
 Skip dead-end sessions: `1` prompt, `0` files, no agents. The header counts them.
 
-A digest gives frontmatter, then **Notable** if anything was marked (hand-picked,
+A digest gives frontmatter, then **Notable** if anything was noted (hand-picked,
 so read it first), the user's prompts verbatim in order (the intent trail —
 usually the most valuable part), files changed, commands run, delegated agents,
 and where it left off.

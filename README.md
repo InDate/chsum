@@ -79,15 +79,15 @@ and one symlink on `PATH`. `pipx install --editable .` while working on it.
 A real command rather than a shell alias, because an alias doesn't exist for
 scripts, hooks, or agents.
 
-### Marking while an agent is working
+### Noting while an agent is working
 
 `!` is not available while you are addressing an agent — what you type goes to the
 agent as a message, so there is no way to run the command yourself until you are
 back in the conversation. Two things do work:
 
-- Mark it afterwards, from the session: `chsum mark --match "<phrase the agent
+- Note it afterwards, from the session: `chsum note --match "<phrase the agent
   said>"` searches the sidecars too, so the agent's own words are addressable.
-- Ask the agent to mark it as it goes. That is a Bash call, which prompts, and a
+- Ask the agent to note it as it goes. That is a Bash call, which prompts, and a
   subagent has nobody watching to approve — so allow the command first, in
   `~/.claude/settings.json` or a project's `.claude/settings.local.json`:
 
@@ -95,9 +95,9 @@ back in the conversation. Two things do work:
 { "permissions": { "allow": ["Bash(chsum:*)"] } }
 ```
 
-The whole command, not just `mark`: everything chsum does is read transcripts you
-already have, and `digest`'s file lands in `~/.chsum/digests/`. Narrow it
-to `Bash(chsum mark:*)` if you'd rather approve the reading commands case by case.
+The whole command, not just `note`: everything chsum does is read transcripts you
+already have, and what it writes lands in `~/.chsum/`. Narrow it to
+`Bash(chsum note:*)` if you'd rather approve the reading commands case by case.
 
 The plugin can't set this for you — permissions come from settings files, and a
 plugin that allowlisted its own shell command would be granting itself something
@@ -128,10 +128,10 @@ chsum context <ch_ref>                         # reload artifact, for pasting in
 chsum context <ch_ref>/<agent-id>              # one subagent's own digest
 chsum journal --since 7d                       # work log for this project
 chsum journal --since 2w --all                 # across every project
-! chsum mark "this is the approach that worked"  # flag the moment as notable
-! chsum mark --recent 20                       # list recent messages, with ids
-! chsum mark --at 47dca7e9 "where it turned"   # mark an earlier message
-chsum find --marks                             # everything you've marked
+! chsum note "this is the approach that worked"  # note the moment
+! chsum note --recent 20                       # list recent messages, with ids
+! chsum note --at 47dca7e9 "where it turned"   # note an earlier message
+chsum find --notes                             # everything you've noted
 chsum name "what it actually was"              # rename the session you're in
 chsum name <ch_ref> "marks: design + build"    # rename a past one
 chsum name --list                              # everything you've renamed
@@ -140,7 +140,7 @@ chsum name --list                              # everything you've renamed
 Bare `chsum` lists the project's sessions, newest activity first:
 
 ```
-Thu 06 Aug 2026                        dur    prompts  files  agents  marks
+Thu 06 Aug 2026                        dur    prompts  files  agents  notes
   ch_c120431a267b202aebf0b38f6c3c1b69  5h38m  78       14     -       ⚑2
     ↳ Plan 3D house model from floor plan photographs
 
@@ -355,36 +355,36 @@ nobody wants to read.
 `<parent-ref>/<agent-id>` resolves to `<uuid>/subagents/agent-<id>.jsonl`. chsum's
 own scheme, not claude-history's — see *Notes on correctness*.
 
-### Marks
+### Notes
 
-`chsum mark` flags a moment while you're in it, so the digest says which part
-mattered — extraction can tell you what changed, not which of it was the point.
+`chsum note` files a note against the moment you're in, so the digest says which
+part mattered — extraction can tell you what changed, not which of it was the
+point. `chsum annotate` and `chsum mark` are the same command.
 
 ```sh
-! chsum mark "the shrinkwrap approach, after two dead ends"
+! chsum note "the shrinkwrap approach, after two dead ends"
 ```
 
-The `!` prefix is the mechanism, not decoration. chsum writes nothing: it prints
-a marker line, and Claude Code's own recording of the `!` run puts it in the
-transcript, at the point in the conversation where you typed it. So there is no
-second store to keep in sync, nothing injected into a file Claude Code is
-appending to, and the mark inherits an `mN` and a durable `ma_` anchor for free.
-Run outside a session it warns instead — there is nothing there to record it.
+It prints nothing. The note goes into chsum's own store (`~/.chsum/turns/`),
+filed under the turn of yours whose gap holds the message it points at, with
+the file, the row and the first line of that message stamped beside it. The
+transcript is never written to. Run outside a session it still files the note,
+against the newest transcript of this project.
 
-To mark something further back, list recent messages and name one:
+To note something further back, list recent messages and name one:
 
 ```sh
-! chsum mark --recent 20
+! chsum note --recent 20
 47dca7e9  06:27  you     can we make the digest quote the anchor instead
 be74e21f  06:40  claude  That collides — two messages with identical text share one anchor
 a27a1c9c  06:41  claude  Edit: chsum.py
 0b2f4db2  06:42  claude  Bash: python3 -m pytest -x
-! chsum mark --at be74e21f "the anchor collision, explained properly"
+! chsum note --at be74e21f "the anchor collision, explained properly"
 ```
 
 Everything that happened, in order: both sides' messages *and* every tool call,
-so you can mark the edit or the command rather than the sentence near it. Tool
-results are left out — a mark resolves to the message containing the action
+so you can note the edit or the command rather than the sentence near it. Tool
+results are left out — a note resolves to the message containing the action
 either way.
 
 Ids come from the transcript itself. `--at <line>` takes a bare row number too.
@@ -392,56 +392,75 @@ Ids come from the transcript itself. `--at <line>` takes a bare row number too.
 Or name the message by something it said:
 
 ```sh
-! chsum mark --match "worth knowing exactly where it dies" "the subagent gap"
+! chsum note --match "worth knowing exactly where it dies" "the subagent gap"
 ```
 
 Matching folds case, punctuation, and markdown away — `currently no` finds
-`Currently **no** —`, because nobody retypes the asterisks. Marks still quote the
+`Currently **no** —`, because nobody retypes the asterisks. Notes still quote the
 original bytes. If more than one message matches, chsum lists the candidates and
-marks nothing: asking to mark a phrase puts that phrase in your own prompt too,
-so "newest wins" would keep marking the request instead of its subject. `chsum
-mark`'s own calls and output are excluded from matching — its tool call is
-recorded before the command runs, so otherwise every search would find itself.
+files nothing: asking to note a phrase puts that phrase in your own prompt too,
+so "newest wins" would keep noting the request instead of its subject. `chsum
+note`'s own calls are excluded from matching — its tool call is recorded before
+the command runs, so otherwise every search would find itself.
 
-Marks show up as **Notable** at the top of the digest, verbatim, with the message
+Notes show up as **Notable** at the top of the digest, verbatim, with the message
 they point at; as a `⚑` count in the listing; inline in `journal`; and
-`chsum find --marks [query]` searches them across sessions.
+`chsum find --notes [query]` searches them across sessions.
 
-Marked something you'd rather not keep:
+Noted something you'd rather not keep:
 
 ```sh
-! chsum mark --list
-the subagent gap, stated plainly    dde43c3c
+! chsum note --list
+the subagent gap, stated plainly    dde43c3c#1  note
   ↳ Currently **no** — and worth knowing exactly where it dies.
 
-Testing                             32e8b253
+Testing                             dde43c3c#2  note
   ↳ Left in place — it records the state that prompted the change.
 
-! chsum mark --list --full          # whole reason, whole marked message
-! chsum mark --show dde43c3c        # where it landed, with what surrounds it
-! chsum mark --revoke 32e8b253      # takes several ids at once
+! chsum note --list --full            # whole text, whole targeted message
+! chsum note --show dde43c3c#1        # where it landed, with what surrounds it
+! chsum note --delete dde43c3c#2      # takes several ids at once
 ```
 
-Each mark shows its reason, its id, and the message it marks. A bare `chsum mark`
-points at the message it followed — its own output record says nothing about what
-you were marking.
+`--list` shows every annotation the store holds for this conversation: your
+notes, and the bullets `recap` wrote, each tagged by kind. An id is the turn's
+uuid and a number issued once — a bullet that `recap` rewrites takes a fresh
+number, and a note keeps its own, so an id you copied out still names the
+same text later. `--delete` removes the annotation from the store; deleting a
+recap bullet means the next recap of that turn prints without it.
 
 `--show` takes the same id and answers where: the file, the row in it, the time,
-the agent when the message is a subagent's, the row it sits on where the
-caught up, then the marked message whole and `--context N` records either side
-(3 by default). The location is stamped into the mark as it is made, so this is a
-lookup rather than a fresh search of the conversation and every sidecar. A stamp
-that disagrees with the record it names is discarded and the search runs anyway,
-which is what keeps an edited or rebuilt transcript from pointing somewhere wrong.
+the agent when the message is a subagent's, then the targeted message whole and
+`--context N` records either side (3 by default). It resolves across the
+project, so an id from any session of it works.
 
-A revocation is another line of output, same as a mark — nothing was written, so
-there is nothing to delete. Both records stay in the transcript; the mark simply
-stops counting everywhere marks are read.
+A subagent can note too. Its notes fold into the parent, like its edits and
+commands, tagged `agent <id>` with the row in that sidecar — sidecars' rows
+don't number against the parent's. Either side can delete the other's.
 
-A subagent can mark too. Its marks land in its own sidecar and fold into the
-parent, like its edits and commands, tagged `agent <id>` instead of an `mN` —
-sidecars have no ordinals or anchors to cite. Revocations cross that boundary in
-both directions: the parent can drop a mark its agent made, and vice versa.
+**Marks made before 2.2** were recorded as a marker line in the transcript.
+Nothing reads those any more; the transcripts keep them, and `claude-history`
+still finds their text as conversation.
+
+### claude-history
+
+The same store is what [claude-history](https://github.com/raine/claude-history)
+reads when it renders and searches annotations. Register chsum as an annotator
+in `~/.config/claude-history/config.toml`:
+
+```toml
+[annotations]
+write_to = "chsum"
+
+[annotators.chsum]
+command = "chsum annotations"
+```
+
+Every note and every recap bullet then shows in its viewer at the row it points
+at and matches in `claude-history agent search`, tagged by kind. A note typed in
+its viewer (`a`) is filed by chsum the same way `chsum note` files one, and `d`
+there deletes through chsum. `chsum annotations read|write|delete` is that wire
+— one JSON object on stdin, one on stdout — and not a command you type.
 
 ### Search modes
 
@@ -466,14 +485,14 @@ cwd: ~/Documents/Code/chsum
 projects: ~/.claude/projects/  (…/ below)
 chsum 1.2.0 (9162a1d dirty) · python 3.10.11 · darwin · exit 0
 files (1)
-  ch_8b0a671d…  meta,marks  947.1K  671 recs  …/-Users-…-chsum/9a9e9ac5-….jsonl
+  ch_8b0a671d…  meta,turns  947.1K  671 recs  …/-Users-…-chsum/9a9e9ac5-….jsonl
 procs (3)
   0   0.03s  claude-history agent outline ch_8b0a671d… --no-budget  (1005 chars out)
   0   0.01s  claude-history agent read ch_8b0a671d…:m1..m27 --no-budget  (11084 chars out)
 steps (4)
   resolve_ref    via=argv ref=ch_8b0a671d…
   _parent_path   ref=ch_8b0a671d… uuid=9a9e9ac5-…
-  scan_marks     file=9a9e9ac5-….jsonl marks=0 sentinel=absent
+  _load_store    dir=-Users-…-chsum files=126 sessions=6
   read_messages  ref=ch_8b0a671d… asked=m1..m27 messages=7 got=m1..m27
 reproduce
   chsum digest ch_8b0a671d… --stdout
@@ -488,8 +507,9 @@ chsum checkout and the files it names are still there to open.
 
 `steps` is where a wrong line usually comes from. Each one is a resolution with
 its inputs and its result, including the fallbacks that print nothing during a
-normal run: `_verify_stamp … match=no fallback=walk` (a mark's stamp disagreed
-with the record it named), `_turn_checkpoints … checkpoint=4 transcript=2` (two
+normal run: `_stamp_turns … unstamped=126 stamped=126 transcripts=38` (turn files
+from before the store was stamped, resolved against this project's transcripts),
+`_turn_checkpoints … checkpoint=4 transcript=2` (two
 turns had no checkpoint covering them), `_run_chunk … failed=1` (one summariser call
 died and its gap says so). Repeated steps collapse in the middle, and `files`
 and `procs` cap at 24 rows with the remainder counted.
@@ -502,7 +522,7 @@ byte-identical against the previous release across thirteen invocations.
 | Section | Source |
 |---|---|
 | Frontmatter — ref, title, project, branch, start, duration, counts | computed |
-| **Notable** — what you flagged with `chsum mark`, verbatim | copied |
+| **Notable** — what you filed with `chsum note`, verbatim | copied |
 | **What I asked for** — your prompts, verbatim, in order | copied |
 | **Files changed** / **Commands run** | parsed from tool calls |
 | **Delegated** — one line per subagent, with its address | parsed from sidecars |

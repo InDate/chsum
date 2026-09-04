@@ -383,7 +383,7 @@ def is_real_prompt(text: str) -> bool:
 
 def is_typed_prompt(text: str) -> bool:
     """`is_real_prompt`, minus `!` runs — something you did, not something you
-    said. Mark paths stay on `is_real_prompt`, since marks are typed via `!`."""
+    said. Note paths stay on `is_real_prompt`, since notes are typed via `!`."""
     return is_real_prompt(text) and not text.lstrip().startswith("<bash-")
 
 
@@ -503,8 +503,6 @@ class AgentRun:
     edited: list[str] = field(default_factory=list)
     commands: list[str] = field(default_factory=list)
     command_total: int = 0  # every Bash call, before the notable filter and dedupe
-    marks: list[Mark] = field(default_factory=list)
-    revoked: set[str] = field(default_factory=set)  # reconciled with the parent's
     path: pathlib.Path | None = None
 
 
@@ -530,7 +528,7 @@ class Meta:
     commands: list[str] = field(default_factory=list)
     command_total: int = 0  # every Bash call the session and its agents made
     agent_only: set[str] = field(default_factory=set)  # files no parent turn touched
-    marks: list[Mark] = field(default_factory=list)  # `chsum mark` calls, parent-only
+    notes: list[Annotation] = field(default_factory=list)  # kind `note` only, agents' folded in
     path: pathlib.Path | None = None
 
     @property
@@ -560,7 +558,7 @@ NAMES_PATH = CHSUM_DIR / "names.json"
 _names_cache: tuple[float, dict[str, str]] | None = None
 
 
-def _load_store() -> dict[str, dict]:
+def _load_names() -> dict[str, dict]:
     """Raw store: uuid → {"title", "was"}. `was` is Claude Code's title at
     rename time, so `--clear` can restore it."""
     global _names_cache
@@ -587,14 +585,14 @@ def _load_store() -> dict[str, dict]:
 
 def load_names() -> dict[str, str]:
     """uuid → your name for it. Cached on mtime — the listing path asks once per session."""
-    return {uuid: entry["title"] for uuid, entry in _load_store().items()}
+    return {uuid: entry["title"] for uuid, entry in _load_names().items()}
 
 
 def save_name(uuid: str, title: str | None, was: str = "") -> None:
     """Write-then-rename, so two sessions renaming at once can't leave a torn
     file — the store is the only place a name survives Claude Code's next title."""
     global _names_cache
-    store = dict(_load_store())
+    store = dict(_load_names())
     if title is None:
         store.pop(uuid, None)
     else:
@@ -629,46 +627,38 @@ def append_ai_title(path: pathlib.Path, title: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Marks
+# Notes
 # ---------------------------------------------------------------------------
-# `chsum mark <reason>` writes nothing: run via `!`, Claude Code's own recording
-# of the run is what plants the sentinel in the transcript, with an mN and
-# ma_ anchor for free. Detection reads only captured command output, so a
-# quoted mark pasted into a later session doesn't read back as a mark of it.
-
-MARK_SENTINEL = "⚑ chsum-mark v1"
-# Line-anchored: unanchored, this line's own text would match and forge a mark.
-_MARK_RE = re.compile(
-    r"^(?:<bash-stdout>)?⚑ chsum-mark v1(?P<fields>[^|]*)\|(?P<reason>.*)", re.MULTILINE
-)
-# Ends at the first closing tag, not the last — stderr's tag follows stdout's in the same record.
-_MARK_TAIL_RE = re.compile(r"</bash-\w+>.*$", re.DOTALL)
-_MARK_GREP = "chsum-mark"  # ASCII pre-filter: cheap, and survives any escaping
-
-
-@dataclass
-class Mark:
-    reason: str  # verbatim argv
-    rec: str = ""  # record uuid of the sentinel itself — what `--revoke` names
-    at: str = ""  # record uuid of the message marked; "" means "here"
-    line: int = 0  # 1-based JSONL line of the sentinel's own record
-    at_line: int = 0  # ditto for the marked record, once resolved
-    at_path: pathlib.Path | None = None  # file `at_line` is a line of, if not the transcript
-    quote: str = ""  # first line of the marked message, verbatim
-    when: str = ""
-    agent: str = ""  # sidecar the mark was made in; blank for the parent's own
-    # Kept apart from `agent`: a mark typed in the parent can point into a running
-    # agent's sidecar, and only the target's side decides whether an mN exists.
-    at_agent: str = ""  # sidecar the marked record lives in
+# `chsum note <text>` files into the turn store and prints nothing. The
+# transcript is never written to, and nothing reads it for notes.
 
 
 @dataclass
 class _MarkTarget:
-    """Where a mark points, resolved before the sentinel prints. Stamped into the
-    sentinel so reading a mark back is a lookup, not a search of every file."""
+    """Where a note points, resolved while you type it: record uuid, row, and
+    the sidecar the row is in."""
     uuid: str
     line: int = 0
     agent: str = ""
+
+
+@dataclass
+class Annotation:
+    """One annotation as the store holds it and claude-history is served it: a
+    `note` a person typed, or a `recap` bullet a model wrote, filed under one
+    turn or session file. `id` is the file's uuid and a number issued once."""
+    id: str
+    n: int
+    kind: str  # "note" | "recap" | as received on the wire
+    text: str
+    targets: list = field(default_factory=list)  # parent rows, int or "a..b"; [] is session-level
+    written: str = ""
+    turn: str = ""  # the turn file's uuid; "" under a session file
+    session: str = ""
+    agent: str = ""  # sidecar the target sits in — its rows don't order against the parent's
+    row: int = 0  # row inside that sidecar
+    quote: str = ""  # first line of the targeted record, verbatim
+    record: str = ""  # the sentinel record an imported mark came from
 
 
 def _record_text(rec: dict) -> str:
@@ -681,106 +671,6 @@ def _record_text(rec: dict) -> str:
     return ""
 
 
-def _tool_result_text(rec: dict) -> str:
-    """Captured output of a tool call — where a mark lands when Claude ran it,
-    rather than the user typing `! chsum mark`."""
-    content = (rec.get("message") or {}).get("content")
-    if not isinstance(content, list):
-        return ""
-    out = []
-    for part in content:
-        if not isinstance(part, dict) or part.get("type") != "tool_result":
-            continue
-        body = part.get("content")
-        if isinstance(body, str):
-            out.append(body)
-        elif isinstance(body, list):
-            out += [p.get("text", "") for p in body
-                    if isinstance(p, dict) and p.get("type") == "text"]
-    return "\n".join(out)
-
-
-def scan_marks(path: pathlib.Path) -> list[Mark]:
-    """Live marks in one transcript."""
-    marks, revoked = _scan_marks_raw(path)
-    return _apply_revocations(marks, revoked)
-
-
-def _apply_revocations(marks: list[Mark], revoked: set[str]) -> list[Mark]:
-    if not revoked:
-        return marks
-    return [m for m in marks if not any(m.rec.startswith(r) for r in revoked if r)]
-
-
-def _scan_marks_raw(path: pathlib.Path) -> tuple[list[Mark], set[str]]:
-    """Marks and revocations in one file, kept apart so a parent and its sidecars
-    can be reconciled: either side may retract a mark the other made. Its own
-    pass rather than part of `extract_meta` because line numbers are the only
-    bridge back to mN, and `_records` doesn't carry them."""
-    try:
-        data = path.read_text(errors="replace")
-    except OSError:
-        return [], set()
-    TRACE.file(path, "marks")
-    if _MARK_GREP not in data:
-        # Said explicitly: "no sentinel anywhere in this file" is the answer to
-        # a mark that didn't show up, and the walk below never runs to report it.
-        TRACE.step("scan_marks", file=path.name, marks=0, sentinel="absent")
-        return [], set()
-    marks: list[Mark] = []
-    revoked: set[str] = set()
-    for lineno, raw in enumerate(data.splitlines(), start=1):
-        if _MARK_GREP not in raw:
-            continue
-        try:
-            rec = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(rec, dict) or rec.get("type") != "user":
-            continue
-        text = _record_text(rec) if "<bash-stdout>" in raw else ""
-        for m in _MARK_RE.finditer(f"{text}\n{_tool_result_text(rec)}"):
-            fields = dict(t.split("=", 1) for t in m.group("fields").split() if "=" in t)
-            if fields.get("revoke"):
-                # Nothing was written to take back, so the record stays and the mark drops.
-                revoked.add(fields["revoke"])
-                continue
-            stamp = fields.get("line", "")
-            marks.append(Mark(reason=_MARK_TAIL_RE.sub("", m.group("reason")).strip(),
-                              rec=str(rec.get("uuid") or ""),
-                              at=fields.get("at", ""),
-                              line=lineno,
-                              at_line=int(stamp) if stamp.isdigit() else 0,
-                              at_agent=fields.get("agent", ""),
-                              when=str(rec.get("timestamp") or "")))
-    # A stamp is a copy, so it is checked against the uuid it claims before it is
-    # used — anything that disagrees drops back to the search below.
-    for mk in marks:
-        if mk.at_line and not _verify_stamp(mk, path):
-            TRACE.step("_verify_stamp", mark=mk.rec[:8], at=mk.at[:8], line=mk.at_line,
-                       agent=mk.at_agent or "—", match="no", fallback="walk")
-            mk.at_line, mk.at_agent, mk.at_path = 0, "", None
-    stamped = sum(1 for m in marks if m.at_line)
-    if any(m.at and not m.at_line for m in marks):
-        _resolve_marked(data, marks, path)
-        # A mark typed in the transcript can name a record in a sidecar: while an
-        # agent is running, that is the file the conversation is landing in.
-        for side, agent in mark_sources(path)[1:]:
-            missing = [m for m in marks if m.at and not m.at_line]
-            if not missing:
-                break
-            TRACE.file(side, "marks")
-            _resolve_marked(side.read_text(errors="replace"), missing, side, agent)
-    if any(not m.at for m in marks):
-        _resolve_here(data, marks, path)
-    # After resolution, not before: whether the walk placed what the stamp missed
-    # is the answer to a mark that came back without a row.
-    TRACE.step("scan_marks", file=path.name, marks=len(marks), revoked=len(revoked),
-               stamped=stamped, placed=sum(1 for m in marks if m.at_line),
-               unplaced=sum(1 for m in marks if not m.at_line))
-    return marks, revoked
-
-
 def _mark_file(path: pathlib.Path, agent: str) -> pathlib.Path | None:
     """The file an `agent=` stamp names. Resolved through the parent transcript,
     since a mark read out of a sidecar names its siblings by the parent's ids."""
@@ -789,32 +679,6 @@ def _mark_file(path: pathlib.Path, agent: str) -> pathlib.Path | None:
     if not agent:
         return root
     return next((s for s, a in mark_sources(root) if a == agent), None)
-
-
-def _verify_stamp(mark: Mark, path: pathlib.Path) -> bool:
-    """Confirm the stamped row still holds the record the mark names, and fill the
-    quote from it. False sends the mark back to the search that predates stamping."""
-    src = _mark_file(path, mark.at_agent)
-    if not src or not src.exists() or not mark.at:
-        return False
-    try:
-        lines = src.read_text(errors="replace").splitlines()
-    except OSError:
-        return False
-    TRACE.file(src, "stamp", records=len(lines))
-    if mark.at_line > len(lines):
-        return False
-    try:
-        rec = json.loads(lines[mark.at_line - 1])
-    except json.JSONDecodeError:
-        return False
-    uid = rec.get("uuid") if isinstance(rec, dict) else ""
-    if not isinstance(uid, str) or not uid.startswith(mark.at):
-        return False
-    mark.at_path = src
-    text = _record_text(rec).strip()
-    mark.quote = next((ln for ln in text.splitlines() if ln.strip()), "")
-    return True
 
 
 def _text_at_line(lines: list[str], lineno: int) -> str:
@@ -871,48 +735,6 @@ def _here_target(path: pathlib.Path) -> _MarkTarget | None:
     TRACE.step("_here_target", said=len(said), at=uid[:8], line=lineno,
                agent=agent or "—", when=_ts)
     return _MarkTarget(uid, lineno, agent) if uid else None
-
-
-def _resolve_here(data: str, marks: list[Mark], path: pathlib.Path | None = None) -> None:
-    """Place a bare mark made before stamping existed: the last real thing said
-    before its own record, which is command output and never a target itself."""
-    said = _said_records(path, data)
-    for mk in marks:
-        if mk.at:
-            continue
-        if mk.when:
-            prior = [s for s in said if (s[0], s[1]) < (mk.when, mk.line)]
-        else:
-            prior = [s for s in said if s[2] in (None, path) and s[1] < mk.line]
-        if prior:
-            _ts, mk.at_line, mk.at_path, agent, mk.quote, _uid = prior[-1]
-            if agent:
-                mk.at_agent = agent
-
-
-def _resolve_marked(data: str, marks: list[Mark], src: pathlib.Path | None = None,
-                    agent: str = "") -> None:
-    """Fill in where each `at=` mark points, from the record it names."""
-    want = {m.at for m in marks if m.at}
-    for lineno, raw in enumerate(data.splitlines(), start=1):
-        if not any(w in raw for w in want):
-            continue
-        try:
-            rec = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        uid = rec.get("uuid") if isinstance(rec, dict) else ""
-        if not isinstance(uid, str) or not uid:
-            continue
-        for mk in marks:
-            if mk.at and uid.startswith(mk.at) and not mk.at_line:
-                mk.at_line, mk.at_path = lineno, src
-                if agent:
-                    # Lines of a sidecar, which has no mN: the id stands in for the
-                    # ordinal, exactly as it does for a mark an agent made itself.
-                    mk.at_agent = agent
-                text = _record_text(rec).strip()
-                mk.quote = next((ln for ln in text.splitlines() if ln.strip()), "")
 
 
 IDLE_GAP_SECONDS = 30 * 60
@@ -988,9 +810,6 @@ def extract_agent(side: pathlib.Path) -> AgentRun:
         run.duration = _fmt_secs(active_seconds(stamps))
     run.edited, run.commands = edited, _dedupe(cmds)
     run.command_total = len(all_cmds)
-    run.marks, run.revoked = _scan_marks_raw(side)
-    for mk in run.marks:
-        mk.agent = run.id
     return run
 
 
@@ -1048,17 +867,11 @@ def extract_meta(path: pathlib.Path) -> Meta:
         run.edited = keep(run.edited)
     meta.agent_only = set(meta.edited) - set(keep(own_edits))
 
-    # Marks fold in like edits and commands do. Revocations pool first, so either
-    # side can retract the other's.
-    own_marks, revoked = _scan_marks_raw(path)
-    for run in meta.agents:
-        revoked |= run.revoked
-    for run in meta.agents:
-        run.marks = _apply_revocations(run.marks, revoked)
-    all_marks = _apply_revocations(own_marks, revoked)
-    all_marks += [mk for run in meta.agents for mk in run.marks]
-    # By when they were made, so a delegated mark sits where it happened.
-    meta.marks = sorted(all_marks, key=lambda mk: mk.when or "")
+    # Hand-typed only: a digest is deterministic, and a `recap` bullet is a
+    # model's. Agents' notes are in the same files, by the `agent` they carry.
+    meta.notes = sorted((a for doc in _load_store(path.parent.name).get(path.stem, [])
+                         for a in _annotations_of(doc) if a.kind == "note"),
+                        key=lambda a: a.written)
     return meta
 
 
@@ -1364,8 +1177,8 @@ def frontmatter(meta: Meta, ref: str) -> str:
     if meta.duration:
         lines.append(f"duration: {meta.duration}")
     lines += [f"prompts: {meta.prompts}", f"files_edited: {len(meta.edited)}"]
-    if meta.marks:
-        lines.append(f"marks: {len(meta.marks)}")
+    if meta.notes:
+        lines.append(f"notes: {len(meta.notes)}")
     if meta.agent_count:
         lines.append(f"subagents: {meta.agent_count}  # their edits are counted above")
     lines += ["generated_by: chsum (deterministic extraction, no model)", "---"]
@@ -1474,12 +1287,12 @@ def render_agent_digest(meta: Meta, parent_ref: str, run: AgentRun) -> str:
                  + (f" · {run.duration}" if run.duration else "")
                  + f" · spawned by `{parent_ref}`*\n")
 
-    if run.marks:
+    notes = [a for a in meta.notes if a.agent == run.id]
+    if notes:
         parts.append("## Notable\n")
-        parts.append("*Marked by this agent with `chsum mark`. Reasons are verbatim.*\n")
-        # No ordinals: sidecar messages have none, and no anchors to cite either.
+        parts.append("*Noted by this agent with `chsum note`. Text is verbatim.*\n")
         # The agent id is redundant here — the whole digest is that agent.
-        parts += _render_marks(run.marks, "", show_agent=False) + [""]
+        parts += _render_notes(notes, "", show_agent=False) + [""]
 
     parts.append("## Task\n")
     task = next((m.text for m in msgs if m.role == "user"), "")
@@ -1550,13 +1363,12 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
     parts.append(f"*{when} · {meta.project_name}"
                  + (f" · `{meta.branch}`" if meta.branch else "") + "*\n")
 
-    if meta.marks:
-        # First, because someone chose these by hand mid-session — they outrank
-        # anything extraction picked out.
+    if meta.notes:
+        # First, because someone chose these by hand — they outrank anything
+        # extraction picked out.
         parts.append("## Notable\n")
-        parts.append("*Marked during the session with `chsum mark`. "
-                     "Reasons are verbatim.*\n")
-        parts += _render_marks(meta.marks, meta.uuid) + [""]
+        parts.append("*Noted by hand with `chsum note`. Text is verbatim.*\n")
+        parts += _render_notes(meta.notes, meta.uuid) + [""]
 
     # The intent trail: verbatim, in order. This is the summary, uninvented.
     parts.append("## What I asked for\n")
@@ -1655,32 +1467,26 @@ def _drill_block(ref: str, path: pathlib.Path | None) -> list[str]:
     return out
 
 
-def _render_marks(marks: list[Mark], session: str,
+def _render_notes(notes: list[Annotation], session: str,
                   show_agent: bool = True) -> list[str]:
-    """A mark names the row it points at. The mark already carries that row and the
-    file it is in, so nothing is looked up and nothing needs claude-history to
-    resolve what comes out."""
+    """A note names the row it points at. The note carries that row and the
+    sidecar it is in, so nothing is looked up to place it."""
     out = []
-    for mk in marks:
+    for a in notes:
         where = []
-        # The target's file decides: a target's line is a line of the target's file.
-        agent = mk.at_agent or mk.agent
-        target = mk.at_line or mk.line
-        if target and session:
-            who = f"{session[:8]}/{agent[:8]}" if agent else session[:8]
-            where.append(f"`{who}:{target}`")
-        elif agent and show_agent:
-            where.append(f"agent `{agent}`")
-        head = f"- **{_clip_line(mk.reason, 300)}**"
+        # The target's file decides: a sidecar row is a row of the sidecar.
+        row = a.row if a.agent else _first_row(a.targets)
+        if row and session:
+            who = f"{session[:8]}/{a.agent[:8]}" if a.agent else session[:8]
+            where.append(f"`{who}:{row}`")
+        elif a.agent and show_agent:
+            where.append(f"agent `{a.agent}`")
+        head = f"- **{_clip_line(a.text, 300)}**"
         if where:
             head += f"  ({' · '.join(where)})"
-        elif mk.at:
-            head += f"  (record `{mk.at[:8]}`)"
-        elif mk.rec:
-            head += f"  (mark `{mk.rec[:8]}`)"
         out.append(head)
-        if mk.quote:
-            out.append(f"  > {_clip_line(mk.quote, 160)}")
+        if a.quote:
+            out.append(f"  > {_clip_line(a.quote, 160)}")
     return out
 
 
@@ -1712,8 +1518,8 @@ def resolve_ref(args) -> str:
         if not path.exists():
             raise SystemExit(f"no such transcript: {path}")
         ref = ch_ref_for_path(path)
-        # A derived value is checked against what it claims, the same rule as
-        # `_verify_stamp`: the ref has to resolve back to the file it came from.
+        # A derived value is checked against what it claims: the ref has to
+        # resolve back to the file it came from.
         got = path_for_ref(ref)
         if got != path:
             raise SystemExit(
@@ -1726,33 +1532,37 @@ def resolve_ref(args) -> str:
     return args.ref
 
 
-def _find_marks(args) -> int:
-    """Marks matching a query. Pure JSONL and plain substring matching — there are
-    few marks and they're short, so an index would buy nothing and cost exactness."""
+def _find_notes(args) -> int:
+    """Notes matching a query, read off the store: one directory per project,
+    plain substring matching — there are few notes and they're short."""
     q = (args.query or "").lower()
+    dirs = ([project_dir_name(pathlib.Path.cwd())] if not args.all
+            else sorted(p.name for p in TURNS_DIR.iterdir() if p.is_dir())
+            if TURNS_DIR.is_dir() else [])
+    paths = {p.stem: p for p in transcripts(local=not args.all)}
     rows = []
-    for p in transcripts(local=not args.all):
-        meta = extract_meta(p)
-        for mk in meta.marks:
-            if q and q not in mk.reason.lower():
-                continue
-            rows.append((meta, mk))
+    for d in dirs:
+        for session, docs in _load_store(d).items():
+            for a in (a for doc in docs for a in _annotations_of(doc) if a.kind == "note"):
+                if q and q not in a.text.lower():
+                    continue
+                rows.append((session, paths.get(session), a))
     if not rows:
-        print("no marks" + (f" matching {args.query!r}" if q else ""), file=sys.stderr)
+        print("no notes" + (f" matching {args.query!r}" if q else ""), file=sys.stderr)
         return 1
-    rows.sort(key=lambda r: r[1].when or r[0].ended or "", reverse=True)
-    for meta, mk in rows[:args.top]:
-        print(f"{ch_ref_for_path(meta.path)}  {(mk.when or meta.ended or '')[:10]}  "
-              f"⚑ {mk.reason}")
+    rows.sort(key=lambda r: r[2].written, reverse=True)
+    for session, path, a in rows[:args.top]:
+        ref = ch_ref_for_path(path) if path else session[:8]
+        print(f"{ref}  {a.written[:10]}  ⚑ {a.text}")
     print(f"\nRead one: `chsum context <ref>`", file=sys.stderr)
     return 0
 
 
 def cmd_find(args) -> int:
-    if args.marks:
-        return _find_marks(args)
+    if args.notes:
+        return _find_notes(args)
     if not args.query:
-        raise SystemExit("find: need a query (or --marks to list marks)")
+        raise SystemExit("find: need a query (or --notes to list notes)")
     if args.mode in ("hybrid", "semantic"):
         # Embedding search is tens of seconds warm, and several minutes the very
         # first time while the index builds. Say so rather than looking hung.
@@ -2110,7 +1920,7 @@ def _sources_block(rows: list[_Row], session: str) -> list[str]:
 
 def find_row(path: pathlib.Path, spec: str) -> tuple[_Row, str]:
     """The row an id prefix names, with the captured output where it has one. An
-    ambiguity lists candidates rather than picking, same rule as `_find_mark`: the
+    ambiguity lists candidates rather than picking, same rule as `_find_annotation`: the
     id is copied off a row, so a prefix matching two rows is a typo."""
     hits = [r for r in collect_rows(path, ("tool", "command"))
             if r.tool_id.startswith(spec) or _short_id(r.tool_id).startswith(spec)]
@@ -2642,30 +2452,32 @@ def _fold(text: str) -> str:
     return " ".join(re.sub(r"[^0-9a-z]+", " ", text.lower()).split())
 
 
-_MARK_INPUT_RE = re.compile(r"\s*<bash-input>\s*chsum\s+mark\b")
+_NOTE_INPUT_RE = re.compile(r"\s*<bash-input>\s*chsum\s+(?:note|annotate|mark)\b")
+_BASH_INPUT_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.S)
+_BASH_OUTPUT_RE = re.compile(r"<bash-stdout>(.*?)</bash-stdout>|<bash-stderr>(.*?)</bash-stderr>", re.S)
 _BASH_OUT_RE = re.compile(r"\s*<bash-(?:stdout|stderr)>")
 
 
 class _Machinery:
-    """`chsum mark`'s own footprint, tracked in file order — excluded from
+    """`chsum note`'s own footprint, tracked in file order — excluded from
     matching (a tool_use record is written before the command runs, so without
     this every `--match` finds itself). Invocations only, not talk about them,
-    or a conversation about this feature becomes unmarkable. One instance per
+    or a conversation about this feature becomes unnotable. One instance per
     file: adjacency is a fact about the file, and timestamp sort interleaves sidecars."""
 
     def __init__(self) -> None:
-        self.after_mark = False
+        self.after_note = False
 
     def sees(self, text: str, kind: str = "text") -> bool:
         # Tool calls hang off a record rather than being one, so they carry no
         # state: nothing is written between a tool_use and the record after it.
         if kind == "tool":
-            return bool(re.search(r"\bchsum\s+mark\b", text))
+            return bool(re.search(r"\bchsum\s+(?:note|annotate|mark)\b", text))
         if _BASH_OUT_RE.match(text):
-            was, self.after_mark = self.after_mark, False
-            return was or MARK_SENTINEL in text
-        self.after_mark = bool(_MARK_INPUT_RE.match(text))
-        return self.after_mark or MARK_SENTINEL in text
+            was, self.after_note = self.after_note, False
+            return was
+        self.after_note = bool(_NOTE_INPUT_RE.match(text))
+        return self.after_note
 
 
 def _match_target(path: pathlib.Path, needle: str) -> _MarkTarget:
@@ -2695,20 +2507,6 @@ def _match_target(path: pathlib.Path, needle: str) -> _MarkTarget:
     return hits[0][0]
 
 
-def _find_mark(marks: list[Mark], spec: str) -> list[Mark]:
-    """Every mark on the record an id prefix names. One record can carry several —
-    a single command printing several sentinels — and the id names the record, so
-    they come back together rather than as an ambiguity nothing can narrow.
-    Shared by `--revoke` and `--show`, so a prefix that resolves for one resolves
-    for the other."""
-    hits = [mk for mk in marks if mk.rec.startswith(spec)]
-    if not hits:
-        raise SystemExit(f"no live mark {spec!r} — `chsum mark --list` shows them")
-    if len({mk.rec for mk in hits}) > 1:
-        raise SystemExit(f"{spec!r} matches {len(hits)} marks — use more characters")
-    return hits
-
-
 def _context_rows(src: pathlib.Path, lineno: int, n: int) -> list[tuple[int, dict]]:
     """The n records either side of a row, in file order. Messages and one line per
     tool call — the level `--list --full` prints at, not tool inputs or result bodies."""
@@ -2735,45 +2533,36 @@ def _context_rows(src: pathlib.Path, lineno: int, n: int) -> list[tuple[int, dic
     return rows[max(0, here - n):here + n + 1]
 
 
-def _show_mark(path: pathlib.Path, marks: list[Mark], context: int, cols: int) -> int:
-    """Where the marks on one record landed, and what surrounds them. The header
-    carries the whole answer to "where is this" — file, row, time, record id,
-    agent — so nothing downstream has to search the transcript again to place it.
-    Several reasons print above one location: they share the record they name."""
-    mk = next((m for m in marks if m.at_line), marks[0])
-    src = mk.at_path or _mark_file(path, mk.at_agent) or path
-    where = [f"{src}:{mk.at_line}" if mk.at_line else str(src)]
-    if mk.when:
-        where.append(_hhmmss(mk.when))
-    if mk.at and mk.at_line:
-        where.append(f"record {mk.at[:8]}")
-    agent = mk.at_agent or mk.agent
-    if agent:
-        where.append(f"agent {agent}")
-    if mk.at_line:
-        where.append(f"line {mk.at_line}")
-    for one in marks:
-        print(f"{one.rec[:8]}  {one.reason}")
+def _show_note(path: pathlib.Path, a: Annotation, context: int, cols: int) -> int:
+    """Where one annotation landed and what surrounds it. The header carries
+    the whole answer to "where is this" — file, row, time, agent — so nothing
+    downstream has to search the transcript to place it."""
+    src = _sidecar_path(path, a.agent)
+    row = a.row if a.agent else _first_row(a.targets)
+    where = [f"{src}:{row}" if row else str(src)]
+    if a.written:
+        where.append(_hhmmss(a.written))
+    if a.agent:
+        where.append(f"agent {a.agent}")
+    where.append(a.kind)
+    print(f"{a.id}  {a.text}")
     print(_dim("  " + "  ·  ".join(where)))
-    if not mk.at_line:
-        # Naming the record it points at, not just "nothing": a mark quoted out of
-        # another conversation names a record this file has never held.
-        print(_dim(f"\n  record {mk.at[:8]} is not in this file" if mk.at
-                   else "\n  (nothing before it)"))
+    if not row:
+        print(_dim("\n  (session-level: no row)"))
         return 0
-    rows = _context_rows(src, mk.at_line, max(0, context))
+    rows = _context_rows(src, row, max(0, context))
     for lineno, rec in rows or []:
         print()
-        who = f"agent {agent[:8]}" if agent else (
+        who = f"agent {a.agent[:8]}" if a.agent else (
             "you" if rec.get("type") == "user" else "claude")
         # Local clock, matching the header's own stamp — two clocks in one view
         # read as two different moments.
-        head = f"{'▸' if lineno == mk.at_line else ' '} {lineno:>6}  " \
+        head = f"{'▸' if lineno == row else ' '} {lineno:>6}  " \
                f"{_hhmmss(str(rec.get('timestamp') or ''))}  {who}"
-        print(head if lineno == mk.at_line else _dim(head))
+        print(head if lineno == row else _dim(head))
         body = _record_text(rec).strip()
-        if lineno != mk.at_line:
-            # The marked record prints whole; its neighbours are orientation, and
+        if lineno != row:
+            # The targeted record prints whole; its neighbours are orientation, and
             # the row number above each one says where to read the rest.
             body = _clip(body, 400, f"line {lineno} of {src.name}")
         for para in body.splitlines() + [f"⚙ {t}" for t in _tool_lines(rec)]:
@@ -2782,51 +2571,54 @@ def _show_mark(path: pathlib.Path, marks: list[Mark], context: int, cols: int) -
                 continue
             text = "\n".join(textwrap.wrap(para, cols, initial_indent="    ",
                                            subsequent_indent="    "))
-            print(text if lineno == mk.at_line else _dim(text))
+            print(text if lineno == row else _dim(text))
     if not rows:
-        print(_dim(f"\n  row {mk.at_line} is not in {src.name}"))
+        print(_dim(f"\n  row {row} is not in {src.name}"))
     return 0
 
 
-def cmd_mark(args) -> int:
-    """Mark a moment as notable. Writes nothing: printing the sentinel is the
-    whole mechanism — see the Marks section above for why."""
+def cmd_note(args) -> int:
+    """A note against a row of this conversation, into the store. Prints
+    nothing on success: nothing is recorded by the harness any more, so there
+    is nothing for output to carry."""
     path = pathlib.Path(args.file).expanduser().resolve() if args.file else live_transcript()
     if not path.exists():
         raise SystemExit(f"no such transcript: {path}")
+    project_dir = path.parent.name
 
     # Named on every path that quotes the transcript: a result that disagrees with
     # another invocation is unreadable without knowing which file each one searched.
     cols = max(40, min(shutil.get_terminal_size((100, 24)).columns, 88))
 
     if args.show:
-        marks = extract_meta(path).marks
-        if not marks:
-            print(f"nothing marked in {path}", file=sys.stderr)
-            return 1
-        return _show_mark(path, _find_mark(marks, args.show), args.context, cols)
+        # Across the project: the store is per project and an id names a file in it.
+        anns = [a for docs in _load_store(project_dir).values()
+                for doc in docs for a in _annotations_of(doc)]
+        a = _find_annotation(anns, args.show)
+        src = path if a.session == path.stem else next(
+            (p for p in transcripts() if p.stem == a.session), path)
+        return _show_note(src, a, args.context, cols)
 
     if args.list:
-        # The session's marks (agents' folded in too), same pooled definition extract_meta uses.
-        marks = extract_meta(path).marks
-        if not marks:
-            print(f"nothing marked in {path}", file=sys.stderr)
+        anns = _annotations_for(path)
+        if not anns:
+            print(f"nothing noted in {path}", file=sys.stderr)
             return 1
         if args.full:
-            # The stored quote is only the marked message's first line; the rest comes back off disk.
-            # Keyed by file: a mark can point into a sidecar, whose line numbers mean nothing here.
+            # Keyed by file: a note can point into a sidecar, whose line numbers mean nothing here.
             lines_of: dict[pathlib.Path, list[str]] = {}
-            for i, mk in enumerate(marks):
+            for i, a in enumerate(anns):
                 if i:
                     print()
-                print(f"{mk.rec[:8]}  {mk.reason}")
-                src = mk.at_path or path
+                print(f"{a.id[:8]}#{a.n}  {a.kind}  {a.text}")
+                src = _sidecar_path(path, a.agent)
+                row = a.row if a.agent else _first_row(a.targets)
                 if src not in lines_of:
                     lines_of[src] = src.read_text(errors="replace").splitlines()
                     TRACE.file(src, "list-full", records=len(lines_of[src]))
-                body = _text_at_line(lines_of[src], mk.at_line) or mk.quote
+                body = _text_at_line(lines_of[src], row) or a.quote
                 first = True  # the ↳ opens the message, it doesn't bullet its paragraphs
-                for para in (body or "(nothing before it)").splitlines():
+                for para in (body or "(session-level)").splitlines():
                     if not para.strip():
                         print()
                         continue
@@ -2835,42 +2627,35 @@ def cmd_mark(args) -> int:
                         subsequent_indent="    "))))
                     first = False
             sys.stdout.flush()
-            print(f"\n{_plural(len(marks), 'mark')} in {path}", file=sys.stderr)
+            print(f"\n{_plural(len(anns), 'annotation')} in {path}", file=sys.stderr)
             return 0
-        # Two lines each: a reason and the message it marks are both prose.
-        rows = [(_clip_line(mk.reason, 60),
-                 f"{mk.rec[:8]}  agent {mk.agent[:8]}" if mk.agent else mk.rec[:8],
-                 _clip_line(mk.quote, 96) or "(nothing before it)") for mk in marks]
+        # Two lines each: the text and the message it targets are both prose.
+        rows = [(_clip_line(a.text, 60),
+                 f"{a.id[:8]}#{a.n}  {a.kind}" + (f"  agent {a.agent[:8]}" if a.agent else ""),
+                 _clip_line(a.quote, 96) or ("(session-level)" if not a.targets
+                                             else f"row {_first_row(a.targets)}")) for a in anns]
         width = max(len(r[0]) for r in rows)
         # Wrapped here rather than left to the terminal: a quote that folds at
-        # column 0 reads as a new mark.
-        for i, (reason, rec, quote) in enumerate(rows):
+        # column 0 reads as a new note.
+        for i, (text, tag, quote) in enumerate(rows):
             if i:
                 print()
-            print(f"{reason:<{width}}  {rec}")
+            print(f"{text:<{width}}  {tag}")
             print(_dim("\n".join(textwrap.wrap(quote, cols, initial_indent="  ↳ ",
                                                subsequent_indent="    "))))
         # Flushed first, or the hint jumps the list: stdout is block-buffered when
         # piped, stderr never is.
         sys.stdout.flush()
-        print(f"\n{path}\nShow one: `chsum mark --show <id>`  ·  "
-              "drop one: `chsum mark --revoke <id>`", file=sys.stderr)
+        print(f"\n{path}\nShow one: `chsum note --show <id>`  ·  "
+              "drop one: `chsum note --delete <id>`", file=sys.stderr)
         return 0
 
-    if args.revoke:
-        # Agents' marks included: either side can retract the other's.
-        marks = extract_meta(path).marks
-        out = []
-        for spec in args.revoke:
-            # One sentinel per record: `_apply_revocations` drops by record id, so
-            # naming it once retracts every mark that record carries.
-            hits = _find_mark(marks, spec)
-            out.append(f"{MARK_SENTINEL} revoke={hits[0].rec} | dropped: "
-                       f"{_clip_line(' / '.join(mk.reason for mk in hits), 120)}")
-        print("\n".join(out))
-        if not os.environ.get("CLAUDECODE"):
-            print("warning: not running inside Claude Code, so nothing recorded this.",
-                  file=sys.stderr)
+    if args.delete:
+        anns = _annotations_for(path)
+        for spec in args.delete:
+            a = _find_annotation(anns, spec)
+            _remove_annotation(project_dir, a.id)
+            print(f"deleted {a.id}  {_clip_line(a.text, 80)}", file=sys.stderr)
         return 0
 
     if args.recent is not None:
@@ -2884,42 +2669,98 @@ def cmd_mark(args) -> int:
             when = str(rec.get("timestamp") or "")[11:16]
             print(f"{str(rec.get('uuid') or '')[:8]}  {when:<5}  {who:<14}  {label[:88]}")
         print("\nMessages and tool calls, oldest first; tool results are not listed.\n"
-              'Mark one: `chsum mark --at <id> "<reason>"`', file=sys.stderr)
+              'Note one: `chsum note --at <id> "<text>"`', file=sys.stderr)
         return 0
 
-    reason = " ".join(args.reason).strip()
-    if not reason:
-        # Named separately from the bare case: `--match "<phrase>"` with no reason
+    text = " ".join(args.text).strip()
+    if not text:
+        # Named separately from the bare case: `--match "<phrase>"` with no text
         # reads as complete, and the generic message sent one reader off diagnosing
         # the match instead of the missing argument.
         if args.match or args.at:
             flag = "--match" if args.match else "--at"
             raise SystemExit(
-                f'{flag} says which message to mark, not why — add a reason:\n'
-                f'  chsum mark {flag} "{(args.match or args.at)}" "why this matters"')
-        raise SystemExit('nothing to mark — try: chsum mark "why this matters"')
-    # One line, because the sentinel is parsed back out of a single record.
-    reason = " ".join(reason.split())
+                f'{flag} says which message to note, not what — add the note:\n'
+                f'  chsum note {flag} "{(args.match or args.at)}" "why this matters"')
+        raise SystemExit('nothing to note — try: chsum note "why this matters"')
     if args.at and args.match:
         raise SystemExit("--at and --match name the same thing two ways; use one")
     target = (_mark_target(path, args.at) if args.at
               else _match_target(path, args.match) if args.match
               else _here_target(path))
-    # Row and file are stamped beside the uuid so reading the mark back is a lookup;
-    # both values are digits or hex, which the space-separated field grammar requires.
-    fields = ""
-    if target:
-        fields = f" at={target.uuid}"
-        if target.line:
-            fields += f" line={target.line}"
-        if target.agent:
-            fields += f" agent={target.agent}"
-
-    print(f"{MARK_SENTINEL}{fields} | {reason}")
-    if not os.environ.get("CLAUDECODE"):
-        print("warning: not running inside Claude Code, so nothing recorded this. "
-              "Run it as `! chsum mark …` in a session.", file=sys.stderr)
+    quote = ""
+    if target and target.line:
+        src = _sidecar_path(path, target.agent)
+        quote = next((ln for ln in _text_at_line(
+            src.read_text(errors="replace").splitlines(), target.line).splitlines()
+            if ln.strip()), "")
+    agent = target.agent if target else ""
+    row = target.line if target else 0
+    _file_note(project_dir, path.stem, path, [row] if row and not agent else [],
+               "note", text, agent=agent, row=row if agent else 0, quote=quote)
     return 0
+
+
+def cmd_annotations(args) -> int:
+    """The wire claude-history speaks: one JSON object on stdin, one on stdout,
+    exit zero for success. A failure exits non-zero with one line on stderr,
+    which their side surfaces at the keystroke for a write and drops this
+    annotator from the merge for a read."""
+    try:
+        req = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        raise SystemExit("annotations: stdin is not one JSON object")
+    if not isinstance(req, dict):
+        raise SystemExit("annotations: stdin is not one JSON object")
+    if args.op == "read":
+        out = []
+        for conv in req.get("conversations") or []:
+            if not isinstance(conv, str) or not conv:
+                continue
+            p = pathlib.Path(conv)
+            for a in _annotations_for(p):
+                row: dict = {"conversation": conv, "id": a.id, "targets": a.targets,
+                             "kind": a.kind, "text": a.text, "written": a.written}
+                if a.turn:
+                    row["turn"] = a.turn
+                if a.agent:
+                    row["agent"], row["row"] = a.agent, a.row
+                out.append(row)
+        print(json.dumps({"annotations": out}, ensure_ascii=False))
+        TRACE.step("annotations", op="read",
+                   conversations=len(req.get("conversations") or []), served=len(out))
+        return 0
+    conv = req.get("conversation")
+    if not isinstance(conv, str) or not conv:
+        raise SystemExit("annotations: `conversation` is required")
+    p = pathlib.Path(conv)
+    if args.op == "write":
+        text = " ".join(str(req.get("text") or "").split())
+        if not text:
+            raise SystemExit("annotations write: `text` is empty")
+        targets = []
+        for t in req.get("targets") or []:
+            # A run "7..9" files under the turn its first row selects.
+            head = t.split("..")[0] if isinstance(t, str) else t
+            if isinstance(head, int) or (isinstance(head, str) and head.isdigit()):
+                targets.append(int(head))
+        quote = ""
+        if targets and p.exists():
+            quote = next((ln for ln in _text_at_line(
+                p.read_text(errors="replace").splitlines(), _first_row(targets)).splitlines()
+                if ln.strip()), "")
+        note_id = _file_note(p.parent.name, p.stem, p, targets,
+                             str(req.get("kind") or "note"), text, quote=quote)
+        print(json.dumps({"id": note_id}))
+        return 0
+    if args.op == "delete":
+        spec = str(req.get("id") or "")
+        hit = _remove_annotation(p.parent.name, spec)
+        if hit is None:
+            raise SystemExit(f"annotations delete: no annotation {spec!r} for {p.stem[:8]}")
+        print(json.dumps({"deleted": True}))
+        return 0
+    raise SystemExit(f"annotations: unknown op {args.op!r}")
 
 
 def path_for_ref(ref: str) -> pathlib.Path:
@@ -2983,7 +2824,7 @@ def cmd_name(args) -> int:
         if not meta.renamed:
             print(f"{ref} was never renamed", file=sys.stderr)
             return 1
-        was = _load_store().get(path.stem, {}).get("was", "")
+        was = _load_names().get(path.stem, {}).get("was", "")
         save_name(path.stem, None)
         # Put Claude Code's title back the same way — appended, never deleted — or
         # /resume keeps showing the name chsum just forgot.
@@ -3130,7 +2971,7 @@ def _failed(body: str, is_error: bool) -> bool:
     """Whether a Bash result records something going wrong. `is_error` is taken
     as given; the text signal only counts in the last 500 chars, since a command
     that *died* ends at its error while one that merely printed error text as
-    data carries on past it — unanchored, it forges the same way `scan_marks` guards against."""
+    data carries on past it — unanchored, a quoted traceback forges a fresh failure."""
     if _DECLINED_RE.match(body.strip()):
         return False
     if is_error:
@@ -3222,6 +3063,7 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
     running to now — a timestamp even for the parent, since the far end has to
     cut sidecars too."""
     events: list[_Event] = []
+    shell_at: int | None = None  # index of the `!` command awaiting its output record
     sources = mark_sources(path)
     for src, agent in sources:
         # id -> the command, not just its id: a failure has to be able to name
@@ -3261,14 +3103,42 @@ def _events_since(path: pathlib.Path, anchor_line: int, anchor_ts: str,
                 # The command you typed, kept as an event where its loaded body
                 # is dropped as a turn — otherwise the work it caused appears
                 # under the previous turn with nothing naming the cause.
-                cmd = _COMMAND_NAME_RE.search(_record_text(rec))
+                text = _record_text(rec)
+                cmd = _COMMAND_NAME_RE.search(text)
                 if cmd:
-                    cargs = _COMMAND_ARGS_RE.search(_record_text(rec))
+                    cargs = _COMMAND_ARGS_RE.search(text)
                     detail = cargs.group(1).strip() if cargs else ""
                     events.append(_Event(ts, agent, "command",
                                          _clip_line(cmd.group(1)
                                                     + (f" {detail}" if detail else ""), 200),
                                          lineno, src))
+                    continue
+                # A `!` run is yours, not Claude's: it lands as two records, the
+                # command and then its output, and the extract names no actor on
+                # its own — without this kind the model reads the reply that
+                # followed and writes "Claude ran" for what you typed.
+                bang = _BASH_INPUT_RE.search(text)
+                if bang:
+                    shell_at = len(events)
+                    events.append(_Event(ts, agent, "shell",
+                                         _clip_line(_first_command(bang.group(1)), 200),
+                                         lineno, src))
+                    continue
+                if shell_at is not None and _BASH_OUTPUT_RE.search(text):
+                    out = "\n".join(m.group(1) or m.group(2) or ""
+                                    for m in _BASH_OUTPUT_RE.finditer(text)).strip()
+                    prev = events[shell_at]
+                    # chsum's own output is a view of this transcript, and a
+                    # view quoted back into the extract is summarised again on
+                    # the next run — each round more transcript-shaped than the
+                    # last. The command stays; what it printed does not.
+                    if _first_command(prev.text).startswith("chsum"):
+                        out = ""
+                    if out:
+                        events[shell_at] = _Event(prev.when, prev.agent, prev.kind,
+                                                  prev.text + "\n" + out[-400:],
+                                                  prev.line, prev.source)
+                    shell_at = None
                     continue
             content = (rec.get("message") or {}).get("content")
             if isinstance(content, str) and live and rec["type"] == "assistant":
@@ -3466,7 +3336,7 @@ def _chunk_material(events: list[_Event]) -> str:
     else — no other chunk's material or output, and no prompt text repeated
     across every chunk. Isolation by construction: a thread handed this string
     has no way to see what any other chunk produced."""
-    return "\n".join(_event_block(e) for e in events)
+    return "\n".join(f"#{i} {_event_block(e)}" for i, e in enumerate(events, start=1))
 
 
 def _split_to_fit(bucket: list[_Event], max_chars: int) -> list[list[_Event]]:
@@ -3481,6 +3351,25 @@ def _split_to_fit(bucket: list[_Event], max_chars: int) -> list[list[_Event]]:
     pieces = min(len(bucket), -(-size // max_chars))  # ceil(size / max_chars)
     step = -(-len(bucket) // pieces)  # ceil(len(bucket) / pieces)
     return [bucket[i:i + step] for i in range(0, len(bucket), step)]
+
+
+def _chunk_rows(chunk: list[_Event]) -> list[int]:
+    """[first, last] parent row a chunk's events sit on, or [] where every
+    event is a sidecar's. This is what a chunk's bullets target: the run of
+    rows the call read, exact, where a row the model copied out would not be."""
+    rows = [e.line for e in chunk if not e.agent and e.line]
+    return [min(rows), max(rows)] if rows else []
+
+
+def _first_row(targets: list) -> int:
+    """The row an annotation anchors at: a bare number, or the start of a run."""
+    if not targets:
+        return 0
+    head = targets[0]
+    if isinstance(head, int):
+        return head
+    start = str(head).split("..")[0]
+    return int(start) if start.isdigit() else 0
 
 
 def _chunk_activity(chunk: list[_Event]) -> bool:
@@ -3548,6 +3437,272 @@ def _turn_path(project_dir: str, uuid: str) -> pathlib.Path:
     return TURNS_DIR / project_dir / f"{uuid}.json"
 
 
+_NO_BULLETS_PREFIX = "- *no bullet list came back for this turn"
+
+_store_cache: dict[str, tuple[int, dict[str, list[dict]]]] = {}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(
+        timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _load_doc(target: pathlib.Path) -> dict | None:
+    try:
+        doc = json.loads(target.read_text())
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _save_doc(target: pathlib.Path, doc: dict) -> None:
+    """Written whole and moved into place, so a concurrent read never opens half a file."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=1))
+    tmp.replace(target)
+
+
+def _number_bullets(doc: dict) -> None:
+    """Every bullet in a file carries a number issued once, from the counter the
+    file's notes share (`issued`). Entries are walked in the order they were
+    written and a part already numbered keeps its numbers, so a re-summary
+    appends under fresh numbers and an id given out earlier still names the
+    same bullet."""
+    count = int(doc.get("issued") or 0)
+    entries = [e for e in (doc.get("summaries") or []) if isinstance(e, dict)]
+    for entry in sorted(entries, key=lambda e: str(e.get("written") or "")):
+        for part in entry.get("parts") or []:
+            if not isinstance(part, dict) or "numbers" in part:
+                continue
+            bullets = part.get("bullets") if isinstance(part.get("bullets"), list) else []
+            part["numbers"] = list(range(count + 1, count + 1 + len(bullets)))
+            count += len(bullets)
+    doc["issued"] = count
+
+
+def _latest_summary(doc: dict) -> dict | None:
+    entries = [e for e in (doc.get("summaries") or []) if isinstance(e, dict)]
+    return max(entries, key=lambda e: str(e.get("written") or ""), default=None)
+
+
+_UUID_FIELD_RE = re.compile(r'"uuid":\s*"([0-9a-f-]{36})"')
+
+
+def _stamp_turns(project_dir: str, docs: dict[pathlib.Path, dict]) -> int:
+    """Files written before the transcript and row were stamped get both, once:
+    this project's transcripts are scanned for their uuids, oldest first, so a
+    fork's parent is the one a shared uuid binds to. A uuid found in no
+    transcript is stamped with an empty session, or it would be scanned for on
+    every read."""
+    wanted = {str(d.get("uuid") or ""): p for p, d in docs.items()
+              if "session" not in d and d.get("uuid")}
+    if not wanted:
+        return 0
+    found: dict[str, tuple[str, int]] = {}
+    opened = 0
+    project = PROJECTS_ROOT / project_dir
+    files = sorted((p for p in project.glob("*.jsonl") if not p.name.startswith("agent-")),
+                   key=lambda p: p.stat().st_mtime) if project.is_dir() else []
+    for tp in files:
+        opened += 1
+        TRACE.file(tp, "stamp")
+        for lineno, raw in enumerate(tp.read_text(errors="replace").splitlines(), start=1):
+            m = _UUID_FIELD_RE.search(raw)
+            uid = m.group(1) if m else ""
+            if uid in wanted and uid not in found:
+                found[uid] = (tp.stem, lineno)
+        if len(found) == len(wanted):
+            break
+    for uid, target in wanted.items():
+        doc = docs[target]
+        doc["session"], doc["line"] = found.get(uid, ("", 0))
+        _number_bullets(doc)
+        _save_doc(target, doc)
+    TRACE.step("_stamp_turns", dir=project_dir, unstamped=len(wanted),
+               stamped=len(found), transcripts=opened)
+    return len(found)
+
+
+def _load_store(project_dir: str) -> dict[str, list[dict]]:
+    """Every turn and session file of one project, keyed by the transcript they
+    were stamped with. One directory read per run: the listing calls this once
+    per session, and every write into the directory moves a file into it, which
+    changes the directory's mtime, so that keys the cache."""
+    d = TURNS_DIR / project_dir
+    try:
+        stamp = d.stat().st_mtime_ns
+    except OSError:
+        return {}
+    hit = _store_cache.get(project_dir)
+    if hit and hit[0] == stamp:
+        return hit[1]
+    docs: dict[pathlib.Path, dict] = {}
+    for p in d.glob("*.json"):
+        doc = _load_doc(p)
+        if doc:
+            docs[p] = doc
+    if any("session" not in doc for doc in docs.values()):
+        _stamp_turns(project_dir, docs)
+        stamp = d.stat().st_mtime_ns
+    by: dict[str, list[dict]] = {}
+    for doc in docs.values():
+        session = str(doc.get("session") or "")
+        if session:
+            by.setdefault(session, []).append(doc)
+    for group in by.values():
+        group.sort(key=lambda doc: (str(doc.get("when") or ""), str(doc.get("uuid") or "")))
+    TRACE.step("_load_store", dir=project_dir, files=len(docs), sessions=len(by))
+    _store_cache[project_dir] = (stamp, by)
+    return by
+
+
+def _annotations_of(doc: dict) -> list[Annotation]:
+    """What one file serves: the latest entry's bullets as `recap`, then its
+    notes. Earlier entries stay on disk unserved, or one turn renders once per
+    prompt revision; the marked non-bullet line is prose a call replied with,
+    not a summary, so it is not served either."""
+    uuid = str(doc.get("uuid") or "")
+    session = str(doc.get("session") or "")
+    turn = uuid if uuid != session else ""
+    out: list[Annotation] = []
+    latest = _latest_summary(doc)
+    if latest:
+        line = int(doc.get("line") or 0)
+        for part in latest.get("parts") or []:
+            if not isinstance(part, dict):
+                continue
+            # The run of rows the chunk read, so the viewer spreads a turn's
+            # bullets along its work; a part from before rows were stored, or
+            # one whose events were all a sidecar's, anchors at the turn's row.
+            def span_targets(rows: list) -> list:
+                rows = [r for r in rows if isinstance(r, int)]
+                if len(rows) == 2 and rows[0] < rows[1]:
+                    return [f"{rows[0]}..{rows[1]}"]
+                return [rows[0]] if rows else []
+            run = span_targets(part.get("rows") or []) or ([line] if line else [])
+            spans = part.get("spans") or []
+            for k, (text, n) in enumerate(zip(part.get("bullets") or [],
+                                              part.get("numbers") or [])):
+                if not isinstance(text, str) or text.startswith(_NO_BULLETS_PREFIX):
+                    continue
+                own = span_targets(spans[k]) if k < len(spans) and isinstance(spans[k], list) else []
+                out.append(Annotation(f"{uuid}#{n}", int(n), "recap",
+                                      text[2:] if text.startswith("- ") else text,
+                                      own or run, str(latest.get("written") or ""),
+                                      turn, session))
+    for note in doc.get("notes") or []:
+        if not isinstance(note, dict):
+            continue
+        n = int(note.get("n") or 0)
+        out.append(Annotation(
+            f"{uuid}#{n}", n, str(note.get("kind") or "note"), str(note.get("text") or ""),
+            [t for t in (note.get("targets") or []) if isinstance(t, (int, str))],
+            str(note.get("written") or ""), turn, session, str(note.get("agent") or ""),
+            int(note.get("row") or 0), str(note.get("quote") or ""),
+            str(note.get("record") or "")))
+    return out
+
+
+def _file_note(project_dir: str, session: str, path: pathlib.Path | None,
+               targets: list[int], kind: str, text: str, *, agent: str = "",
+               row: int = 0, quote: str = "", record: str = "",
+               written: str = "") -> str:
+    """A hand-typed annotation into the store: under the turn whose gap holds
+    its row — the rightmost turn at or before it, the bisect `_chunk_events`
+    uses — or under the session file where there is no parent row. Returns the
+    id, which names the file and the number the note took."""
+    turn: _Turn | None = None
+    if targets and path is not None and path.exists() and not agent:
+        turns = _your_turns(path)
+        i = bisect.bisect_right([t.line for t in turns], _first_row(targets)) - 1
+        if i >= 0 and turns[i].uuid:
+            turn = turns[i]
+    target = _turn_path(project_dir, turn.uuid if turn else session)
+    doc = _load_doc(target) or {}
+    if turn:
+        doc.setdefault("uuid", turn.uuid)
+        doc.setdefault("when", turn.when)
+        doc.setdefault("kind", turn.kind)
+        doc.setdefault("line", turn.line)
+    else:
+        doc.setdefault("uuid", session)
+    doc["session"] = session
+    _number_bullets(doc)
+    n = int(doc.get("issued") or 0) + 1
+    doc["issued"] = n
+    note: dict = {"n": n, "kind": kind, "text": text, "targets": targets,
+                  "written": written or _now_iso()}
+    if agent:
+        note["agent"], note["row"] = agent, row
+    if quote:
+        note["quote"] = quote
+    if record:
+        note["record"] = record
+    doc.setdefault("notes", []).append(note)
+    _save_doc(target, doc)
+    TRACE.step("_file_note", file=target.name, n=n, kind=kind,
+               under="turn" if turn else "session", targets=targets or "session-level",
+               agent=agent or "—")
+    return f"{doc['uuid']}#{n}"
+
+
+def _remove_annotation(project_dir: str, spec: str) -> Annotation | None:
+    """Delete by id: the note leaves `notes`, or the bullet and its number leave
+    their part together, so the next recap reprints the turn without it. None
+    where the id names nothing served."""
+    uuid, _, num = spec.partition("#")
+    if not num.isdigit():
+        return None
+    n = int(num)
+    target = _turn_path(project_dir, uuid)
+    doc = _load_doc(target)
+    if not doc:
+        return None
+    hit = next((a for a in _annotations_of(doc) if a.n == n), None)
+    if hit is None:
+        return None
+    doc["notes"] = [x for x in (doc.get("notes") or [])
+                    if not (isinstance(x, dict) and x.get("n") == n)]
+    for entry in doc.get("summaries") or []:
+        for part in entry.get("parts") or []:
+            nums = part.get("numbers") or []
+            if n in nums:
+                k = nums.index(n)
+                bullets = part.get("bullets") or []
+                part["numbers"], part["bullets"] = nums[:k] + nums[k + 1:], bullets[:k] + bullets[k + 1:]
+    _save_doc(target, doc)
+    TRACE.step("_remove_annotation", file=target.name, n=n, kind=hit.kind)
+    return hit
+
+
+def _find_annotation(anns: list[Annotation], spec: str) -> Annotation:
+    """The one annotation an id names, by a prefix of the file's uuid and the
+    exact number after `#`. A prefix matching two files is a typo, listed
+    rather than picked."""
+    uuid, sep, num = spec.partition("#")
+    if not sep or not num.isdigit():
+        raise SystemExit(f"{spec!r} is not an id — they look like <uuid>#<n>; "
+                         "`chsum note --list` shows them")
+    hits = [a for a in anns if a.id.split("#")[0].startswith(uuid) and a.n == int(num)]
+    if not hits:
+        raise SystemExit(f"no annotation {spec!r} — `chsum note --list` shows them")
+    if len(hits) > 1:
+        rows = "\n".join(f"  {a.id}  {_clip_line(a.text, 60)}" for a in hits)
+        raise SystemExit(f"{spec!r} matches {len(hits)} annotations — use more characters:\n{rows}")
+    return hits[0]
+
+
+def _sidecar_path(path: pathlib.Path, agent: str) -> pathlib.Path:
+    return _mark_file(path, agent) or path if agent else path
+
+
+def _annotations_for(path: pathlib.Path) -> list[Annotation]:
+    """Everything the store holds for one transcript, file order then number."""
+    return [a for doc in _load_store(path.parent.name).get(path.stem, [])
+            for a in _annotations_of(doc)]
+
+
 def _turn_closers(path: pathlib.Path, spine: list[_Turn], until_ts: str) -> list[str]:
     """Per turn, the uuid of the last assistant record in its gap once that gap
     is closed, else "". A gap still open takes more records after the ones a
@@ -3604,7 +3759,7 @@ def _read_breakdown(project_dir: str, turn: _Turn, instructions: str, model: str
     """This turn's stored bullets, one list per chunk, or None. A hit needs the
     entry to name the same instructions and model, to hold one part per chunk,
     and every part to name the material of the chunk it is read for — the store
-    is checked against what it claims, the same rule as `_verify_stamp`."""
+    is checked against what it claims, the same rule as `resolve_ref`."""
     try:
         doc = json.loads(_turn_path(project_dir, turn.uuid).read_text())
     except (OSError, ValueError):
@@ -3631,33 +3786,26 @@ def _read_breakdown(project_dir: str, turn: _Turn, instructions: str, model: str
 
 
 def _write_breakdown(project_dir: str, turn: _Turn, closed_by: str,
-                     instructions: str, model: str, parts: list[dict]) -> None:
+                     instructions: str, model: str, parts: list[dict],
+                     session: str) -> None:
     """One turn's breakdown onto disk. An entry written under different
     instructions stays beside the new one rather than being dropped: the text a
-    past recap printed remains findable after `_CHUNK_PROMPT` changes."""
+    past recap printed remains findable after `_CHUNK_PROMPT` changes. The
+    transcript and row are stamped here, where the recap holds both, so serving
+    the file by transcript later is a filter and not a scan."""
     target = _turn_path(project_dir, turn.uuid)
-    doc: dict = {}
-    try:
-        loaded = json.loads(target.read_text())
-        if isinstance(loaded, dict):
-            doc = loaded
-    except (OSError, ValueError):
-        doc = {}
+    doc = _load_doc(target) or {}
     doc.update({"uuid": turn.uuid, "when": turn.when, "kind": turn.kind,
-                "closed_by": closed_by})
+                "closed_by": closed_by, "session": session, "line": turn.line})
     kept = [e for e in (doc.get("summaries") or [])
             if isinstance(e, dict) and (e.get("instructions") != instructions
                                         or e.get("model") != model)]
     doc["summaries"] = kept + [{
         "instructions": instructions, "model": model,
-        "written": datetime.now(timezone.utc).isoformat(
-            timespec="milliseconds").replace("+00:00", "Z"),
+        "written": _now_iso(),
         "parts": parts}]
-    target.parent.mkdir(parents=True, exist_ok=True)
-    # Written whole and moved into place, so a concurrent read never opens half a file.
-    tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=1))
-    tmp.replace(target)
+    _number_bullets(doc)
+    _save_doc(target, doc)
 
 
 def _turn_chunks(chunks: list[list[_Event]], boundaries: list[str]) -> list[list[int]]:
@@ -3697,7 +3845,7 @@ def _cached_turns(project_dir: str, spine: list[_Turn], chunks: list[list[_Event
 
 
 def _store_turn(project_dir: str, turn: _Turn, closed_by: str, parts: list[dict],
-                failed: bool, instructions: str, model: str) -> bool:
+                failed: bool, instructions: str, model: str, session: str) -> bool:
     """One finished turn onto disk, the moment its own chunks are in — a run
     killed part-way keeps every turn that completed. A turn holding a failed
     call is not written, or the missing part would come back as a hit."""
@@ -3705,7 +3853,7 @@ def _store_turn(project_dir: str, turn: _Turn, closed_by: str, parts: list[dict]
         return False
     if not any(part["bullets"] for part in parts):
         return False
-    _write_breakdown(project_dir, turn, closed_by, instructions, model, parts)
+    _write_breakdown(project_dir, turn, closed_by, instructions, model, parts, session)
     return True
 
 
@@ -3714,6 +3862,7 @@ _KIND_LABELS = {"said": "what Claude said", "edit": "file edits",
                 "failed": "failures (command + error)", "you": "your own turns",
                 "spawn": "subagents spawned", "tool": "other tool calls",
                 "command": "slash commands you ran",
+                "shell": "shell commands you ran with `!`",
                 "compacted": "conversation compaction"}
 
 
@@ -3993,6 +4142,49 @@ def _failures_section(events: list[_Event], session: str = "") -> list[str]:
 # A numbered list counts too — falling back to a flat timeline over a `1.` costs
 # the whole feature to save one alternation.
 _BULLET_START_RE = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+\S")
+# `- #3 #5-#7 text`: the event numbers a bullet leads with, in any of the
+# forms the prompt names, up to the first character that is not one.
+_BULLET_REFS_RE = re.compile(
+    r"^(?P<marker>\s*(?:[-*+]|\d{1,3}[.)])\s+)(?P<refs>(?:#\d+(?:\s*[-–]\s*#?\d+)?[\s,;]*)+)")
+_REF_RE = re.compile(r"#(\d+)(?:\s*[-–]\s*#?(\d+))?")
+
+
+def _bullet_refs(bullet: str) -> tuple[str, list[int]]:
+    """(the bullet with its leading event numbers removed, those numbers). A
+    number is what the model copied out of the extract, so nothing here trusts
+    it: the caller checks each against the chunk it was written for."""
+    m = _BULLET_REFS_RE.match(bullet)
+    if not m:
+        return bullet, []
+    refs: list[int] = []
+    for a, b in _REF_RE.findall(m.group("refs")):
+        lo, hi = int(a), int(b) if b else int(a)
+        refs.extend(range(min(lo, hi), max(lo, hi) + 1))
+    rest = bullet[m.end():]
+    if not rest.strip():
+        return bullet, []
+    return m.group("marker") + rest, refs
+
+
+def _chunk_parts(text: str, chunk: list[_Event]) -> tuple[list[str], list[list[int]]]:
+    """(bullets with their event numbers stripped, [first, last] parent row per
+    bullet). A bullet's numbers resolve to the rows of the events they name,
+    which is what claude-history places it at; a number outside the chunk, or
+    one naming only sidecar events, leaves [] and the bullet takes the chunk's
+    own run instead — a copied value checked against what it claims."""
+    bullets, spans = [], []
+    placed = 0
+    for raw in _chunk_bullets(text, strip=False):
+        bullet, refs = _bullet_refs(raw)
+        rows = [chunk[i - 1].line for i in refs
+                if 1 <= i <= len(chunk) and not chunk[i - 1].agent and chunk[i - 1].line]
+        ok = bool(refs) and len(rows) == len(refs)
+        bullets.append(bullet)
+        spans.append([min(rows), max(rows)] if ok else [])
+        placed += ok
+    TRACE.step("_chunk_parts", bullets=len(bullets), placed=placed,
+               fallback=len(bullets) - placed, events=len(chunk))
+    return bullets, spans
 
 
 def _timeline_bullets(text: str) -> tuple[list[str], list[str]]:
@@ -4013,7 +4205,7 @@ def _timeline_bullets(text: str) -> tuple[list[str], list[str]]:
     return preamble, bullets
 
 
-def _chunk_bullets(text: str) -> list[str]:
+def _chunk_bullets(text: str, strip: bool = True) -> list[str]:
     """One chunk digest's bullets, or a marked line when the reply carried none.
 
     A reply with no bullet markers is not a summary. On a chunk holding a single
@@ -4025,10 +4217,10 @@ def _chunk_bullets(text: str) -> list[str]:
     has bullets or it does not."""
     preamble, bullets = _timeline_bullets(text)
     if bullets:
-        return bullets
+        return [_bullet_refs(b)[0] for b in bullets] if strip else bullets
     if not preamble:
         return []
-    return [f"- *no bullet list came back for this turn; the call replied:* "
+    return [f"{_NO_BULLETS_PREFIX}; the call replied:* "
             f"{_clip_line(' '.join(preamble), 400)}"]
 
 
@@ -4414,9 +4606,13 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
 
     _status("reading the transcript…")
     events = _events_since(path, anchor_line, anchor_ts, until_ts)
-    # Your own turns are events too, or the extract shows a direction change with no cause.
-    if turns:
+    # Your own turns are events too, or the extract shows a direction change with
+    # no cause. The anchor included: without it the first turn of a window
+    # fingerprints differently from the same turn mid-window, and the store
+    # misses on it every time the window moves.
+    if turns is not None and not live:
         events += [_Event(t.when, "", "you", t.text) for t in turns]
+        events.append(_Event(anchor_ts, "", "you", prompt_text))
         events.sort(key=lambda e: e.when)
     _status(f"{_plural(len(events), 'event')} since {_hhmm(anchor_ts)}")
 
@@ -4594,16 +4790,18 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
                         continue
                     idx = turn_of[i]
                     text, usage, seconds, err = got
+                    bullets, spans = _chunk_parts(text, chunks[i]) if text else ([], [])
                     parts_by_turn[idx].append({
                         "material": _fingerprint(_chunk_material(chunks[i])),
-                        "bullets": _chunk_bullets(text) if text else [],
+                        "bullets": bullets, "spans": spans,
+                        "rows": _chunk_rows(chunks[i]),
                         "usage": usage or {}, "seconds": round(seconds, 3)})
                     turn_failed[idx] = turn_failed[idx] or bool(err)
                     outstanding[idx] -= 1
                     if outstanding[idx] == 0 and hits[idx] is None and _store_turn(
                             path.parent.name, spine[idx], closers[idx],
                             parts_by_turn[idx], turn_failed[idx], instructions,
-                            HaikuSummariser.model):
+                            HaikuSummariser.model, path.stem):
                         stored += 1
     if closers:
         TRACE.step("turn_store", written=stored, turns=len(spine),
@@ -4778,7 +4976,7 @@ class _Wizard:
 
     # Same columns `chsum` prints, in the same order — this is the screen where
     # you pick a session, and duration alone doesn't say which one was real work.
-    SESSION_HEADS = ("when", "dur", "prompts", "files", "agents", "marks", "")
+    SESSION_HEADS = ("when", "dur", "prompts", "files", "agents", "notes", "")
 
     @staticmethod
     def _session_row(p: pathlib.Path) -> tuple[str, ...]:
@@ -4790,7 +4988,7 @@ class _Wizard:
         title = ("✎ " if m.renamed else "") + (m.title or "(untitled)")
         return (_local_when(last_activity(p), mtime), m.duration or "-", str(m.prompts),
                 str(len(m.edited)), str(m.agent_count) if m.agent_count else "-",
-                f"⚑{len(m.marks)}" if m.marks else "-", title)
+                f"⚑{len(m.notes)}" if m.notes else "-", title)
 
     def _session_line(self, row: tuple[str, ...]) -> str:
         return ("  ".join(f"{c:<{w}}" for c, w in zip(row, self.widths))
@@ -4911,7 +5109,7 @@ class _Wizard:
         until = "" if hi == len(self.turns) - 1 else b.when
         events = _events_since(self.path, a.line, a.when, until)
         inner = [t for t in self.turns if a.when < t.when <= b.when]
-        events += [_Event(t.when, "", "you", t.text) for t in inner]
+        events += [_Event(t.when, "", "you", t.text) for t in [a] + inner]
         events.sort(key=lambda e: e.when)
         # Mirrors `_render_window`'s `spine`, so this prices the N calls a real run would make.
         spine = [a] + inner
@@ -5119,7 +5317,10 @@ def _recap_start(path: pathlib.Path, turns: list[_Turn]) -> int | None:
     governs whether that turn's bullets are *reused* — this only decides where
     to start reading."""
     project_dir = path.parent.name
-    stored = [bool(t.uuid) and _turn_path(project_dir, t.uuid).exists() for t in turns]
+    # Summaries, not the file: a file holding notes alone marks nothing as
+    # recapped, or a note against an unrecapped turn would move the start past it.
+    stored = [bool(t.uuid) and bool((_load_doc(_turn_path(project_dir, t.uuid)) or {})
+                                    .get("summaries")) for t in turns]
     first_new = next((i for i, done in enumerate(stored) if not done), None)
     TRACE.step("_recap_start", turns=len(turns), stored=sum(stored),
                start_turn=(first_new + 1) if first_new is not None else "(all stored)")
@@ -5280,13 +5481,13 @@ def cmd_sessions(args) -> int:
             str(m.prompts),
             str(len(m.edited)),
             str(m.agent_count) if m.agent_count else "-",
-            f"⚑{len(m.marks)}" if m.marks else "-",
+            f"⚑{len(m.notes)}" if m.notes else "-",
             # Marked, because provenance differs: one is Claude Code's reading of
             # the session, the other is yours.
             ("✎ " if m.renamed else "") + (m.title or "(untitled)") + here,
             delegated,  # past the width calculation, which stops at `heads`
         ))
-    heads = ("", "dur", "prompts", "files", "agents", "marks")  # dates fill the ref column
+    heads = ("", "dur", "prompts", "files", "agents", "notes")  # dates fill the ref column
     # Widths across every day: columns that shift per group read as separate tables.
     widths = [max(len(r[i]) for rs in by_day.values() for r in (*rs, heads))
               for i in range(len(heads))]
@@ -5377,9 +5578,9 @@ def cmd_journal(args) -> int:
                                 if m.resumed and m.date != (m.ended or "")[:10] else "") if b]
             print(f"### {m.title}")
             print(f"*{' · '.join(bits)}*\n")
-            for mk in m.marks:
-                print(f"⚑ {mk.reason}")
-            if m.marks:
+            for a in m.notes:
+                print(f"⚑ {a.text}")
+            if m.notes:
                 print()
             # Same five-then-count as the listing. A week's log is mostly a
             # question of what got worked on, and "2 agents" doesn't answer it.
@@ -5439,9 +5640,17 @@ off, interrupted, incomplete, or unfinished — that is a fact about the extract
 not about what happened.
 
 Who did what, by event kind. `said:`, `ran:`, `edit:`, `tool:`, `output:`,
-`failed:` and `spawn:` are all Claude's own work. Only two kinds are the
-user's: `you:` is something the user typed, and `command:` is a slash command
-the user ran. An event tagged `agent <id>` is a subagent Claude spawned.
+`failed:` and `spawn:` are all Claude's own work — `ran:` is a command Claude
+ran through its Bash tool, however shell-like it looks. Only three kinds are
+the user's: `you:` is something the user typed, `command:` is a slash command
+the user typed, and `shell:` is a command the user typed at the `!` prompt,
+followed by the tail of its output. An event tagged `agent <id>` is a subagent
+Claude spawned.
+
+Every event in the extract is numbered `#N`. Start each bullet with the
+numbers of the events it describes — `#3`, `#3-#5`, or `#3 #7` — then a
+space, then the sentence. The numbers are how each bullet is placed beside the
+events it covers, so name every event the bullet draws on and no other.
 
 Write a plain-language account of what happened in this slice, for someone
 who stepped away from the screen and is coming back to it. Markdown bullet
@@ -5465,7 +5674,9 @@ Hard rules:
   go in the account.
 - Attribute by the kinds above. Claude ran the commands and made the edits:
   write "Claude ran …" or leave the subject out ("the file was rewritten").
-  Never "the user ran" for a `ran:`, `edit:` or `tool:` event.
+  Never "the user ran" for a `ran:`, `edit:` or `tool:` event, and never
+  "Claude" for a `you:`, `command:` or `shell:` event — the user typed those,
+  and a `shell:` line is the command as typed, not a description of it.
 - Report outcomes only as recorded ("pytest printed 4 passed"), never as a
   judgement ("successfully", "correctly", "works").
 - No opinions, no advice, no closing summary, and no guesses about intent
@@ -5581,8 +5792,8 @@ def main(argv=None) -> int:
     p.add_argument("query", nargs="?")
     p.add_argument("--all", action="store_true", help="all workspaces (default: this one)")
     p.add_argument("--top", type=int, default=8)
-    p.add_argument("--marks", action="store_true",
-                   help="search what you marked with `chsum mark` (query optional)")
+    p.add_argument("--notes", "--marks", dest="notes", action="store_true",
+                   help="search what you noted with `chsum note` (query optional)")
     for mode in ("hybrid", "semantic", "lexical", "exact"):
         p.add_argument(f"--{mode}", dest="mode", action="store_const", const=mode)
     p.set_defaults(mode="hybrid", func=cmd_find)
@@ -5656,34 +5867,44 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_context)
 
     p = sub.add_parser(
-        "mark", parents=[dbg], help="flag this moment as notable, for the digest to pick up",
-        description="Prints a marker. Nothing is written: run through Claude Code's "
-                    "`!` prefix, the harness records the run itself, so the mark lands "
-                    "in the transcript where you typed it.",
+        "note", parents=[dbg], aliases=["annotate", "mark"],
+        help="note this moment, for digests and claude-history to pick up",
+        description="Files a note in chsum's store against the message it follows. "
+                    "Prints nothing: nothing is recorded by the harness any more. "
+                    "`annotate` and `mark` are the same command.",
     )
-    p.add_argument("reason", nargs="*", help="why this matters — quoted verbatim later")
+    p.add_argument("text", nargs="*", help="the note — quoted verbatim later")
     p.add_argument("--at", metavar="ID",
-                   help="mark an earlier message: a record id from --recent, or a row number")
+                   help="note an earlier message: a record id from --recent, or a row number")
     p.add_argument("--match", metavar="TEXT",
-                   help="mark the one message containing TEXT; lists candidates if "
+                   help="note the one message containing TEXT; lists candidates if "
                         "more than one matches")
     p.add_argument("--recent", nargs="?", type=int, const=20, default=None, metavar="N",
                    help="list the last N messages and tool calls (default 20), with "
                         "the record ids --at takes")
     p.add_argument("--list", action="store_true",
-                   help="marks made in this conversation, with the ids --revoke takes")
+                   help="this conversation's notes and recap bullets, with the ids "
+                        "--delete takes")
     p.add_argument("--show", metavar="ID",
-                   help="where a mark landed: file, row, time, agent, and the "
+                   help="where an annotation landed: file, row, time, agent, and the "
                         "message it points at")
     p.add_argument("--context", type=int, default=3, metavar="N",
                    help="with --show: N records either side of it (default 3)")
     p.add_argument("--full", action="store_true",
-                   help="with --list: whole reason and whole marked message, unclipped")
-    p.add_argument("--revoke", nargs="+", metavar="ID",
-                   help="drop marks made earlier (they stay in the transcript, "
-                        "but stop counting)")
+                   help="with --list: whole text and whole targeted message, unclipped")
+    p.add_argument("--delete", nargs="+", metavar="ID", help="remove annotations")
     p.add_argument("--file", help="transcript path (default: the session you're in)")
-    p.set_defaults(func=cmd_mark)
+    p.set_defaults(func=cmd_note)
+
+    p = sub.add_parser(
+        "annotations", parents=[dbg],
+        help="the annotator claude-history calls: read|write|delete over JSON",
+        description="One JSON object on stdin, one on stdout. `read` takes "
+                    "{\"conversations\": [paths]} and serves every annotation the store "
+                    "holds for them; `write` files a note; `delete` removes one by id.",
+    )
+    p.add_argument("op", choices=["read", "write", "delete"])
+    p.set_defaults(func=cmd_annotations)
 
     p = sub.add_parser(
         "name", parents=[dbg], help="rename a conversation to what it actually was",
