@@ -4426,9 +4426,12 @@ def _failures_section(events: list[_Event], session: str = "") -> list[str]:
 # the whole feature to save one alternation.
 _BULLET_START_RE = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+\S")
 # `- #3 #5-#7 text`: the event numbers a bullet leads with, in any of the
-# forms the prompt names, up to the first character that is not one.
+# forms the prompt names, up to the first character that is not one. The
+# trailing class takes the separator the model punctuated with: `- #12: text`
+# left the colon behind and rendered as `- : text`.
 _BULLET_REFS_RE = re.compile(
-    r"^(?P<marker>\s*(?:[-*+]|\d{1,3}[.)])\s+)(?P<refs>(?:#\d+(?:\s*[-–]\s*#?\d+)?[\s,;]*)+)")
+    r"^(?P<marker>\s*(?:[-*+]|\d{1,3}[.)])\s+)(?P<refs>(?:#\d+(?:\s*[-–]\s*#?\d+)?[\s,;]*)+)"
+    r"(?P<sep>[:.–—-]*\s*)")
 _REF_RE = re.compile(r"#(\d+)(?:\s*[-–]\s*#?(\d+))?")
 
 
