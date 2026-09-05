@@ -1,7 +1,6 @@
 # Contributing
 
-`CLAUDE.md` is the design brief — the rules a change has to hold to, and why.
-Read it before changing `chsum.py`. This file is the mechanics.
+`README.md` is the user-facing doc. This file is the mechanics.
 
 ## Setup
 

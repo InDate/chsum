@@ -25,8 +25,8 @@ from.
   far.** — a bare `chsum recap` reads the live transcript from your last prompt
   onward, failures quoted first. → [`chsum recap`](#the-bare-run)
 - **A new session needs the context of an old one, without a model paraphrasing
-  it.** — `chsum context <ref>` prints the digest as a paste-ready artifact with a
-  provenance header. → [`chsum context`](#chsum-context)
+  it.** — `chsum digest <ref> --stdout` prints the digest as a paste-ready
+  artifact. → [`chsum digest`](#chsum-digest)
 - **Which session was that, and which of them went anywhere?** — bare `chsum` lists
   this project's sessions with duration, prompts, files, agents and notes, dead
   ends included. → [`chsum`](#chsum-1)
@@ -56,7 +56,6 @@ The commands, one section each:
 | [`chsum`](#chsum-1) | list this project's sessions, newest activity first |
 | [`chsum recap`](#chsum-recap) | what happened over a window of turns, with a model-written timeline |
 | [`chsum digest`](#chsum-digest) | one conversation, verbatim and computed, plus row-level views |
-| [`chsum context`](#chsum-context) | the digest as a reload artifact for pasting into Claude |
 | [`chsum journal`](#chsum-journal) | a work log across sessions |
 | [`chsum find`](#chsum-find) | locate a conversation or a note by what it said |
 | [`chsum note`](#chsum-note) | mark the moment that mattered |
@@ -141,8 +140,8 @@ you never agreed to.
 
 ## Picking a conversation, and a window of it
 
-`recap`, `digest` and `context` take the same selectors, so a window you found in
-one runs in the others unchanged:
+`recap` and `digest` take the same selectors, so a window you found in
+one runs in the other unchanged:
 
 ```sh
 chsum digest                          # the session you are in
@@ -169,10 +168,10 @@ started last week; run from inside Claude Code, the session doing the running is
 excluded. Everything scopes to the current project; `--all` widens it.
 
 A subagent has an address of its own, `<parent-ref>/<agent-id>`, taken by
-`digest` and `context`:
+`digest`:
 
 ```sh
-chsum context ch_da4e99d42e5efab11ebdedc22fb65145/a728cd49179f1a356
+chsum digest ch_da4e99d42e5efab11ebdedc22fb65145/a728cd49179f1a356 --stdout
 ```
 
 ## `chsum`
@@ -208,10 +207,10 @@ one prompt. The session running right now is listed too, tagged in progress; its
 numbers trail the conversation, since Claude Code is still appending.
 
 Subagents are named, not just counted, because "3 agents" says nothing about a
-session that delegated its work — and the id is the one `chsum context
-<ref>/<id>` takes. Five deep, then a count. Five sessions too, by default: the
-listing is usually read into a context window, and `-n 0 --all` is the whole
-corpus.
+session that delegated its work — and the id is the one `chsum digest
+<ref>/<id> --stdout` takes. Five deep, then a count. Five sessions too, by
+default: the listing is usually read into a context window, and `-n 0 --all`
+is the whole corpus.
 
 A `recap` column states the turn store's coverage of each session — `3/12 · 2h
 ago` is turns holding a breakdown over turns there are — and a `✎` marks a title
@@ -350,6 +349,8 @@ exchange; and the `sed` line that opens any row. A bare run prints the digest of
 the session you are in; naming a session (a ref, `--last`, `--file`) writes it to
 a file and prints the path, and `--stdout` prints it instead.
 
+https://github.com/user-attachments/assets/93f3cdac-cf82-403a-8333-5c8e42159fd7
+
 ```sh
 chsum digest                                   # this session, printed
 chsum digest <ch_ref>                          # write a digest file
@@ -458,26 +459,11 @@ Open a record: `sed -n '18p' ~/.claude/projects/…/f1b9bbc6-….jsonl`
 - `01CPKjYaSD`  `f1b9bbc6:26`  11:30:28  Bash  `ls && wc -l chsum.py`
 ```
 
-## `chsum context`
-
-The digest as a reload artifact: the same content with a provenance header
-stating that no model wrote it, for pasting into a new Claude session.
-
-```sh
-chsum context                                  # this session
-chsum context --last                           # the previous one
-chsum context <ch_ref>                         # a named one
-chsum context <ch_ref>/<agent-id>              # one subagent's own digest
-```
-
-`context` covers a whole conversation and takes no `--messages` window; it says
-so and names `digest --messages` when given one.
-
 ## `chsum journal`
 
 A chronological work log across sessions, under day headings: each session's
-title, its duration, project and branch, the `chsum context` line that reloads
-it, each subagent's task line, and your notes inline.
+title, its duration, project and branch, the `chsum digest --stdout` line that
+reloads it, each subagent's task line, and your notes inline.
 
 ```sh
 chsum journal --since 7d                       # this project, the last week
@@ -650,6 +636,8 @@ at and matches in `claude-history agent search`, tagged by kind. A note typed in
 its viewer (`a`) is filed by chsum the same way `chsum note` files one, and `d`
 there deletes through chsum. `chsum annotations read|write|delete` takes one JSON
 object on stdin and answers with one on stdout.
+
+<img src="https://raw.githubusercontent.com/InDate/chsum/main/meta/chsum_notes_in_claude-history.webp" alt="chsum notes shown at their rows in claude-history's viewer" width="800" />
 
 ## `chsum hook`
 

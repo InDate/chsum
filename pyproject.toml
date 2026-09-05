@@ -25,4 +25,4 @@ chsum = "chsum:main"
 only-include = ["chsum.py"]
 
 [tool.hatch.build.targets.sdist]
-include = ["chsum.py", "README.md", "CLAUDE.md", "LICENSE"]
+include = ["chsum.py", "README.md", "LICENSE"]

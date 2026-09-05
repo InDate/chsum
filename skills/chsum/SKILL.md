@@ -17,10 +17,10 @@ on as fact.
 |---|---|
 | `chsum` | List this project's five most recent sessions (default). `-n 25`, `--since 7d`, `--all` |
 | `chsum recap` | This session, from wherever the last recap stopped. `--full` for all of it |
-| `chsum context --last` | The most recent session that isn't this one. `--last 2` for the one before |
+| `chsum digest --last --stdout` | The most recent session that isn't this one. `--last 2` for the one before |
 | `chsum find "<query>"` | Find a session by content. `--lexical` for identifiers/filenames/errors |
-| `chsum context <ref>` | Full digest, for reloading into the conversation |
-| `chsum context <ref>/<agent-id>` | One subagent's own digest |
+| `chsum digest <ref> --stdout` | Full digest, for reloading into the conversation |
+| `chsum digest <ref>/<agent-id> --stdout` | One subagent's own digest |
 | `chsum digest <ref>` | Same, written to a file (`--stdout` to print) |
 | `chsum digest <ref> --commands` | Every Bash call in order, unfiltered, each with a `<session>:<line>` locator into the raw JSONL |
 | `chsum digest <ref> --messages` | Every message in order, each locating its own record |
@@ -156,8 +156,8 @@ nudge again next session.
 
 - Vague reference ("the one about the overlays") → `find`. Default hybrid search
   takes tens of seconds warm, minutes on a cold index; `--lexical` is sub-second.
-- "Yesterday" / "last time" → `chsum` first, match on date, then `context`. The
-  most recent session is often not the one meant.
+- "Yesterday" / "last time" → `chsum` first, match on date, then `digest <ref>
+  --stdout`. The most recent session is often not the one meant.
 - What's been happening → `journal --since 7d`.
 - A specific stretch of a past session, not the whole thing → `recap <ref>
   --messages N M`.

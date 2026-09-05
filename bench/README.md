@@ -103,9 +103,8 @@ arrives attached to its evidence:
 ```
 
 32 of 32 emitted timestamps appear verbatim in the material given to that call.
-CLAUDE.md records an earlier design that carried `HH:MM` through the summariser
-and was deleted; there the copied time *placed* the bullet, so a wrong copy
-misplaced it silently. Here it attributes, and a wrong copy is what `invented`
+An earlier design carried `HH:MM` through the summariser and was deleted; there
+the copied time *placed* the bullet, so a wrong copy misplaced it silently. Here it attributes, and a wrong copy is what `invented`
 counts.
 
 ### The reading, which overturned the counts

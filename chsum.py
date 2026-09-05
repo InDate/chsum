@@ -5,7 +5,7 @@ Every line of output is copied verbatim or computed, never invented. Prose
 generation lives behind the `Summariser` seam and prints beneath the verbatim
 record, labelled model-written.
 
-Commands: sessions (default), last, find, digest, context, mark, journal.
+Commands: sessions (default), last, find, digest, mark, journal.
 """
 
 from __future__ import annotations
@@ -701,6 +701,10 @@ class Annotation:
     row: int = 0  # row inside that sidecar
     quote: str = ""  # first line of the targeted record, verbatim
     record: str = ""  # the sentinel record an imported mark came from
+    # The file and rows the text was written from, where that is not the
+    # conversation itself: {"path": …, "lines": "a..b"}. A sidecar's rows do not
+    # order against the parent's, so they travel as a path and not as `targets`.
+    origin: dict | None = None
 
 
 def _record_text(rec: dict) -> str:
@@ -1466,7 +1470,7 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
         if len(meta.agents) > 8:
             parts.append(f"- …and {len(meta.agents) - 8} more")
         parts.append("")
-        parts.append(f"One agent's own digest: `chsum context {ref}/<id>`\n")
+        parts.append(f"One agent's own digest: `chsum digest {ref}/<id> --stdout`\n")
 
     if meta.commands:
         parts.append("## Commands run\n")
@@ -1604,7 +1608,7 @@ def _find_notes(args) -> int:
     for session, path, a in rows[:args.top]:
         ref = ch_ref_for_path(path) if path else session[:8]
         print(f"{ref}  {a.written[:10]}  ⚑ {a.text}")
-    print(f"\nRead one: `chsum context <ref>`", file=sys.stderr)
+    print(f"\nRead one: `chsum digest <ref> --stdout`", file=sys.stderr)
     return 0
 
 
@@ -1767,6 +1771,30 @@ def _locator(row: _Row, session: str) -> str:
     part alone is not — a fork copies a sidecar under the same name."""
     who = f"{session[:8]}/{row.agent[:8]}" if row.agent else session[:8]
     return f"{who}:{row.line}"
+
+
+def _source_label(path: pathlib.Path) -> str:
+    """`<project> · <session>` for the transcript a run read. The project is the
+    `cwd` a record carries, not the parent directory's slug, which joins path
+    segments on `-` and cannot be split back where a segment holds one. The scan
+    stops at 50 records so a transcript carrying no `cwd` costs a head, not a
+    whole read."""
+    name = ""
+    try:
+        with path.open(errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= 50:
+                    break
+                try:
+                    cwd = json.loads(line).get("cwd")
+                except (json.JSONDecodeError, AttributeError):
+                    continue
+                if cwd:
+                    name = pathlib.Path(cwd).name
+                    break
+    except OSError:
+        pass
+    return f"{name} \u00b7 {path.stem[:8]}" if name else path.stem[:8]
 
 
 # `.message.content` is a string on a typed record and a list of parts on every
@@ -2295,8 +2323,8 @@ def _digest_for(ref: str) -> tuple[Meta, str]:
 
 
 def _target(args, here=None) -> tuple[pathlib.Path, list[int]]:
-    """Which conversation, and which of your turns — one resolver for `recap`,
-    `digest` and `context`, so a window typed for one runs on the others. A ref
+    """Which conversation, and which of your turns — one resolver for `recap`
+    and `digest`, so a window typed for one runs on the other. A ref
     and turn numbers arrive on `spec` and on the view flag beside it, and
     `_split_spec` separates them by shape. `--last N` takes the Nth most recent
     conversation that is not this one; `--here` overrides both and takes the one
@@ -2384,27 +2412,6 @@ def cmd_digest(args) -> int:
     dest = args.out / (f"{meta.uuid}-agent-{agent_id}.md" if agent_id else f"{meta.uuid}.md")
     dest.write_text(md)
     print(f"wrote {dest}")
-    return 0
-
-
-def cmd_context(args) -> int:
-    """Reload artifact. Same content as the digest, with a provenance header so a
-    future reader knows exactly how much to trust it (answer: it's verbatim)."""
-    _, span = _target(args)
-    if span:
-        raise SystemExit("context covers the whole conversation and takes no "
-                         "turn numbers — `chsum digest --messages N M` for a window")
-    ref = resolve_ref(args)
-    meta, md = _digest_for(ref)
-    parent_ref, agent_id = _split_agent_ref(ref)
-    print("<!-- Extracted verbatim from the transcript by chsum. No model wrote this;")
-    print("     nothing here is paraphrased. Quotes may be clipped — full text is in")
-    if agent_id:
-        print("     the sidecar named under Drill down. -->")
-    else:
-        print(f"     the transcript, at the rows named: sed -n '<line>p' <file> | jq -->")
-    print()
-    sys.stdout.write(md)
     return 0
 
 
@@ -2683,7 +2690,7 @@ def cmd_note(args) -> int:
     if args.list:
         anns = _annotations_for(path)
         if not anns:
-            print(f"nothing noted in {path}", file=sys.stderr)
+            print(f"nothing noted in {_source_label(path)}", file=sys.stderr)
             return 1
         if args.full:
             # Keyed by file: a note can point into a sidecar, whose line numbers mean nothing here.
@@ -2708,7 +2715,8 @@ def cmd_note(args) -> int:
                         subsequent_indent="    "))))
                     first = False
             sys.stdout.flush()
-            print(f"\n{_plural(len(anns), 'annotation')} in {path}", file=sys.stderr)
+            print(f"\n{_plural(len(anns), 'annotation')} in {_source_label(path)}",
+                  file=sys.stderr)
             return 0
         # Two lines each: the text and the message it targets are both prose.
         rows = [(_clip_line(a.text, 60),
@@ -2727,7 +2735,7 @@ def cmd_note(args) -> int:
         # Flushed first, or the hint jumps the list: stdout is block-buffered when
         # piped, stderr never is.
         sys.stdout.flush()
-        print(f"\n{path}\nShow one: `chsum note --show <id>`  ·  "
+        print(f"\n{_source_label(path)}\nShow one: `chsum note --show <id>`  ·  "
               "drop one: `chsum note --delete <id>`", file=sys.stderr)
         return 0
 
@@ -2806,6 +2814,8 @@ def cmd_annotations(args) -> int:
                     row["turn"] = a.turn
                 if a.agent:
                     row["agent"], row["row"] = a.agent, a.row
+                if a.origin:
+                    row["origin"] = a.origin
                 out.append(row)
         print(json.dumps({"annotations": out}, ensure_ascii=False))
         TRACE.step("annotations", op="read",
@@ -3411,6 +3421,47 @@ def _chunk_rows(chunk: list[_Event]) -> list[int]:
     return [min(rows), max(rows)] if rows else []
 
 
+def _launch_rows(path: pathlib.Path) -> dict[str, int]:
+    """Sidecar id to the parent row holding the `Agent` call that launched it.
+    Each sidecar's `.meta.json` carries the `toolUseId` of that call, and one
+    read of the parent resolves every id to its row. This is where a bullet
+    describing an agent's work anchors: the agent's own rows sit in another
+    file and do not order against the parent's."""
+    want: dict[str, str] = {}
+    for side in subagent_transcripts(path):
+        try:
+            d = json.loads(side.with_suffix(".meta.json").read_text(errors="replace"))
+        except (OSError, ValueError):
+            continue
+        tid = str(d.get("toolUseId") or "") if isinstance(d, dict) else ""
+        if tid:
+            want[tid] = side.stem.removeprefix("agent-")
+    if not want:
+        return {}
+    rows: dict[str, int] = {}
+    TRACE.file(path, "launch")
+    for lineno, raw in enumerate(path.read_text(errors="replace").splitlines(), start=1):
+        hits = [t for t in want if want[t] not in rows and f'"{t}"' in raw]
+        if not hits:
+            continue
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict) or rec.get("type") != "assistant":
+            continue
+        content = (rec.get("message") or {}).get("content")
+        calls = {p.get("id") for p in content
+                 if isinstance(p, dict) and p.get("type") == "tool_use"} if isinstance(content, list) else set()
+        for tid in hits:
+            if tid in calls:
+                rows[want[tid]] = lineno
+        if len(rows) == len(want):
+            break
+    TRACE.step("_launch_rows", sidecars=len(want), resolved=len(rows))
+    return rows
+
+
 def _first_row(targets: list) -> int:
     """The row an annotation anchors at: a bare number, or the start of a run."""
     if not targets:
@@ -3490,6 +3541,24 @@ def _turn_path(project_dir: str, uuid: str) -> pathlib.Path:
 _NO_BULLETS_PREFIX = "- *no bullet list came back for this turn"
 
 _store_cache: dict[str, tuple[int, dict[str, list[dict]]]] = {}
+# One read per sidecar for a whole run: a turn's bullets name the same few agents.
+_agent_desc_cache: dict[str, str] = {}
+
+
+def _agent_description(side: str) -> str:
+    """The task line a sidecar was launched with, from its `.meta.json`. This
+    is what names the agent a bullet describes; the bullet's own text names
+    only "Agent" and its clipped id."""
+    hit = _agent_desc_cache.get(side)
+    if hit is not None:
+        return hit
+    try:
+        d = json.loads(pathlib.Path(side).with_suffix(".meta.json").read_text(errors="replace"))
+    except (OSError, ValueError):
+        d = {}
+    got = str(d.get("description") or "") if isinstance(d, dict) else ""
+    _agent_desc_cache[side] = got
+    return got
 
 
 def _now_iso() -> str:
@@ -3632,15 +3701,26 @@ def _annotations_of(doc: dict) -> list[Annotation]:
                 return [rows[0]] if rows else []
             run = span_targets(part.get("rows") or []) or ([line] if line else [])
             spans = part.get("spans") or []
+            # Written per bullet since a turn's gap can run several agents; a
+            # part from before they were stored has neither and serves as it did.
+            agents = part.get("agents") or []
+            origins = part.get("origins") or []
             for k, (text, n) in enumerate(zip(part.get("bullets") or [],
                                               part.get("numbers") or [])):
                 if not isinstance(text, str) or text.startswith(_NO_BULLETS_PREFIX):
                     continue
                 own = span_targets(spans[k]) if k < len(spans) and isinstance(spans[k], list) else []
+                body = text[2:] if text.startswith("- ") else text
+                origin = origins[k] if k < len(origins) and isinstance(origins[k], dict) else None
+                # The description is read here rather than stored, so the served
+                # text follows the sidecar's own metadata and the stored bullet
+                # stays the model's words.
+                desc = _agent_description(str(origin.get("path") or "")) if (
+                    origin and k < len(agents) and agents[k]) else ""
                 out.append(Annotation(f"{uuid}#{n}", int(n), "recap",
-                                      text[2:] if text.startswith("- ") else text,
+                                      f"{desc}: {body}" if desc else body,
                                       own or run, str(latest.get("written") or ""),
-                                      turn, session))
+                                      turn, session, origin=origin))
     for note in doc.get("notes") or []:
         if not isinstance(note, dict):
             continue
@@ -3719,8 +3799,13 @@ def _remove_annotation(project_dir: str, spec: str) -> Annotation | None:
             nums = part.get("numbers") or []
             if n in nums:
                 k = nums.index(n)
-                bullets = part.get("bullets") or []
-                part["numbers"], part["bullets"] = nums[:k] + nums[k + 1:], bullets[:k] + bullets[k + 1:]
+                # Every per-bullet list is indexed by the same k, so one that
+                # kept the removed entry would place the bullets after it by
+                # the row, agent and origin of the one before.
+                for key in ("numbers", "bullets", "spans", "agents", "origins"):
+                    have = part.get(key)
+                    if isinstance(have, list) and k < len(have):
+                        part[key] = have[:k] + have[k + 1:]
     _save_doc(target, doc)
     TRACE.step("_remove_annotation", file=target.name, n=n, kind=hit.kind)
     return hit
@@ -4182,7 +4267,7 @@ def _checkpoint_shas(project_dir: pathlib.Path | None, session_uuid: str) -> lis
     """(timestamp, sha) per turn the `chsum hook stop` Stop hook
     committed-then-reset-away for this session, oldest first (the raw reflog
     is newest-first). Never raises: no repo, no `git`, no hook installed, or
-    a reflog that's already aged the entries out (see CLAUDE.md) all degrade
+    a reflog that's already aged the entries out all degrade
     to `[]`, same as a session that never had checkpoints at all — this must
     be exactly as forgiving as the rest of this file's summariser-failure
     handling, even though no model call is involved."""
@@ -4452,25 +4537,46 @@ def _bullet_refs(bullet: str) -> tuple[str, list[int]]:
     return m.group("marker") + rest, refs
 
 
-def _chunk_parts(text: str, chunk: list[_Event]) -> tuple[list[str], list[list[int]]]:
+def _chunk_parts(text: str, chunk: list[_Event],
+                 launch: dict[str, int]) -> tuple[list[str], list[list[int]],
+                                                  list[str], list[dict | None]]:
     """(bullets with their event numbers stripped, [first, last] parent row per
-    bullet). A bullet's numbers resolve to the rows of the events they name,
-    which is what claude-history places it at; a number outside the chunk, or
-    one naming only sidecar events, leaves [] and the bullet takes the chunk's
-    own run instead — a copied value checked against what it claims."""
-    bullets, spans = [], []
-    placed = 0
+    bullet, the sidecar each bullet describes, where its text came from). A
+    bullet's numbers resolve to the rows of the events they name, which is what
+    claude-history places it at; a number outside the chunk leaves [] and the
+    bullet takes the chunk's own run instead — a copied value checked against
+    what it claims.
+
+    A bullet whose numbers name one sidecar's events anchors at that sidecar's
+    launch row and carries the sidecar's own file and rows as its origin. Its
+    events sit in another file, so without that it takes the chunk's run and
+    stacks with every other bullet of the chunk. Two or more sidecars in one
+    bullet name no single file, so that bullet keeps the chunk's run."""
+    bullets, spans, agents, origins = [], [], [], []
+    placed = anchored = 0
     for raw in _chunk_bullets(text, strip=False):
         bullet, refs = _bullet_refs(raw)
-        rows = [chunk[i - 1].line for i in refs
-                if 1 <= i <= len(chunk) and not chunk[i - 1].agent and chunk[i - 1].line]
-        ok = bool(refs) and len(rows) == len(refs)
+        named = [chunk[i - 1] for i in refs if 1 <= i <= len(chunk)]
+        ok = bool(refs) and len(named) == len(refs)
+        rows = [e.line for e in named if not e.agent and e.line]
+        side = {e.agent for e in named if e.agent}
+        agent = next(iter(side)) if ok and len(side) == 1 else ""
+        lines = sorted(e.line for e in named if e.agent == agent and e.line) if agent else []
+        src = next((e.source for e in named if e.agent == agent and e.source), None) if agent else None
         bullets.append(bullet)
-        spans.append([min(rows), max(rows)] if ok else [])
-        placed += ok
-    TRACE.step("_chunk_parts", bullets=len(bullets), placed=placed,
-               fallback=len(bullets) - placed, events=len(chunk))
-    return bullets, spans
+        agents.append(agent)
+        origins.append({"path": str(src),
+                        "lines": f"{lines[0]}..{lines[-1]}" if lines[0] != lines[-1] else str(lines[0])}
+                       if lines and src else None)
+        if agent and agent in launch:
+            spans.append([launch[agent]])
+            anchored += 1
+        else:
+            spans.append([min(rows), max(rows)] if ok and len(rows) == len(refs) else [])
+            placed += ok and len(rows) == len(refs)
+    TRACE.step("_chunk_parts", bullets=len(bullets), placed=placed, anchored=anchored,
+               fallback=len(bullets) - placed - anchored, events=len(chunk))
+    return bullets, spans, agents, origins
 
 
 def _timeline_bullets(text: str) -> tuple[list[str], list[str]]:
@@ -5071,6 +5177,9 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
     # written the moment it finishes, and its gap has to already be known closed.
     closers = ([] if not write_store or all(h is not None for h in hits)
                else _turn_closers(path, spine, until_ts))
+    # One read of the parent for the whole run, not one per chunk: every chunk
+    # of every turn anchors its agent bullets against the same launch rows.
+    launch = _launch_rows(path) if closers else {}
     outstanding = [sum(1 for i in idxs if i in pending) for idxs in per_turn]
     parts_by_turn: list[list[dict]] = [[] for _ in spine]
     turn_failed = [False] * len(spine)
@@ -5101,10 +5210,13 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
                         continue
                     idx = turn_of[i]
                     text, usage, seconds, err = got
-                    bullets, spans = _chunk_parts(text, chunks[i]) if text else ([], [])
+                    bullets, spans, agents, origins = (
+                        _chunk_parts(text, chunks[i], launch) if text
+                        else ([], [], [], []))
                     parts_by_turn[idx].append({
                         "material": _fingerprint(_chunk_material(chunks[i])),
                         "bullets": bullets, "spans": spans,
+                        "agents": agents, "origins": origins,
                         "rows": _chunk_rows(chunks[i]),
                         "usage": usage or {}, "seconds": round(seconds, 3)})
                     turn_failed[idx] = turn_failed[idx] or bool(err)
@@ -5345,7 +5457,7 @@ def cmd_sessions(args) -> int:
         assert m.path is not None  # every `m` here came from extract_meta, which always sets it
         # Tagged since its numbers are a snapshot — still being appended to.
         here = " · this session (in progress)" if m.path.stem == live else ""
-        # Ids in full — `chsum context <ref>/<id>` matches exactly, so a clipped one wouldn't resolve.
+        # Ids in full — `chsum digest <ref>/<id> --stdout` matches exactly, so a clipped one wouldn't resolve.
         delegated = [f"{r.id}  {_clip_line(r.description, cols - len(r.id) - 8)}"
                      if r.description else r.id for r in m.agents[:5]]
         if m.agent_count > len(delegated):
@@ -5386,7 +5498,8 @@ def cmd_sessions(args) -> int:
                 print(_dim(f"      {line}"))
         print()
     sys.stdout.flush()
-    print("Read one: `chsum context <ref>`   Most recent real session: `chsum context --last`",
+    print("Read one: `chsum digest <ref> --stdout`   "
+          "Most recent real session: `chsum digest --last --stdout`",
           file=sys.stderr)
     return 0
 
@@ -5479,7 +5592,7 @@ def cmd_journal(args) -> int:
                       + ", ".join(f"`{f}`" for f in m.edited[:6])
                       + (f" +{len(m.edited) - 6} more" if len(m.edited) > 6 else ""))
                 print()
-            print(f"`chsum context {ch_ref_for_path(m.path)}`\n")
+            print(f"`chsum digest {ch_ref_for_path(m.path)} --stdout`\n")
     return 0
 
 
@@ -5656,9 +5769,9 @@ def main(argv=None) -> int:
     dbg.add_argument("--debug", action="store_true",
                      help="print what this run read, ran and resolved, for pasting "
                           "into a chsum session to reproduce from")
-    # The second parent: `recap`, `digest` and `context` answer "which
+    # The second parent: `recap` and `digest` answer "which
     # conversation, which turns" in one spelling, so a window typed for one runs
-    # on the others. `_target` reads exactly what this declares.
+    # on the other. `_target` reads exactly what this declares.
     win = argparse.ArgumentParser(add_help=False)
     win.add_argument("spec", nargs="*", metavar="REF|N",
                      help="ch_... ref from `chsum find`, and one or two turn "
@@ -5722,10 +5835,6 @@ def main(argv=None) -> int:
     p.add_argument("--call", metavar="ID",
                    help="one tool call whole, with its output")
     p.set_defaults(func=cmd_digest)
-
-    p = sub.add_parser("context", parents=[dbg, win],
-                       help="reload artifact for pasting back into Claude")
-    p.set_defaults(func=cmd_context)
 
     p = sub.add_parser(
         "note", parents=[dbg], aliases=["annotate", "mark"],

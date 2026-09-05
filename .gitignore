@@ -7,3 +7,5 @@ __pycache__/
 # Bench outputs: per-run artefacts, read locally. The material and variants
 # are committed, which is what makes two runs comparable.
 bench/out/
+meta/*.mov
+meta/*.mp4
