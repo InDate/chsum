@@ -518,6 +518,9 @@ class Meta:
     ended: str = ""
     duration: str = ""
     prompts: int = 0  # things you actually typed
+    turns: int = 0  # prompts plus answers to the question tool, `_your_turns`' unit
+    recapped: int = 0  # turns the store holds a breakdown for
+    recapped_at: str = ""  # the newest breakdown's `written`, ISO
     records: int = 0  # raw user/assistant records, mostly tool traffic
     active: int = 0  # seconds of work, excluding idle gaps
     resumed: bool = False  # spans a long break, so `date` alone understates it
@@ -833,8 +836,12 @@ def extract_meta(path: pathlib.Path) -> Meta:
         if rec.get("type") in ("user", "assistant"):
             meta.records += 1
             meta.spawned += _collect_tools(rec, edited, read, cmds, all_cmds)
-        if rec.get("type") == "user" and _is_typed_prompt(rec, command_ids):
-            meta.prompts += 1
+        if rec.get("type") == "user":
+            if _is_typed_prompt(rec, command_ids):
+                meta.prompts += 1
+                meta.turns += 1
+            elif not rec.get("isCompactSummary") and _answered(rec):
+                meta.turns += 1  # a menu choice is a turn, as in `_your_turns`
     # Yours wins over Claude Code's own later `ai-title` appends.
     named = load_names().get(meta.uuid, "")
     meta.renamed = bool(named)
@@ -869,9 +876,13 @@ def extract_meta(path: pathlib.Path) -> Meta:
 
     # Hand-typed only: a digest is deterministic, and a `recap` bullet is a
     # model's. Agents' notes are in the same files, by the `agent` they carry.
-    meta.notes = sorted((a for doc in _load_store(path.parent.name).get(path.stem, [])
-                         for a in _annotations_of(doc) if a.kind == "note"),
+    docs = _load_store(path.parent.name).get(path.stem, [])
+    meta.notes = sorted((a for doc in docs for a in _annotations_of(doc) if a.kind == "note"),
                         key=lambda a: a.written)
+    # Summaries, not files, as `_recap_start`: a file holding notes alone recaps nothing.
+    latest = [e for e in (_latest_summary(doc) for doc in docs) if e]
+    meta.recapped = len(latest)
+    meta.recapped_at = max((str(e.get("written") or "") for e in latest), default="")
     return meta
 
 
@@ -4396,6 +4407,35 @@ def _local_when(ts: str, mtime: float) -> str:
     return when.strftime("%a %d %b %Y %H:%M")
 
 
+def _recap_cell(m: Meta) -> str:
+    """`3/12 · 2h ago`: turns the store covers over turns there are, and the age
+    of the newest breakdown. `-` where nothing is stored, since `0/12` beside a
+    real age would read as a recap that produced nothing."""
+    if not m.recapped:
+        return "-"
+    return f"{m.recapped}/{m.turns} · {_ago(m.recapped_at, 0.0)}"
+
+
+# The columns every session list prints, in one order: `chsum`, the typed picker
+# and the wizard's first step. Duration alone doesn't say which session was real
+# work, and `recap` says whether a bare `recap` has anything left to cover.
+SESSION_HEADS = ("when", "dur", "prompts", "files", "agents", "notes", "recap", "")
+
+
+def _session_row(p: pathlib.Path, when=_local_when) -> tuple[str, ...]:
+    """One list row for `p`; `when` renders the first column, `_local_when` where
+    the line has room for a stamp and `_ago` where it does not (the typed picker)."""
+    m = extract_meta(p)
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    title = ("✎ " if m.renamed else "") + (m.title or "(untitled)")
+    return (when(last_activity(p), mtime), m.duration or "-", str(m.prompts),
+            str(len(m.edited)), str(m.agent_count) if m.agent_count else "-",
+            f"⚑{len(m.notes)}" if m.notes else "-", _recap_cell(m), title)
+
+
 def _pick_transcript(live_only: bool = True) -> pathlib.Path:
     """The bare-`recap` picker — used only here; `live_transcript` itself stays
     untouched since `mark`/`name` depend on its silent newest-file fallback.
@@ -4419,30 +4459,24 @@ def _pick_transcript(live_only: bool = True) -> pathlib.Path:
 
     # Ascending, so the newest sits last, beside the prompt Enter picks.
     ranked = sorted(cands, key=recency)[-8:]
-    rows = []
-    for p in ranked:
-        m = extract_meta(p)
-        try:
-            mtime = p.stat().st_mtime
-        except OSError:
-            mtime = 0.0
-        age = _ago(last_activity(p), mtime)
-        title = ("✎ " if m.renamed else "") + (m.title or "(untitled)")
-        rows.append((age, m.duration or "-", title))
+    # The same columns the wizard and `chsum` print; `_ago` for `when`, since
+    # this one line has no room for a stamp.
+    rows = [_session_row(p, _ago) for p in ranked]
     default = len(ranked)  # newest = last row = the one Enter picks
-    idx_w, age_w, dur_w = len(str(default)), max(len(r[0]) for r in rows), \
-        max(len(r[1]) for r in rows)
+    idx_w = len(str(default))
+    widths = [max(len(r[i]) for r in (*rows, SESSION_HEADS))
+              for i in range(len(SESSION_HEADS) - 1)]
     # stderr here, not stdout, so `_colour_ok` needs telling which stream to ask.
     bold, dim, reset = ("\033[1m", "\033[2m", "\033[0m") if _colour_ok(sys.stderr) else ("", "", "")
-    # Capped, same pattern as `cmd_sessions`: an unclipped title wraps at the
-    # terminal's own column 0 and reads as a second row, not a folded one.
-    cols = max(40, min(shutil.get_terminal_size((100, 24)).columns, 88))
-    title_w = max(10, cols - (idx_w + age_w + dur_w + 8))
-    for i, (age, dur, title) in enumerate(rows, start=1):
+    # Clipped to the terminal, not `cmd_sessions`' 88: an unclipped title wraps
+    # at column 0 and reads as a second row, and a table row is not prose.
+    cols = max(40, shutil.get_terminal_size((100, 24)).columns)
+    title_w = max(10, cols - (idx_w + sum(widths) + 2 * len(widths) + 4))
+    cells = lambda r: "  ".join(f"{c:<{w}}" for c, w in zip(r, widths))
+    print(f"  {' ' * idx_w}  {dim}{cells(SESSION_HEADS)}{reset}", file=sys.stderr)
+    for i, r in enumerate(rows, start=1):
         idx = f"{bold}{i:>{idx_w}}{reset}"
-        age_c = f"{dim}{age:<{age_w}}{reset}"
-        dur_c = f"{dim}{dur:<{dur_w}}{reset}"
-        print(f"  {idx}  {age_c}  {dur_c}  {_clip_line(title, title_w)}", file=sys.stderr)
+        print(f"  {idx}  {dim}{cells(r)}{reset}  {_clip_line(r[-1], title_w)}", file=sys.stderr)
     # Prompt written ourselves, not passed to input(), so it can't leak to stdout
     # (stdout is the document — see the module docstring).
     print(f"which session? [{bold}{default}{reset}]: ", end="", file=sys.stderr, flush=True)
@@ -4966,29 +5000,13 @@ class _Wizard:
         self.lines: list[str] = []
         self.line_turn: list[int] = []
         self.line_kind: list[str] = []
-        self.rows = [self._session_row(p) for p in cands]
+        self.rows = [_session_row(p) for p in cands]
         # Widths across every row and the header, so the columns line up as one
         # table. The title is last and unpadded — it is prose and runs long.
-        self.widths = [max(len(r[i]) for r in (*self.rows, self.SESSION_HEADS))
-                       for i in range(len(self.SESSION_HEADS) - 1)]
+        self.widths = [max(len(r[i]) for r in (*self.rows, SESSION_HEADS))
+                       for i in range(len(SESSION_HEADS) - 1)]
         # Newest last and selected, same default as the typed picker.
         self.cursor = max(0, len(cands) - 1)
-
-    # Same columns `chsum` prints, in the same order — this is the screen where
-    # you pick a session, and duration alone doesn't say which one was real work.
-    SESSION_HEADS = ("when", "dur", "prompts", "files", "agents", "notes", "")
-
-    @staticmethod
-    def _session_row(p: pathlib.Path) -> tuple[str, ...]:
-        m = extract_meta(p)
-        try:
-            mtime = p.stat().st_mtime
-        except OSError:
-            mtime = 0.0
-        title = ("✎ " if m.renamed else "") + (m.title or "(untitled)")
-        return (_local_when(last_activity(p), mtime), m.duration or "-", str(m.prompts),
-                str(len(m.edited)), str(m.agent_count) if m.agent_count else "-",
-                f"⚑{len(m.notes)}" if m.notes else "-", title)
 
     def _session_line(self, row: tuple[str, ...]) -> str:
         return ("  ".join(f"{c:<{w}}" for c, w in zip(row, self.widths))
@@ -5004,7 +5022,7 @@ class _Wizard:
         if self.step == 0:
             # The blank line under the heading, spent on column names — the
             # numbers below it are unreadable without them.
-            scr.addnstr(1, 0, self._session_line(self.SESSION_HEADS), w - 1, curses.A_DIM)
+            scr.addnstr(1, 0, self._session_line(SESSION_HEADS), w - 1, curses.A_DIM)
         body_h = max(1, h - 3)
         if self.step == 3:
             for i, line in enumerate(self.cost[:body_h]):
@@ -5482,12 +5500,13 @@ def cmd_sessions(args) -> int:
             str(len(m.edited)),
             str(m.agent_count) if m.agent_count else "-",
             f"⚑{len(m.notes)}" if m.notes else "-",
+            _recap_cell(m),
             # Marked, because provenance differs: one is Claude Code's reading of
             # the session, the other is yours.
             ("✎ " if m.renamed else "") + (m.title or "(untitled)") + here,
             delegated,  # past the width calculation, which stops at `heads`
         ))
-    heads = ("", "dur", "prompts", "files", "agents", "notes")  # dates fill the ref column
+    heads = ("", *SESSION_HEADS[1:-1])  # dates fill the ref column
     # Widths across every day: columns that shift per group read as separate tables.
     widths = [max(len(r[i]) for rs in by_day.values() for r in (*rs, heads))
               for i in range(len(heads))]
@@ -5503,9 +5522,9 @@ def cmd_sessions(args) -> int:
             print(row(r))
             # Wrapped here, not by the terminal: a title folded at column 0 reads
             # as the next session.
-            print(_dim("\n".join(textwrap.wrap(r[6], cols, initial_indent="    ↳ ",
+            print(_dim("\n".join(textwrap.wrap(r[7], cols, initial_indent="    ↳ ",
                                                subsequent_indent="      "))))
-            for line in r[7]:
+            for line in r[8]:
                 print(_dim(f"      {line}"))
         print()
     sys.stdout.flush()
