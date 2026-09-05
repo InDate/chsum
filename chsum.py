@@ -13,8 +13,6 @@ from __future__ import annotations
 import argparse
 import bisect
 import concurrent.futures
-import contextlib
-import curses
 import hashlib
 import importlib.metadata
 import html
@@ -29,18 +27,59 @@ import sys
 import textwrap
 import threading
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 PROJECTS_ROOT = pathlib.Path(
     os.environ.get("CLAUDE_CONFIG_DIR", pathlib.Path.home() / ".claude")
 ) / "projects"
-# chsum's own state, in a root of its own: `~/.claude` holds what Claude Code
-# wrote, and nothing here is read by Claude Code.
-CHSUM_DIR = pathlib.Path.home() / ".chsum"
+
+
+def _data_home() -> pathlib.Path:
+    """chsum's own state, in a root of its own: `~/.claude` holds what Claude
+    Code wrote, and nothing here is read by Claude Code. Digests, names and turn
+    breakdowns are all data, so the XDG data home is the one directory they sit
+    in. macOS takes `~/.local/share` as well: a drill-down line is a `sed`
+    command naming a path, and the space in `Application Support` splits one."""
+    explicit = os.environ.get("CHSUM_DIR")
+    if explicit:
+        return pathlib.Path(explicit)
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        return pathlib.Path(xdg) / "chsum"
+    local = os.environ.get("LOCALAPPDATA")
+    if sys.platform == "win32" and local:
+        return pathlib.Path(local) / "chsum"
+    return pathlib.Path.home() / ".local" / "share" / "chsum"
+
+
+CHSUM_DIR = _data_home()
 DIGEST_DIR = CHSUM_DIR / "digests"
 TURNS_DIR = CHSUM_DIR / "turns"
+
+
+def _migrate_store() -> None:
+    """The store moved from `~/.chsum` to the data home. The move runs where the
+    new directory is absent, and no read falls back to the old path afterwards —
+    the files move once, so a run reads one store rather than two."""
+    if os.environ.get("CHSUM_DIR"):
+        return  # an explicit path is the caller's own, and this moves nothing
+    old = pathlib.Path.home() / ".chsum"
+    if CHSUM_DIR.exists() or not old.is_dir():
+        return
+    CHSUM_DIR.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(old, CHSUM_DIR)
+    except OSError:
+        # A rename crosses no device boundary; a copy-then-delete does.
+        try:
+            shutil.move(str(old), str(CHSUM_DIR))
+        except (OSError, shutil.Error) as e:
+            print(f"chsum: {old} did not move to {CHSUM_DIR}: {e}", file=sys.stderr)
+            raise SystemExit(1)
+    print(f"chsum: store moved from {old} to {CHSUM_DIR}", file=sys.stderr)
+
 
 # ---------------------------------------------------------------------------
 # --debug trace
@@ -2028,6 +2067,15 @@ def _resolve_span(anchors: list[int], nums: list[int],
     return anchors[lo], stop, lo + 1, hi + 1
 
 
+def _turn_note(lo: int, hi: int, total: int, asked: list[int]) -> str:
+    """What the numbers resolved to, for a header: `-10 -1` alone says nothing
+    about where in the conversation the window landed. One wording for the row
+    views and for `recap`, which resolve the pair through `_resolve_span`."""
+    which = f"turn {lo}" if lo == hi else f"turns {lo}–{hi}"
+    said = " ".join(str(v) for v in asked)
+    return f"{said} — your {which} of {total}" if said else f"your {which} of {total}"
+
+
 def _span_rows(rows: list[_Row],
                nums: list[int]) -> tuple[list[_Row], _Window]:
     """The rows a turn window covers, and the turns it names."""
@@ -2154,10 +2202,7 @@ def render_rows(meta: Meta, ref: str, rows: list[_Row], what: str,
            f"*{meta.title}*\n",
            f"*{scope}*\n"]
     if window:
-        which = (f"turn {window.lo}" if window.lo == window.hi
-                 else f"turns {window.lo}–{window.hi}")
-        asked = " ".join(str(v) for v in window.nums)
-        out.append(f"*{asked} — your {which} of {window.turns}.*\n")
+        out.append(f"*{_turn_note(window.lo, window.hi, window.turns, window.nums)}.*\n")
     if not rows:
         out.append(f"*No {what} in this window.*\n" if window
                    else f"*No {what} recorded.*\n")
@@ -2249,15 +2294,39 @@ def _digest_for(ref: str) -> tuple[Meta, str]:
     return meta, render_digest(meta, ref, messages_from_jsonl(path), path=path)
 
 
-def _resolve_or_live(args) -> str:
-    """The ref a digest is about. Bare means the session you are in, `--last`
-    the most recent one that isn't — the same rule `chsum last` used before it
-    became this flag."""
-    if not args.ref and not args.file:
-        path = (latest_transcript(local=not args.all, nth=args.nth)
-                if args.last else live_transcript())
-        args.file = str(path)
-    return resolve_ref(args)
+def _target(args, here=None) -> tuple[pathlib.Path, list[int]]:
+    """Which conversation, and which of your turns — one resolver for `recap`,
+    `digest` and `context`, so a window typed for one runs on the others. A ref
+    and turn numbers arrive on `spec` and on the view flag beside it, and
+    `_split_spec` separates them by shape. `--last N` takes the Nth most recent
+    conversation that is not this one; `--here` overrides both and takes the one
+    you are in. Nothing named calls `here` — `live_transcript` for a digest,
+    `_pick_transcript` for a recap — and sets `args.file` from it, so
+    `resolve_ref` derives the ref from the file this returns."""
+    extra = [v for k in _ROW_KINDS for v in (getattr(args, k, None) or [])]
+    args.ref, span = _split_spec(list(args.spec) + extra)
+    if getattr(args, "here", False):
+        args.ref, args.file, args.last = "", "", None
+    if args.last is not None and args.last < 1:
+        raise SystemExit("--last counts from 1: 1 is the most recent "
+                         "conversation that isn't this one")
+    via = "--file" if args.file else "ref" if args.ref else \
+        "--last" if args.last is not None else "here"
+    if via == "--last":
+        args.file = str(latest_transcript(local=not args.all, nth=args.last))
+    elif via == "here":
+        args.file = str(here() if here else live_transcript())
+    if args.file:
+        path = pathlib.Path(args.file).expanduser().resolve()
+        if not path.exists():
+            raise SystemExit(f"no such transcript: {path}")
+    else:
+        # An agent ref addresses a sidecar; the turns are the parent's, so the
+        # parent is what resolves to a path.
+        path = path_for_ref(_split_agent_ref(args.ref)[0])
+    TRACE.step("_target", ref=args.ref or "(none)", uuid=path.stem,
+               turns=" ".join(str(v) for v in span) or "(none)", via=via)
+    return path, span
 
 
 def cmd_digest(args) -> int:
@@ -2271,9 +2340,8 @@ def cmd_digest(args) -> int:
     if args.call and _split_spec(list(args.spec))[1]:
         raise SystemExit("--call names one row and takes no turn numbers")
     view = next((k for k in _ROW_KINDS if getattr(args, k, None) is not None), "")
-    args.ref, span = _split_spec(list(args.spec)
-                                 + (list(getattr(args, view)) if view else []))
-    ref = _resolve_or_live(args)
+    path, span = _target(args)
+    ref = resolve_ref(args)
     # Numbers on their own name a window of what was said, the view they are
     # reached for; a flag beside them picks a different one.
     if span and not view:
@@ -2283,7 +2351,6 @@ def cmd_digest(args) -> int:
             raise SystemExit("--agents covers the whole conversation and takes "
                              "no turn numbers")
         parent_ref, _ = _split_agent_ref(ref)
-        path = _parent_path(parent_ref)
         sys.stdout.write(render_agents(extract_meta(path), parent_ref,
                                        _agent_reports(path), path))
         return 0
@@ -2291,7 +2358,6 @@ def cmd_digest(args) -> int:
         # Lookups reached from a hint in the digest, not artifacts to keep, so
         # they print where the digest itself writes a file.
         parent_ref, agent_id = _split_agent_ref(ref)
-        path = _parent_path(parent_ref)
         if args.call:
             row, out = find_row(path, args.call)
             sys.stdout.write(render_row_detail(row, out, ref))
@@ -2324,7 +2390,11 @@ def cmd_digest(args) -> int:
 def cmd_context(args) -> int:
     """Reload artifact. Same content as the digest, with a provenance header so a
     future reader knows exactly how much to trust it (answer: it's verbatim)."""
-    ref = _resolve_or_live(args)
+    _, span = _target(args)
+    if span:
+        raise SystemExit("context covers the whole conversation and takes no "
+                         "turn numbers — `chsum digest --messages N M` for a window")
+    ref = resolve_ref(args)
     meta, md = _digest_for(ref)
     parent_ref, agent_id = _split_agent_ref(ref)
     print("<!-- Extracted verbatim from the transcript by chsum. No model wrote this;")
@@ -3306,37 +3376,6 @@ def _your_turns(path: pathlib.Path) -> list[_Turn]:
     return turns
 
 
-def _turn_activity(path: pathlib.Path, turns: list[_Turn]) -> list[str]:
-    """What happened after each of your turns, one summary per turn. One pass,
-    events bucketed to the turn they followed — a per-turn walk would re-read
-    the file once per turn. Counts only: the picker is a place to choose from, not to read."""
-    if not turns:
-        return []
-    events = _events_since(path, 0, "")
-    stamps = [t.when for t in turns]
-    tally: list[Counter] = [Counter() for _ in turns]
-    agents: list[set] = [set() for _ in turns]
-    for e in events:
-        # The turn this event followed: rightmost turn at or before it.
-        i = bisect.bisect_right(stamps, e.when) - 1
-        if i < 0:
-            continue
-        tally[i][e.kind] += 1
-        if e.agent:
-            agents[i].add(e.agent)
-    out = []
-    for counts, seen in zip(tally, agents):
-        bits = []
-        for kind, word in (("edit", "edit"), ("ran", "cmd"), ("tool", "tool"),
-                           ("command", "slash cmd"), ("failed", "failure")):
-            if counts[kind]:
-                bits.append(_plural(counts[kind], word))
-        if seen:
-            bits.append(_plural(len(seen), "agent"))
-        out.append(" · ".join(bits))
-    return out
-
-
 # Sized to keep a chunk call cheap against the harness floor without
 # fragmenting into so many calls that their fixed overhead dominates.
 _CHUNK_MAX_CHARS = 8_000
@@ -3903,11 +3942,244 @@ def _files_touched(events: list[_Event]) -> list[str]:
            for path in order]
 
 
-_CHECKPOINT_RE = re.compile(r"^chsum-checkpoint: (\S+) @ (\S+)$")
+# ---------------------------------------------------------------------------
+# The hooks Claude Code runs (`chsum hook`)
+# ---------------------------------------------------------------------------
+# `hooks/hooks.json` runs `chsum hook stop` and `chsum hook session-start`, one
+# JSON payload per event on stdin. The Stop hook writes the checkpoint commits
+# `_checkpoint_shas` below reads back.
+
+GATE_NAME = "chsum-checkpoint"  # "enabled" / "declined" / absent (never asked)
+STATE_NAME = "chsum-checkpoint-state"
+_CHECKPOINT_PREFIX = "chsum-checkpoint: "
+_HOOK_GIT_TIMEOUT = 30  # seconds per git call — this must never be what hangs a turn
+
+
+def _git(args: list[str], cwd: pathlib.Path) -> subprocess.CompletedProcess:
+    return subprocess.run(args, cwd=cwd, capture_output=True, text=True,
+                          timeout=_HOOK_GIT_TIMEOUT)
+
+
+def _git_dir(cwd: pathlib.Path) -> pathlib.Path | None:
+    """The real `.git` directory for `cwd` — a worktree's `.git` is a file
+    naming it elsewhere. `None` where `cwd` sits outside a repo, or where `git`
+    is unreachable."""
+    try:
+        proc = _git(["git", "rev-parse", "--git-dir"], cwd)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    p = pathlib.Path(proc.stdout.strip())
+    return p if p.is_absolute() else (cwd / p).resolve()
+
+
+def _enabled(git_dir: pathlib.Path) -> bool:
+    """Per-project opt-in: true only where the gate file reads `enabled`. An
+    absent gate and a `declined` one both read as not-enabled — the SessionStart
+    path reads the file itself, where the two differ."""
+    try:
+        return (git_dir / GATE_NAME).read_text().strip() == "enabled"
+    except OSError:
+        return False
+
+
+def _read_payload() -> dict:
+    """The hook payload Claude Code writes to stdin. Anything unparseable
+    returns an empty payload, which every hook path below exits 0 on."""
+    try:
+        data = sys.stdin.read()
+    except (OSError, ValueError):
+        return {}
+    if not data.strip():
+        return {}
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _self_heal(cwd: pathlib.Path, git_dir: pathlib.Path) -> None:
+    """Resets away a checkpoint commit left as the branch tip by a process
+    killed between the commit and the reset that hides it. A kill is not
+    something a `trap` catches, so the next invocation in this repo — any
+    session's — is the only place that recovery runs."""
+    state = git_dir / STATE_NAME
+    if not state.exists():
+        return
+    try:
+        raw = state.read_text().split()
+        index_tree, before = raw[0], raw[1]
+    except (OSError, ValueError, IndexError):
+        state.unlink(missing_ok=True)
+        return
+    try:
+        head = _git(["git", "log", "-1", "--format=%B"], cwd)
+        if head.returncode == 0 and head.stdout.startswith(_CHECKPOINT_PREFIX):
+            _git(["git", "reset", "--soft", before], cwd)
+            _git(["git", "read-tree", index_tree], cwd)
+        # Any other HEAD carries a real commit, or a reset that already landed:
+        # git's current state stands.
+    except (OSError, subprocess.SubprocessError):
+        pass
+    state.unlink(missing_ok=True)
+
+
+def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str) -> None:
+    """The per-turn commit-then-reset sequence. Every early return leaves git
+    exactly as it was. `_enabled` is checked here rather than in `_hook_stop`,
+    so `_self_heal` still runs in a project that has since declined."""
+    if not _enabled(git_dir):
+        return
+    try:
+        status = _git(["git", "status", "--porcelain"], cwd)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if status.returncode != 0 or not status.stdout.strip():
+        return  # nothing changed this turn — nothing to checkpoint
+
+    try:
+        before = _git(["git", "rev-parse", "HEAD"], cwd)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if before.returncode != 0:
+        return  # no commits yet — nothing to parent a `reset --soft` against
+    before_sha = before.stdout.strip()
+
+    try:
+        tree = _git(["git", "write-tree"], cwd)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if tree.returncode != 0:
+        return
+    index_tree = tree.stdout.strip()
+
+    state = git_dir / STATE_NAME
+    # Written before the one step that moves `HEAD`, so a process killed before
+    # the reset leaves `_self_heal` what it needs.
+    state.write_text(f"{index_tree} {before_sha}")
+
+    # Millisecond precision, matching Claude Code's transcript timestamps: every
+    # timestamp comparison here is a string compare, which sorts a whole-second
+    # stamp after a same-second one carrying ".mmm".
+    now = datetime.now(timezone.utc)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+    message = f"{_CHECKPOINT_PREFIX}{session_id} @ {ts}"
+    try:
+        _git(["git", "add", "-A"], cwd)
+        # --no-verify: this commit is reset away a few lines down, so the user's
+        # own commit hooks would mutate the working tree for nothing.
+        commit = _git(["git", "commit", "-q", "--no-verify", "-m", message], cwd)
+    except (OSError, subprocess.SubprocessError):
+        state.unlink(missing_ok=True)
+        return
+    if commit.returncode != 0:
+        state.unlink(missing_ok=True)  # nothing landed on HEAD — nothing to reset away
+        return
+
+    if os.environ.get("CHSUM_CHECKPOINT_TEST_CRASH_AFTER_COMMIT"):
+        # Test-only: leaves the stray commit a later `_self_heal` is verified against.
+        return
+
+    try:
+        _git(["git", "reset", "--soft", before_sha], cwd)
+        _git(["git", "read-tree", index_tree], cwd)
+    except (OSError, subprocess.SubprocessError):
+        return  # the state file stays — the next invocation's self-heal finishes this
+    state.unlink(missing_ok=True)
+
+
+def _hook_stop(payload: dict) -> int:
+    """Stop: one checkpoint per turn. Exit 2 is the code that blocks a turn, so
+    every condition here exits 0 and every exception stops at this frame."""
+    session_id = payload.get("session_id")
+    cwd_str = payload.get("cwd")
+    if not isinstance(session_id, str) or not session_id:
+        return 0
+    if not isinstance(cwd_str, str) or not cwd_str:
+        return 0
+    cwd = pathlib.Path(cwd_str)
+    if not cwd.is_dir():
+        return 0
+    if shutil.which("git") is None:
+        return 0
+
+    try:
+        git_dir = _git_dir(cwd)
+        if git_dir is None:
+            return 0
+        _self_heal(cwd, git_dir)
+        _write_checkpoint(cwd, git_dir, session_id)
+    except Exception as e:  # noqa: BLE001 — never let this hook fail the turn
+        print(f"chsum checkpoint hook: {e}", file=sys.stderr)
+    return 0
+
+
+_OPT_IN_CONTEXT = (
+    "chsum: per-turn git checkpointing is undecided for this project "
+    "({gate} absent). Ask the user once, plainly, whether to enable it — "
+    "each turn gets committed then reset away into the reflog, invisible in "
+    "normal git commands and reversible, so `chsum recap` can "
+    "read real git diffs for file/line tracking instead of reconstructing "
+    "them from the transcript. Write `enabled` or `declined` to {gate} based "
+    "on their answer, then never ask again in this checkout."
+)
+
+
+def _opt_in_context(git_dir: pathlib.Path) -> str | None:
+    """The `additionalContext` text where the gate file is absent, `None` where
+    it exists — the gate is written by the `chsum` skill, never here, so a
+    project that decided is not asked a second time."""
+    gate = git_dir / GATE_NAME
+    if gate.exists():
+        return None
+    return _OPT_IN_CONTEXT.format(gate=gate)
+
+
+def _hook_session_start(payload: dict) -> int:
+    """SessionStart: fires on startup, resume, clear, compact and fork, before
+    the first turn. Nothing here blocks a session starting."""
+    cwd_str = payload.get("cwd")
+    if not isinstance(cwd_str, str) or not cwd_str:
+        return 0
+    cwd = pathlib.Path(cwd_str)
+    if not cwd.is_dir():
+        return 0
+    if shutil.which("git") is None:
+        return 0
+
+    try:
+        git_dir = _git_dir(cwd)
+        if git_dir is None:
+            return 0
+        context = _opt_in_context(git_dir)
+        if context is None:
+            return 0
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": context,
+            }
+        }))
+    except Exception as e:  # noqa: BLE001 — never let this hook fail a session
+        print(f"chsum session-start hook: {e}", file=sys.stderr)
+    return 0
+
+
+def cmd_hook(args) -> int:
+    payload = _read_payload()
+    if args.event == "stop":
+        return _hook_stop(payload)
+    return _hook_session_start(payload)
+
+
+_CHECKPOINT_RE = re.compile("^" + re.escape(_CHECKPOINT_PREFIX)
+                            + r"(\S+) @ (\S+)$")
 
 
 def _checkpoint_shas(project_dir: pathlib.Path | None, session_uuid: str) -> list[tuple[str, str]]:
-    """(timestamp, sha) per turn the `hooks/chsum_checkpoint.py` Stop hook
+    """(timestamp, sha) per turn the `chsum hook stop` Stop hook
     committed-then-reset-away for this session, oldest first (the raw reflog
     is newest-first). Never raises: no repo, no `git`, no hook installed, or
     a reflog that's already aged the entries out (see CLAUDE.md) all degrade
@@ -4024,7 +4296,7 @@ def _turn_checkpoints(spine: list[_Turn], until_ts: str,
     model calls that `_turn_files` runs after, and the reflog is read once.
 
     `spine[i].when` to `spine[i+1].when` (or `until_ts` for the last turn) is
-    each turn's window — same rightmost-boundary convention `_turn_activity`
+    each turn's window — same rightmost-boundary convention `_chunk_events`
     bisects on. A window holding more than one checkpoint (shouldn't normally
     happen — one hook firing per turn) takes the last."""
     covers = [""] * len(spine)
@@ -4273,8 +4545,8 @@ def _interleaved(turns: list[_Turn], buckets: list[list[str]],
 def _cost_rows(events: list[_Event], boundaries: list[str],
                cached: set[int] | frozenset[int] = frozenset()):
     """`events` chunked exactly as a live run would, then sized off exactly what
-    each chunk's call would send. Shared by `_dry_run_report` and the wizard's
-    cost step so the two can't drift into quoting different numbers.
+    each chunk's call would send. `_dry_run_report` reads it, so the priced
+    figures and the sent ones come off one split.
 
     Returns `(rows, by_kind)`: `rows` is one `(chunk, material_chars, called)`
     per chunk, `called` from `_chunk_activity` so "chunks called" matches what
@@ -4416,8 +4688,8 @@ def _recap_cell(m: Meta) -> str:
     return f"{m.recapped}/{m.turns} · {_ago(m.recapped_at, 0.0)}"
 
 
-# The columns every session list prints, in one order: `chsum`, the typed picker
-# and the wizard's first step. Duration alone doesn't say which session was real
+# The columns every session list prints, in one order: `chsum` and the typed
+# picker. Duration alone doesn't say which session was real
 # work, and `recap` says whether a bare `recap` has anything left to cover.
 SESSION_HEADS = ("when", "dur", "prompts", "files", "agents", "notes", "recap", "")
 
@@ -4459,7 +4731,7 @@ def _pick_transcript(live_only: bool = True) -> pathlib.Path:
 
     # Ascending, so the newest sits last, beside the prompt Enter picks.
     ranked = sorted(cands, key=recency)[-8:]
-    # The same columns the wizard and `chsum` print; `_ago` for `when`, since
+    # The same columns `chsum` prints; `_ago` for `when`, since
     # this one line has no room for a stamp.
     rows = [_session_row(p, _ago) for p in ranked]
     default = len(ranked)  # newest = last row = the one Enter picks
@@ -4611,7 +4883,7 @@ class _Ticker:
 
 def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: str,
                    prompt_text: str, until_ts: str, args, turns: list[_Turn] | None = None,
-                   live: bool = True, anchor_uuid: str = "") -> int:
+                   live: bool = True, anchor_uuid: str = "", span_note: str = "") -> int:
     """The document, for a window with a start and an optional end. One body
     for a bare `recap` and a ranged one — they differ only in how the window was
     chosen. `live` says which: bare runs to now, a chosen range to its end. An empty `until_ts` bounds the window by nothing, which is "to now"
@@ -4626,6 +4898,8 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
     _clear_status()
     header = [f"# {'Catch-up' if live else 'Recap'} — {meta.title}"]
     bits = [meta.project_name, f"your prompt at {_hhmm(anchor_ts)}"]
+    if span_note:
+        bits.append(span_note)
     bits.append(f"snapshot at {datetime.now().astimezone().strftime('%H:%M')} — "
                 "the transcript trails the live screen" if live
                 else f"window ends {_hhmm(until_ts)}" if until_ts
@@ -4887,7 +5161,7 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
         # Computed, not model-narrated — prepended ahead of the bullets it sits
         # beside, same reasoning as `_failures_section`/`_compaction_section`.
         # Prefers a git checkpoint diff over the transcript scan per turn,
-        # wherever the `chsum_checkpoint.py` Stop hook covered it — see `_turn_files`.
+        # wherever the `chsum hook stop` Stop hook covered it — see `_turn_files`.
         for idx, files in enumerate(_turn_files(turn_events, covers, project_dir)):
             if files:
                 turn_bullets[idx] = files + turn_bullets[idx]
@@ -4932,398 +5206,6 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
     return 0
 
 
-@contextlib.contextmanager
-def _tty_curses():
-    """curses drawn on `/dev/tty` with fd 1 pointed at it for the duration —
-    fd 1 is the document, so stdout is restored before anything prints. Raises
-    if there's no controlling terminal; the caller falls back to typed prompts."""
-    tty = os.open("/dev/tty", os.O_RDWR)
-    saved = os.dup(1)
-    scr = None
-    try:
-        os.dup2(tty, 1)
-        scr = curses.initscr()
-        curses.noecho()
-        curses.cbreak()
-        scr.keypad(True)
-        # 80ms: long enough that a split arrow-key sequence isn't misread as Escape.
-        if hasattr(curses, "set_escdelay"):
-            curses.set_escdelay(80)
-        try:
-            curses.curs_set(0)
-        except curses.error:
-            pass  # terminals that can't hide the cursor still work
-        try:
-            curses.start_color()
-            curses.use_default_colors()
-            curses.init_pair(1, curses.COLOR_CYAN, -1)
-            curses.init_pair(2, curses.COLOR_YELLOW, -1)
-        except curses.error:
-            pass
-        yield scr
-    finally:
-        if scr is not None:
-            scr.keypad(False)
-            curses.echo()
-            curses.nocbreak()
-            curses.endwin()
-        os.dup2(saved, 1)
-        os.close(saved)
-        os.close(tty)
-
-
-class _Wizard:
-    """Arrow-key selection for `recap`: session, then start turn, then end turn,
-    then what it will cost before anything is spent. Escape steps back rather
-    than quitting, since every step is a guess you refine."""
-
-    HELP = {
-        0: "↑↓ move · f/l first/last · enter choose session · esc quit",
-        1: "↑↓ move · f/l first/last · enter set START · esc back to sessions",
-        2: "↑↓ move · f/l first/last · enter set END · esc back to start",
-        3: "enter run the recap · esc back to end",
-    }
-
-    def __init__(self, cands: list[pathlib.Path], args=None):
-        self.cands = cands
-        # Held for the cost step alone: `--no-cache` has to price the same way it runs.
-        self.args = args
-        self.step = 0
-        self.cursor = 0
-        self.top = 0
-        self.path: pathlib.Path | None = None
-        self.turns: list[_Turn] = []
-        self.acts: list[str] = []
-        self.start = 0
-        self.end = 0
-        self.cost: list[str] = []
-        self.lines: list[str] = []
-        self.line_turn: list[int] = []
-        self.line_kind: list[str] = []
-        self.rows = [_session_row(p) for p in cands]
-        # Widths across every row and the header, so the columns line up as one
-        # table. The title is last and unpadded — it is prose and runs long.
-        self.widths = [max(len(r[i]) for r in (*self.rows, SESSION_HEADS))
-                       for i in range(len(SESSION_HEADS) - 1)]
-        # Newest last and selected, same default as the typed picker.
-        self.cursor = max(0, len(cands) - 1)
-
-    def _session_line(self, row: tuple[str, ...]) -> str:
-        return ("  ".join(f"{c:<{w}}" for c, w in zip(row, self.widths))
-                + "  " + row[-1]).rstrip()
-
-    # -- drawing ---------------------------------------------------------
-    def _draw(self, scr) -> None:
-        scr.erase()
-        h, w = scr.getmaxyx()
-        head = {0: "which session?", 1: "start where?", 2: "end where?",
-                3: "what this will cost"}[self.step]
-        scr.addnstr(0, 0, head, w - 1, curses.A_BOLD)
-        if self.step == 0:
-            # The blank line under the heading, spent on column names — the
-            # numbers below it are unreadable without them.
-            scr.addnstr(1, 0, self._session_line(SESSION_HEADS), w - 1, curses.A_DIM)
-        body_h = max(1, h - 3)
-        if self.step == 3:
-            for i, line in enumerate(self.cost[:body_h]):
-                scr.addnstr(2 + i, 0, line, w - 1)
-        else:
-            lines = self._lines()
-            # The cursor is a turn, but a turn is several lines: scroll so its
-            # whole block is on screen, not just the line the index points at.
-            owners = self.line_turn if self.step else list(range(len(lines)))
-            mine = [i for i, o in enumerate(owners) if o == self.cursor] or [0]
-            if mine[0] < self.top:
-                self.top = mine[0]
-            elif mine[-1] >= self.top + body_h:
-                self.top = min(mine[0], mine[-1] - body_h + 1)
-            self.top = max(0, min(self.top, max(0, len(lines) - body_h)))
-            for i, text in enumerate(lines[self.top:self.top + body_h]):
-                idx = self.top + i
-                owner = owners[idx]
-                # Two channels: colour says what the line is, gutter+bold says whether it's in range.
-                kind = self.line_kind[idx] if self.step else "said"
-                attr = {"said": curses.A_NORMAL,
-                        "answered": curses.color_pair(2),
-                        "act": curses.A_DIM}.get(kind, curses.A_NORMAL)
-                if self._in_range(owner):
-                    attr |= curses.A_BOLD
-                if owner == self.cursor:
-                    attr |= curses.A_REVERSE
-                if self.step:
-                    gutter = "│ " if self._in_range(owner) else "  "
-                    scr.addnstr(2 + i, 0, gutter, 2, curses.color_pair(1))
-                    scr.addnstr(2 + i, 2, text.ljust(w - 3)[:w - 3], w - 3, attr)
-                else:
-                    scr.addnstr(2 + i, 0, text.ljust(w - 1)[:w - 1], w - 1, attr)
-        scr.addnstr(h - 1, 0, self.HELP[self.step][:w - 1], w - 1, curses.A_DIM)
-        scr.refresh()
-
-    def _in_range(self, idx: int) -> bool:
-        """Rows that would be included, highlighted as the end moves — the point
-        of doing this on a screen rather than by typing two numbers."""
-        if self.step != 2:
-            return False
-        lo, hi = sorted((self.start, self.cursor))
-        return lo <= idx <= hi
-
-    def _build_turn_lines(self, width: int) -> None:
-        """Each turn as however many lines its text needs, plus what happened
-        after it on a line of its own. Nothing you typed is shortened here —
-        this is the screen where you decide what to include."""
-        n = len(self.turns)
-        w = len(str(n))
-        # Two columns of gutter, drawn separately, so range membership can be
-        # shown without spending the text's own colour on it.
-        indent = " " * (w + 8)
-        body_w = max(24, width - len(indent) - 3)
-        self.lines, self.line_turn, self.line_kind = [], [], []
-        for i, t in enumerate(self.turns):
-            flag = "?" if t.kind == "answered" else " "
-            head = f"{i + 1:>{w}}{flag} {_hhmm(t.when)}  "
-            para = [ln for raw in t.text.splitlines() or [""]
-                    for ln in (textwrap.wrap(raw, body_w) or [""])]
-            for j, ln in enumerate(para):
-                self.lines.append((head if j == 0 else indent) + ln)
-                self.line_turn.append(i)
-                self.line_kind.append(t.kind)  # "said" | "answered"
-            act = self.acts[i] if i < len(self.acts) else ""
-            if act:
-                # Tagged to the same turn so it highlights with it, not as a row you could land on.
-                self.lines.append(f"{indent}↳ {act}")
-                self.line_turn.append(i)
-                self.line_kind.append("act")
-
-    def _lines(self) -> list[str]:
-        if self.step == 0:
-            return [self._session_line(r) for r in self.rows]
-        return self.lines
-
-    # -- steps -----------------------------------------------------------
-    def _load_session(self, scr) -> bool:
-        scr.erase()
-        scr.addnstr(0, 0, "reading the transcript…", scr.getmaxyx()[1] - 1)
-        scr.refresh()
-        self.turns = _your_turns(self.cands[self.cursor])
-        if not self.turns:
-            scr.addnstr(2, 0, "nothing typed in that session — esc to go back",
-                        scr.getmaxyx()[1] - 1)
-            scr.refresh()
-            scr.getch()
-            return False
-        self.path = self.cands[self.cursor]
-        self.acts = _turn_activity(self.path, self.turns)
-        self._build_turn_lines(scr.getmaxyx()[1] - 1)
-        return True
-
-    def _load_cost(self, scr) -> None:
-        scr.erase()
-        scr.addnstr(0, 0, "sizing the extract…", scr.getmaxyx()[1] - 1)
-        scr.refresh()
-        lo, hi = sorted((self.start, self.cursor))
-        a, b = self.turns[lo], self.turns[hi]
-        assert self.path is not None
-        # Same far-edge rule as `cmd_recap`, or the price and the run disagree.
-        until = "" if hi == len(self.turns) - 1 else b.when
-        events = _events_since(self.path, a.line, a.when, until)
-        inner = [t for t in self.turns if a.when < t.when <= b.when]
-        events += [_Event(t.when, "", "you", t.text) for t in [a] + inner]
-        events.sort(key=lambda e: e.when)
-        # Mirrors `_render_window`'s `spine`, so this prices the N calls a real run would make.
-        spine = [a] + inner
-        boundaries = [t.when for t in spine]
-        cached: set[int] = set()
-        consulted = not getattr(self.args, "no_cache", False)
-        if consulted:
-            _, cached = _cached_turns(
-                self.path.parent.name, spine,
-                _chunk_events(events, boundaries, _CHUNK_MAX_CHARS), boundaries,
-                _fingerprint(_CHUNK_PROMPT, HaikuSummariser.model),
-                HaikuSummariser.model)
-        rows, by_kind = _cost_rows(events, boundaries, cached)
-        called = [(chunk, chars) for chunk, chars, ok in rows if ok]
-        n_called, n_total = len(called), len(rows)
-        prompt_chars = len(_CHUNK_PROMPT) * n_called
-        material_chars = sum(chars for _, chars in called)
-        total_chars = prompt_chars + material_chars
-        est = n_called * _est_tokens(_CHUNK_PROMPT) + sum(round(c / 4) for _, c in called)
-        self.cost = [
-            f"turns {lo + 1}–{hi + 1}   {_hhmm(a.when)} → "
-            f"{_hhmm(b.when) if until else 'end of session'}"
-            f"   {_plural(len(events), 'event')}   {_plural(n_called, 'call')}"
-            # Stated at zero too: a silent line cannot be told apart from a
-            # store that was never read.
-            + (f"   {len(cached)} of {n_total} chunks stored" if consulted else "")
-            + (f"   {n_total - n_called - len(cached)} quiet"
-               if n_total - n_called - len(cached) > 0 else ""),
-            "",
-        ]
-        kind_rows = sorted(((_KIND_LABELS.get(k, k), v[1], v[0]) for k, v in by_kind.items()),
-                           key=lambda r: -r[1])
-        for label, chars, cnt in kind_rows:
-            self.cost.append(f"  {label:<28} {_plural(cnt, 'event'):>12}"
-                             f"  {_fmt_tokens(round(chars / 4)):>7} tokens")
-        self.cost += [
-            f"  {'chunk instructions':<28} {_plural(n_called, 'call'):>12}"
-            f"  {_fmt_tokens(round(prompt_chars / 4)):>7} tokens",
-            "",
-            f"  extract          {total_chars:>9,} chars   ~{est:,} tokens",
-            f"  claude -p floor  {'':>9}          ~{_HARNESS_FLOOR:,} tokens × {n_called}"
-            f"  (measured {_HARNESS_FLOOR_WHEN})",
-            f"  total                                ~{est + _HARNESS_FLOOR * n_called:,} tokens",
-        ]
-
-    @staticmethod
-    def _decode_escape(scr) -> int:
-        """An undecoded `ESC [ X` / `ESC O X` sequence to its key, else 27.
-        Non-blocking, so a lone Escape reports immediately rather than stalling."""
-        scr.nodelay(True)
-        try:
-            nxt = scr.getch()
-            if nxt not in (ord("["), ord("O")):
-                return 27
-            final = scr.getch()
-        finally:
-            scr.nodelay(False)
-        return {ord("A"): curses.KEY_UP, ord("B"): curses.KEY_DOWN,
-                ord("5"): curses.KEY_PPAGE, ord("6"): curses.KEY_NPAGE,
-                ord("H"): curses.KEY_HOME, ord("F"): curses.KEY_END}.get(final, 27)
-
-    def run(self, scr) -> tuple[pathlib.Path, _Turn, _Turn] | None:
-        while True:
-            self._draw(scr)
-            key = scr.getch()
-            if key in (ord("q"), 3):  # q, ctrl-c
-                return None
-            if key == 27:
-                # Escape, or an arrow whose sequence ncurses didn't decode for this terminal.
-                key = self._decode_escape(scr)
-            if key == 27:  # a real Escape: back one step, or out of the first
-                if self.step == 0:
-                    return None
-                self.step -= 1
-                if self.step == 1:
-                    self.cursor = self.start
-                continue
-            if key in (curses.KEY_ENTER, 10, 13):
-                if self.step == 0:
-                    if self._load_session(scr):
-                        self.step, self.cursor, self.top = 1, 0, 0
-                elif self.step == 1:
-                    self.start = self.cursor
-                    self.step = 2
-                elif self.step == 2:
-                    self.end = self.cursor
-                    self._load_cost(scr)
-                    self.step = 3
-                else:
-                    lo, hi = sorted((self.start, self.end))
-                    assert self.path is not None
-                    return self.path, self.turns[lo], self.turns[hi]
-                continue
-            if self.step == 3:
-                continue
-            # Steps 1 and 2 move by turn, not by line — a multi-line turn is one thing to choose.
-            n = len(self.rows) if self.step == 0 else len(self.turns)
-            h = max(1, scr.getmaxyx()[0] - 3)
-            moves = {curses.KEY_UP: -1, ord("k"): -1, curses.KEY_DOWN: 1, ord("j"): 1,
-                     curses.KEY_PPAGE: -h, curses.KEY_NPAGE: h}
-            if key in moves:
-                self.cursor = max(0, min(n - 1, self.cursor + moves[key]))
-            # `f`/`l` alongside Home/End: the ends are what you reach for, and a
-            # terminal that swallows Home/End still has letters.
-            elif key in (curses.KEY_HOME, ord("f")):
-                self.cursor = 0
-            elif key in (curses.KEY_END, ord("l")):
-                self.cursor = n - 1
-
-
-def _ask(prompt: str, default: int, hi: int) -> int:
-    """One numbered choice on stderr, defaulting on empty input. stderr because
-    stdout is the document, and written rather than passed to `input()` for the
-    same reason — `input`'s own prompt goes to stdout."""
-    bold, reset = ("\033[1m", "\033[0m") if _colour_ok(sys.stderr) else ("", "")
-    print(f"{prompt} [{bold}{default}{reset}]: ", end="", file=sys.stderr, flush=True)
-    try:
-        raw = input().strip()
-    except EOFError:
-        raw = ""
-    if not raw:
-        return default
-    if raw.isdigit() and 1 <= int(raw) <= hi:
-        return int(raw)
-    raise SystemExit(f"not a turn number: {raw!r}")
-
-
-def _pick_range(turns: list[_Turn], args) -> tuple[_Turn, _Turn]:
-    """Start and end of the window, from your own turns. `--from/--to` skip the
-    prompts entirely, so a recap is repeatable and scriptable; without them it
-    only asks at a tty, or a script blocking on `input()` would hang."""
-    n = len(turns)
-    lo, hi = getattr(args, "from_", 0), getattr(args, "to", 0)
-    if not (lo and hi) and not (sys.stdin.isatty() and sys.stderr.isatty()):
-        raise SystemExit("recap needs --from and --to when it can't ask "
-                         "(not a terminal)")
-    if not (lo and hi):
-        show = turns if getattr(args, "all_turns", False) else turns[-30:]
-        if len(show) < n:
-            print(f"  … {n - len(show)} earlier turns hidden (--all-turns for all)",
-                  file=sys.stderr)
-        w = len(str(n))
-        dim, reset = ("\033[2m", "\033[0m") if _colour_ok(sys.stderr) else ("", "")
-        cols = max(40, min(shutil.get_terminal_size((100, 24)).columns, 88))
-        for t in show:
-            i = turns.index(t) + 1
-            # `?` marks an answer to the question tool: the turn exists and
-            # steered the session, but you did not type it.
-            flag = "?" if t.kind == "answered" else " "
-            body = _clip_line(t.text.replace("\n", " · "), max(20, cols - w - 12))
-            print(f"  {i:>{w}}{flag} {dim}{_hhmm(t.when)}{reset}  {body}", file=sys.stderr)
-        lo = lo or _ask("start turn?", 1, n)
-        hi = hi or _ask("end turn?", n, n)
-    if not (1 <= lo <= n and 1 <= hi <= n):
-        raise SystemExit(f"turn out of range: this session has {n}")
-    if lo > hi:
-        lo, hi = hi, lo  # asked backwards is a slip, not a different request
-    return turns[lo - 1], turns[hi - 1]
-
-
-def _run_wizard(args):
-    """`("ok", selection)`, `("quit", None)`, or `("unavailable", None)` — kept
-    apart because escaping the first step (a decision) must not fall through
-    to the typed prompts the way an unavailable terminal does."""
-    why = ("--no-tui" if getattr(args, "no_tui", False) else
-           "--from/--to given" if (args.from_ or args.to) else
-           "session named" if (args.ref or args.file) else
-           "stdin is not a terminal" if not sys.stdin.isatty() else "")
-    if os.environ.get("CHSUM_TUI_DEBUG"):
-        pathlib.Path(os.environ["CHSUM_TUI_DEBUG"]).write_text(f"guard: {why or 'none'}\n")
-    if why:
-        return "unavailable", None
-    cands = transcripts(local=True)
-    if not cands:
-        return "unavailable", None
-
-    def recency(p: pathlib.Path) -> tuple[str, float]:
-        try:
-            mtime = p.stat().st_mtime
-        except OSError:
-            mtime = 0.0
-        return (last_activity(p), mtime)
-
-    cands = sorted(cands, key=recency)[-40:]
-    try:
-        with _tty_curses() as scr:
-            picked = _Wizard(cands, args).run(scr)
-        return ("ok", picked) if picked else ("quit", None)
-    except (curses.error, OSError):
-        # Falls back rather than failing the command; CHSUM_TUI_DEBUG surfaces why.
-        if os.environ.get("CHSUM_TUI_DEBUG"):
-            import traceback
-            pathlib.Path(os.environ["CHSUM_TUI_DEBUG"]).write_text(traceback.format_exc())
-        return "unavailable", None
-
-
 def _recap_start(path: pathlib.Path, turns: list[_Turn]) -> int | None:
     """Index of the first turn the store holds no breakdown for — where a bare
     `chsum recap` picks up. `None` when every turn is stored, which is "nothing
@@ -5345,56 +5227,35 @@ def _recap_start(path: pathlib.Path, turns: list[_Turn]) -> int | None:
     return first_new
 
 
-def _recap_target(args) -> pathlib.Path:
-    """Which conversation a recap is about. Bare means the one you are in — the
-    same context-awareness `--here` had, now the default."""
-    if args.file:
-        return pathlib.Path(args.file)
-    if args.last:
-        return latest_transcript(local=not args.all)
-    ref = args.session or args.ref
-    if ref:
-        return path_for_ref(ref)
-    return live_transcript()
-
-
 def cmd_recap(args) -> int:
     """A window of one conversation, verbatim, with a model-written timeline
     sliced under each of your turns.
 
-    Bare: the session you are in, from the turn after the last one the store
-    covers. `--full` takes the whole of it, `--session`/`--last`/`--file` name a
-    different one, `--from/--to` name the ends. Only a named session with no
-    ends asks."""
-    named = bool(args.file or args.last or args.session or args.ref)
-    if args.here or (not named and not args.full and not (args.from_ and args.to)):
-        return _recap_since_last(args)
-
-    picked = None
-    if named or args.full:
-        path = _recap_target(args)
-    else:
-        # Ends given for the session you are in.
-        path = live_transcript()
-    # `--last` names a whole conversation, the way `chsum last` did; only
-    # `--session`/a bare ref leaves the ends open for the picker.
-    whole = args.full or (args.last and not (args.from_ and args.to))
-    if not (whole or (args.from_ and args.to)):
-        # A named session with no ends: the picker, as before.
-        verdict, picked = _run_wizard(args)
-        if verdict == "quit":
-            return 0  # you escaped out: nothing chosen, nothing to print
-    if picked:
-        path, start, end = picked
-        turns = _your_turns(path)
-    else:
-        turns = _your_turns(path)
-        if not turns:
-            raise SystemExit("nothing typed in that conversation — no turns to pick from")
-        if whole:
-            start, end = turns[0], turns[-1]
-        else:
-            start, end = _pick_range(turns, args)
+    `--messages N [M]` names the ends as signed turns of yours, the spelling
+    `digest` takes. Without them the window opens at the first turn the store
+    holds no breakdown for, whichever conversation was named. `--full` is
+    `--messages 1 -1`."""
+    if args.messages == []:
+        raise SystemExit("--messages needs one or two turn numbers "
+                         "(1 your first, -1 your last)")
+    # `_pick_transcript` lists the live sessions when nothing is named; inside
+    # Claude Code it returns the one you are in without asking.
+    path, span = _target(args, here=_pick_transcript)
+    if args.full and span:
+        raise SystemExit("--full is the whole conversation and --messages names "
+                         "a window: one or the other")
+    if args.full:
+        span = [1, -1]
+    if not span:
+        return _recap_since_last(args, path)
+    turns = _your_turns(path)
+    if not turns:
+        raise SystemExit("nothing typed in that conversation — no turns to recap")
+    # Positions stand in for `_span_rows`' row anchors, so one resolver orders
+    # and clamps the pair for every command; `recap` then maps the two turn
+    # numbers onto the `_Turn` objects it already holds.
+    _, _, lo, hi = _resolve_span(list(range(len(turns))), span, len(turns))
+    start, end = turns[lo - 1], turns[hi - 1]
     _status("reading the transcript…")
     meta = extract_meta(path)
     # The end turn bounds the window; the turns strictly between the two are
@@ -5402,28 +5263,20 @@ def cmd_recap(args) -> int:
     inner = [t for t in turns if start.when < t.when <= end.when]
     # Ending on the last turn bounds the window by nothing: that turn's own work
     # is what follows it, and a bound at its timestamp would cut all of it.
-    # Compared by value, not identity: the wizard picked its turn out of its own
-    # `_your_turns` list and this one is read again, so the last turn of the
-    # window and the last turn of the file are equal objects and never the same one.
-    until = "" if end == turns[-1] else end.when
-    # The interactively-picked range as flags, or the range can't be typed again.
-    TRACE.reproduce(f"chsum recap --session {ch_ref_for_path(path)} "
-                    f"--from {turns.index(start) + 1} --to {turns.index(end) + 1}")
-    TRACE.step("cmd_recap", turns=len(turns), start_turn=turns.index(start) + 1,
-               end_turn=turns.index(end) + 1, start_line=start.line,
-               until=until or "(end of session)", inner=len(inner),
-               picked_by="wizard" if picked else ("whole session" if whole else "flags"))
+    until = "" if hi == len(turns) else end.when
+    TRACE.reproduce(f"chsum recap {ch_ref_for_path(path)} --messages {lo} {hi}")
+    TRACE.step("cmd_recap", turns=len(turns), start_turn=lo, end_turn=hi,
+               start_line=start.line, until=until or "(end of session)",
+               inner=len(inner), asked=" ".join(str(v) for v in span))
     return _render_window(path, meta, start.line, start.when, start.text,
-                          until, args, inner, live=False, anchor_uuid=start.uuid)
+                          until, args, inner, live=False, anchor_uuid=start.uuid,
+                          span_note=_turn_note(lo, hi, len(turns), span))
 
 
-def _recap_since_last(args) -> int:
-    """`chsum recap` with nothing else: the session you are in, from the turn
-    after the last one the store covers. No picker — the window is already
-    decided, and asking would be asking a question with one answer."""
-    # `_pick_transcript` asks when several sessions are live and falls back to
-    # `live_transcript` off a tty — the behaviour `cmd_catchup` had here.
-    path = _pick_transcript()
+def _recap_since_last(args, path: pathlib.Path) -> int:
+    """`recap` with no turn numbers: from the turn after the last one the store
+    covers, to the end of the conversation. The window is already decided, so
+    nothing is asked."""
     turns = _your_turns(path)
     if not turns:
         raise SystemExit("nothing typed in this conversation yet — no turns to recap")
@@ -5438,12 +5291,14 @@ def _recap_since_last(args) -> int:
     meta = extract_meta(path)
     inner = [t for t in turns if start.when < t.when <= end.when]
     TRACE.reproduce(f"chsum recap {ch_ref_for_path(path)} "
-                    f"--from {first_new + 1} --to {len(turns)}")
+                    f"--messages {first_new + 1} -1")
     TRACE.step("_recap_since_last", turns=len(turns), start_turn=first_new + 1,
                covered=first_new)
     # The last turn bounds the window by nothing: its own work is what follows it.
     return _render_window(path, meta, start.line, start.when, start.text,
-                          "", args, inner, live=False, anchor_uuid=start.uuid)
+                          "", args, inner, live=False, anchor_uuid=start.uuid,
+                          span_note=_turn_note(first_new + 1, len(turns),
+                                               len(turns), []))
 
 
 def cmd_sessions(args) -> int:
@@ -5781,6 +5636,7 @@ class HaikuSummariser(Summariser):
 
 
 def main(argv=None) -> int:
+    _migrate_store()
     ap = argparse.ArgumentParser(
         prog="chsum",
         description="Work logs and reload-ready context from Claude Code conversations. "
@@ -5797,6 +5653,24 @@ def main(argv=None) -> int:
     dbg.add_argument("--debug", action="store_true",
                      help="print what this run read, ran and resolved, for pasting "
                           "into a chsum session to reproduce from")
+    # The second parent: `recap`, `digest` and `context` answer "which
+    # conversation, which turns" in one spelling, so a window typed for one runs
+    # on the others. `_target` reads exactly what this declares.
+    win = argparse.ArgumentParser(add_help=False)
+    win.add_argument("spec", nargs="*", metavar="REF|N",
+                     help="ch_... ref from `chsum find`, and one or two turn "
+                          "numbers (1 your first, -1 your last)")
+    win.add_argument("--file", help="transcript path (derives the ref)")
+    win.add_argument("--last", nargs="?", type=int, const=1, default=None, metavar="N",
+                     help="the Nth most recent conversation that isn't this one "
+                          "(default: 1)")
+    win.add_argument("--all", action="store_true",
+                     help="with --last: all projects (default: this one)")
+    # The numbers sit on the flag as well as on `spec`: argparse fills one run
+    # of positionals, so `<ref> --messages -1` leaves the `-1` with nowhere to go.
+    win.add_argument("--messages", nargs="*", metavar="N",
+                     help="one or two turns of yours to narrow to; on `digest`, "
+                          "bare is every message in order, unfiltered")
     sub = ap.add_subparsers(dest="cmd")
 
     p = sub.add_parser("sessions", parents=[dbg],
@@ -5817,28 +5691,13 @@ def main(argv=None) -> int:
         p.add_argument(f"--{mode}", dest="mode", action="store_const", const=mode)
     p.set_defaults(mode="hybrid", func=cmd_find)
 
-    p = sub.add_parser("recap", parents=[dbg],
-                       help="summarise this session since the last recap, or a chosen range")
-    p.add_argument("ref", nargs="?", help="ch_... ref (same as --session)")
-    p.add_argument("--session", metavar="REF",
-                   help="recap this conversation instead of the one you're in")
-    p.add_argument("--last", action="store_true",
-                   help="the most recent conversation that isn't this one")
+    p = sub.add_parser("recap", parents=[dbg, win],
+                       help="summarise this session since the last recap, or a chosen window")
     p.add_argument("--full", action="store_true",
                    help="the whole session, not just since the last recap")
-    p.add_argument("--all", action="store_true",
-                   help="with --last: all projects (default: this one)")
-    # The old spelling. `recap` with no arguments is now what this meant.
+    # The old spelling, and the one job it still has: the conversation you are
+    # in, whatever ref or `--last` sits beside it.
     p.add_argument("--here", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--file", help="transcript path")
-    p.add_argument("--from", dest="from_", type=int, default=0, metavar="N",
-                   help="start at your Nth turn (default: ask)")
-    p.add_argument("--to", type=int, default=0, metavar="N",
-                   help="end at your Nth turn (default: ask)")
-    p.add_argument("--all-turns", dest="all_turns", action="store_true",
-                   help="list every turn when asking, not just the last 30")
-    p.add_argument("--no-tui", dest="no_tui", action="store_true",
-                   help="typed prompts instead of the arrow-key picker")
     p.add_argument("--dry-run", action="store_true",
                    help="size breakdown of what would be sent; no model call")
     p.add_argument("--no-cache", dest="no_cache", action="store_true",
@@ -5848,22 +5707,9 @@ def main(argv=None) -> int:
                         "call for every chunk and replace it")
     p.set_defaults(func=cmd_recap)
 
-    p = sub.add_parser("digest", parents=[dbg], help="deterministic digest of one conversation")
-    p.add_argument("spec", nargs="*", metavar="REF|N",
-                   help="ch_... ref from `chsum find`, and one or two turn "
-                        "numbers (1 your first, -1 your last)")
-    p.add_argument("--file", help="transcript path (derives the ref)")
+    p = sub.add_parser("digest", parents=[dbg, win],
+                       help="deterministic digest of one conversation")
     p.add_argument("--stdout", action="store_true", help="print instead of writing a file")
-    p.add_argument("--last", action="store_true",
-                   help="the most recent conversation that isn't this one")
-    p.add_argument("-n", "--nth", type=int, default=1, metavar="N",
-                   help="with --last: Nth most recent instead of the last (default: 1)")
-    p.add_argument("--all", action="store_true",
-                   help="with --last: all projects (default: this one)")
-    # The numbers sit on the flag as well as on `spec`: argparse fills one run
-    # of positionals, so `<ref> --messages -1` leaves the `-1` with nowhere to go.
-    p.add_argument("--messages", nargs="*", metavar="N",
-                   help="every message in order, unfiltered, each locating its record")
     p.add_argument("--tools", nargs="*", metavar="N",
                    help="every tool call in order, unfiltered")
     p.add_argument("--commands", nargs="*", metavar="N",
@@ -5874,15 +5720,8 @@ def main(argv=None) -> int:
                    help="one tool call whole, with its output")
     p.set_defaults(func=cmd_digest)
 
-    p = sub.add_parser("context", parents=[dbg], help="reload artifact for pasting back into Claude")
-    p.add_argument("ref", nargs="?")
-    p.add_argument("--last", action="store_true",
-                   help="the most recent conversation that isn't this one")
-    p.add_argument("-n", "--nth", type=int, default=1, metavar="N",
-                   help="with --last: Nth most recent instead of the last (default: 1)")
-    p.add_argument("--all", action="store_true",
-                   help="with --last: all projects (default: this one)")
-    p.add_argument("--file")
+    p = sub.add_parser("context", parents=[dbg, win],
+                       help="reload artifact for pasting back into Claude")
     p.set_defaults(func=cmd_context)
 
     p = sub.add_parser(
@@ -5946,6 +5785,19 @@ def main(argv=None) -> int:
     p.add_argument("--since", default="7d", help="window, e.g. 7d, 24h, 2w")
     p.add_argument("--all", action="store_true", help="all projects (default: this one)")
     p.set_defaults(func=cmd_journal)
+
+    # No `parents=[dbg]`: this is a wire Claude Code calls, and `session-start`
+    # writes JSON on stdout that Claude Code parses.
+    p = sub.add_parser(
+        "hook", help="what Claude Code runs from hooks/hooks.json, not a command you type",
+        description="A wire Claude Code calls from hooks/hooks.json, not a command you "
+                    "type: one JSON hook payload per event, on stdin. "
+                    "`stop` writes the per-turn checkpoint commit `recap` reads back "
+                    "out of the reflog; `session-start` prints the checkpoint opt-in "
+                    "where this project's gate file is absent.",
+    )
+    p.add_argument("event", choices=["stop", "session-start"], help="which hook fired")
+    p.set_defaults(func=cmd_hook)
 
     # Bare `chsum` lists sessions: you usually want to pick one, and "most recent"
     # is often a dud. Anything naming a subcommand or asking for help is left alone.

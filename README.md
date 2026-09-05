@@ -10,6 +10,60 @@ truth. The one exception is labelled where it appears: `chsum recap` ends in
 a timeline written by a model, printed beneath the verbatim record it was written
 from.
 
+**Start from the problem you have:**
+
+- **"What did we do yesterday?"** or **"Pick up where we left off."** — `chsum digest
+  --last` writes a short file and prints its path: your prompts in order, each with
+  the row it sits on, the commands that did something, and the last exchange, all
+  copied or computed, no model. `--stdout` prints it instead. → [`chsum digest`](#chsum-digest)
+- **What did Claude do with what I said?** — `chsum recap` quotes each of your turns
+  and accounts for the gap after it: files, commands, agents and failures computed
+  from the transcript, then a model's bullets for that gap alone, printed beneath
+  the record they describe. One `claude -p` call per turn, stored so a window is
+  paid for once. → [`chsum recap`](#chsum-recap)
+- **Claude is working in another terminal and you want to know what it has done so
+  far.** — a bare `chsum recap` reads the live transcript from your last prompt
+  onward, failures quoted first. → [`chsum recap`](#the-bare-run)
+- **A new session needs the context of an old one, without a model paraphrasing
+  it.** — `chsum context <ref>` prints the digest as a paste-ready artifact with a
+  provenance header. → [`chsum context`](#chsum-context)
+- **Which session was that, and which of them went anywhere?** — bare `chsum` lists
+  this project's sessions with duration, prompts, files, agents and notes, dead
+  ends included. → [`chsum`](#chsum-1)
+- **You remember what was said, not when.** — `chsum find "…"` searches the text of
+  every conversation; `--notes` searches what you noted. → [`chsum find`](#chsum-find)
+- **You need the exact command Claude ran, or its full output.** — `chsum digest
+  <ref> --commands` lists every Bash call in order; `--call <id>` prints one whole.
+  → [`chsum digest`](#the-row-views)
+- **A subagent did the work and its report is buried.** — `--agents` prints each
+  report; `<ref>/<agent-id>` addresses the agent's own digest. → [`chsum digest`](#the-row-views)
+- **Something just worked and you want to find that moment later.** — `! chsum note
+  "…"` files a note against the message you are on, or an earlier one by id or
+  phrase. → [`chsum note`](#chsum-note)
+- **A session is titled after its first question, not what it became.** — `chsum
+  name "…"` renames it, in chsum and in `/resume`. → [`chsum name`](#chsum-name)
+- **What did I work on this week, across every project?** — `chsum journal --since
+  7d --all` renders a day-headed work log. → [`chsum journal`](#chsum-journal)
+- **You read transcripts in claude-history and want your notes there too.** —
+  register `chsum annotations` as its annotator. → [`chsum annotations`](#chsum-annotations)
+- **`recap`'s files-touched section misses edits made outside Edit/Write.** — opt in
+  to git checkpoints; the plugin's hooks run `chsum hook`. → [`chsum hook`](#chsum-hook)
+
+The commands, one section each:
+
+| command | what it is for |
+|---|---|
+| [`chsum`](#chsum-1) | list this project's sessions, newest activity first |
+| [`chsum recap`](#chsum-recap) | what happened over a window of turns, with a model-written timeline |
+| [`chsum digest`](#chsum-digest) | one conversation, verbatim and computed, plus row-level views |
+| [`chsum context`](#chsum-context) | the digest as a reload artifact for pasting into Claude |
+| [`chsum journal`](#chsum-journal) | a work log across sessions |
+| [`chsum find`](#chsum-find) | locate a conversation or a note by what it said |
+| [`chsum note`](#chsum-note) | mark the moment that mattered |
+| [`chsum name`](#chsum-name) | rename a session to what it actually was |
+| [`chsum annotations`](#chsum-annotations) | the wire claude-history calls to read and write notes |
+| [`chsum hook`](#chsum-hook) | what Claude Code's hooks run, for per-turn git checkpoints |
+
 ## The idea
 
 Your own prompts already are a faithful record of what you were trying to do.
@@ -18,45 +72,21 @@ would have said, without the risk:
 
 ```markdown
 **m1**
-> can you open a chrome page to the site, it is running on 3000
+> can you open the app in a browser, it is running on 3000
 
 **m7**
-> sherpa-onnx-tts.worker.js:267 [Sherpa Worker] Initialization failed…
+> audio.worker.js:267 [Worker] Initialization failed…
 
 **m137**
-> when I speed up the text to speech, it ends up sounding like a chipmunk
+> when I change the playback rate the pitch shifts with it
 
 **m153**
-> The toolbar is no longer working to slow it down or speed it up live
+> The rate control in the toolbar no longer applies while it plays
 ```
 
 Blockquoting is functional, not cosmetic: a quoted reply containing `## Summary`
 would otherwise forge a section of the digest. Everything else — dates, duration,
 branch, files, commands — is parsed straight out of the transcript.
-
-## Which version am I running
-
-```sh
-chsum --version
-chsum 2.0.0 (dc12598) · python 3.10.11 · darwin
-```
-
-The version comes from the checkout's own `pyproject.toml`, and the commit
-beside it is what built it. An editable install freezes the packaged metadata at
-install time and nothing refreshes it on its own, so after a version bump the
-two can disagree — the line then says so and names the fix:
-
-```
-chsum 2.0.1 (1c8e002) · packaged metadata says 2.0.0 and no longer describes
-what runs; `pipx install --editable . --force` from the checkout refreshes it
-```
-
-## Requirements
-
-- [`claude-history`](https://github.com/) on your `PATH` — for `chsum find`'s
-  `--semantic` and `--hybrid` search only. Every other command reads the
-  transcripts directly and spends no subprocess.
-- Python 3.10+. No third-party packages, no model, no network.
 
 ## Install
 
@@ -64,14 +94,15 @@ what runs; `pipx install --editable . --force` from the checkout refreshes it
 pipx install chsum            # from a checkout: pipx install .
 ```
 
-Or as a Claude Code plugin, which brings the skill with it:
+Or as a Claude Code plugin, which brings the skill and the hooks with it:
 
 ```
 /plugin marketplace add InDate/indate-tools
 /plugin install chsum@indate-tools
 ```
 
-The plugin carries the skill; the `chsum` command still comes from pipx.
+The plugin carries the skill and the hook declarations; the `chsum` command still
+comes from pipx.
 
 pipx, not `pip install --user`: chsum is an application, so it gets its own venv
 and one symlink on `PATH`. `pipx install --editable .` while working on it.
@@ -79,85 +110,102 @@ and one symlink on `PATH`. `pipx install --editable .` while working on it.
 A real command rather than a shell alias, because an alias doesn't exist for
 scripts, hooks, or agents.
 
-### Noting while an agent is working
+Requirements:
 
-`!` is not available while you are addressing an agent — what you type goes to the
-agent as a message, so there is no way to run the command yourself until you are
-back in the conversation. Two things do work:
+- Python 3.10+. No third-party packages, no model, no network.
+- [`claude-history`](https://github.com/raine/claude-history) on your `PATH` — for
+  `chsum find` only. Every other command reads the transcripts directly and spends
+  no subprocess.
+- `claude` on your `PATH` — for `chsum recap`'s timeline only, which it writes
+  through `claude -p`. Without it a recap still prints the verbatim record and a
+  one-line notice.
 
-- Note it afterwards, from the session: `chsum note --match "<phrase the agent
-  said>"` searches the sidecars too, so the agent's own words are addressable.
-- Ask the agent to note it as it goes. That is a Bash call, which prompts, and a
-  subagent has nobody watching to approve — so allow the command first, in
-  `~/.claude/settings.json` or a project's `.claude/settings.local.json`:
+### Letting Claude run it
+
+Inside a session, `! chsum …` runs the command yourself. An agent has nobody
+watching to approve a Bash call, so allow the command first, in
+`~/.claude/settings.json` or a project's `.claude/settings.local.json`:
 
 ```json
 { "permissions": { "allow": ["Bash(chsum:*)"] } }
 ```
 
 The whole command, not just `note`: everything chsum does is read transcripts you
-already have, and what it writes lands in `~/.chsum/`. Narrow it to
-`Bash(chsum note:*)` if you'd rather approve the reading commands case by case.
+already have, and what it writes lands in its own store (see
+[Where chsum writes](#where-chsum-writes)). Narrow it to `Bash(chsum note:*)` if
+you'd rather approve the reading commands case by case.
 
 The plugin can't set this for you — permissions come from settings files, and a
 plugin that allowlisted its own shell command would be granting itself something
 you never agreed to.
 
-## Usage
+## Picking a conversation, and a window of it
+
+`recap`, `digest` and `context` take the same selectors, so a window you found in
+one runs in the others unchanged:
 
 ```sh
-chsum                                          # the five most recent in this project
-chsum -n 25                                    # more of them; 0 for all
-chsum --since 7d                               # only the last week
-chsum --all                                    # across every project
-chsum recap                                    # this session, since the last recap
-chsum recap --full                             # this session, all of it
-chsum recap --last                             # the most recent session that isn't this one
-chsum context --last                           # that session verbatim, no timeline
-chsum context --last -n 2                      # the one before that
-chsum find "text to speech playback speed"     # locate a conversation
-chsum digest <ch_ref>                          # write a digest file
-chsum digest <ch_ref> --stdout                 # print it instead
-chsum digest --file path/to/session.jsonl      # address by file
-chsum digest <ch_ref> --commands               # every Bash call in order, unfiltered
-chsum digest <ch_ref> --call <id>              # one of them whole, with its output
-chsum digest <ch_ref> --agents                 # every subagent and what it reported back
-chsum digest <ch_ref> --messages -3 -1         # your last three turns, printed whole
-chsum digest --last -1                         # the previous session's last turn
-chsum context <ch_ref>                         # reload artifact, for pasting into Claude
-chsum context <ch_ref>/<agent-id>              # one subagent's own digest
-chsum journal --since 7d                       # work log for this project
-chsum journal --since 2w --all                 # across every project
-! chsum note "this is the approach that worked"  # note the moment
-! chsum note --recent 20                       # list recent messages, with ids
-! chsum note --at 47dca7e9 "where it turned"   # note an earlier message
-chsum find --notes                             # everything you've noted
-chsum name "what it actually was"              # rename the session you're in
-chsum name <ch_ref> "marks: design + build"    # rename a past one
-chsum name --list                              # everything you've renamed
+chsum digest                          # the session you are in
+chsum digest ch_3654a13c              # a named one, by the ref the listing prints
+chsum digest --last                   # the most recent session that isn't this one
+chsum digest --last 2                 # the one before that
+chsum digest --file path/to/session.jsonl
+chsum digest --messages 3 10          # your turns 3 to 10
+chsum digest --messages -1            # your last turn, and everything after it
+chsum digest --last 2 --messages -10 -1
 ```
+
+A turn is one thing you typed — or one answer you picked from the question tool,
+because a decision made by menu choice still steered the session — together with
+everything that followed it up to your next turn. `1` is your first and `-1` your
+last; one number names one turn and two name a run of them, both ends included.
+The pair resolves before it is ordered, so `2 -2` and `-2 2` name the same window,
+and an index past either end clamps. The header states what the numbers resolved
+to — `-10 -1 — your turns 45–54 of 54` — because a signed number alone says
+nothing about where in the conversation it landed.
+
+`--last` orders by last activity, so a session you resumed yesterday beats one you
+started last week; run from inside Claude Code, the session doing the running is
+excluded. Everything scopes to the current project; `--all` widens it.
+
+A subagent has an address of its own, `<parent-ref>/<agent-id>`, taken by
+`digest` and `context`:
+
+```sh
+chsum context ch_da4e99d42e5efab11ebdedc22fb65145/a728cd49179f1a356
+```
+
+## `chsum`
 
 Bare `chsum` lists the project's sessions, newest activity first:
 
 ```
-Thu 06 Aug 2026                        dur    prompts  files  agents  notes
-  ch_c120431a267b202aebf0b38f6c3c1b69  5h38m  78       14     -       ⚑2
-    ↳ Plan 3D house model from floor plan photographs
+Thu 06 Aug 2026                        dur    prompts  files  agents  notes  recap
+  ch_c120431a267b202aebf0b38f6c3c1b69  5h38m  78       14     -       ⚑2     3/12 · 2h ago
+    ↳ Plan the import pipeline from the sample files
 
 Wed 05 Aug 2026
-  ch_da4e99d42e5efab11ebdedc22fb65145  3h03m  30       12     2       -
-    ↳ Set up cdp-tools server
-      a43c4ff4401ca693e  Weed noise from the test suite
-      a81d77b6cba4a46b3  Fix standby setpoint tracking
-  ch_b99f11b7c257dafc8b93f53480ba3804  6s     1        0      -       -
+  ch_da4e99d42e5efab11ebdedc22fb65145  3h03m  30       12     2       -      -
+    ↳ Set up the dev server
+      a43c4ff4401ca693e  Quieten the test suite
+      a81d77b6cba4a46b3  Fix the retry backoff
+  ch_b99f11b7c257dafc8b93f53480ba3804  6s     1        0      -       -      -
     ↳ (untitled)
+```
+
+```sh
+chsum                 # the five most recent in this project
+chsum -n 25           # more of them; 0 for all
+chsum --since 7d      # only the last week
+chsum --all           # across every project
 ```
 
 Listing is the default because picking is the common case, and "most recent" is
 often a session you abandoned after one prompt. Dead ends are listed, not hidden
 — that a session went nowhere is the answer to "where did that work go". The
 header counts them: *no activity* is no file, no notable command, no agent, and
-one prompt.
+one prompt. The session running right now is listed too, tagged in progress; its
+numbers trail the conversation, since Claude Code is still appending.
 
 Subagents are named, not just counted, because "3 agents" says nothing about a
 session that delegated its work — and the id is the one `chsum context
@@ -165,121 +213,91 @@ session that delegated its work — and the id is the one `chsum context
 listing is usually read into a context window, and `-n 0 --all` is the whole
 corpus.
 
-`chsum context --last` is `chsum context` on the most recent session with activity, ordered
-by last activity so one you resumed yesterday beats one you started last week.
-Run from inside Claude Code, the session doing the running is excluded.
+A `recap` column states the turn store's coverage of each session — `3/12 · 2h
+ago` is turns holding a breakdown over turns there are — and a `✎` marks a title
+you gave with `chsum name` rather than Claude Code's.
 
-`chsum recap` with no arguments is the opposite case: the session that's excluded above,
-caught mid-run. Run it from a second terminal while Claude works. It anchors on
-the last thing you typed, then shows everything since — files changed, commands
-run, agents at work, and what went wrong — each verbatim or computed, same as
-the rest of chsum. Failures get their own section, quoted from the actual error
-text, because that is usually what you came back to find out. It
-ends in the one section chsum prints that isn't: a timeline written by `claude -p
---model haiku` from a verbatim extract of those events, printed beneath the
-verbatim record and labelled model-written, so a wrong sentence can be checked
-against what sits above it. Like the verbatim sections, it's a snapshot — the
-transcript trails the live screen, so it can lag what's actually on screen.
+## `chsum recap`
 
-Run from that second terminal, there's no env var to say which session is
-running, so it lists the project's recent sessions and asks — newest at the
-bottom, next to the prompt, and Enter takes that one. Inside the session itself,
-or piped, there's no prompt to show: it just picks.
-
-The timeline is written by several small, independent `claude -p` calls, not
-one big one — the events are split into chunks (at your own turn boundaries
-for `recap`, by size alone here) and each chunk gets its own call, run in
-parallel, none of them seeing another's material or output. `--dry-run` makes
-no model call: you get the verbatim record as usual, then a breakdown of what
-each chunk would cost, by where its tokens come from (edits, command output,
-what Claude said) and the largest single events. Character counts are
-measured off the exact text that would be piped in; the token figures are
-chars/4, hence the `~`. It also states the fixed cost of the call itself —
-`claude -p` sends its own system prompt and tool definitions unless told not
-to, so chsum strips them (`--tools ""`, `--setting-sources ""`) and supplies
-its own short instructions via `--system-prompt`, which brings that fixed
-cost down to ~158 tokens *per call*, counted once for every chunk that
-actually runs.
+What Claude did with what you said. A digest gives your side of the conversation
+and flat lists of files and commands; a recap takes a window of your turns and,
+for each one, quotes it verbatim and then accounts for everything that happened
+before you spoke again: the files touched, the commands run, the agents spawned,
+the failures, all computed from the transcript, and beneath those a timeline
+written by `claude -p --model haiku` from a verbatim extract of that one gap.
+That timeline is the one section chsum prints that a model wrote. It is labelled
+as such and printed beneath the record it was written from, so a wrong sentence
+can be checked against what sits above it.
 
 ```sh
-chsum recap --dry-run                          # what would this cost, and why
-chsum recap --invalidate                       # summarise this window again, replacing what's stored
+chsum recap                                    # this session, since the last recap
+chsum recap --last                             # the previous session, since its last recap
+chsum recap --last 2 --messages -10 -1         # the last ten turns of the session before that
+chsum recap ch_3654a13c --messages 3 10        # turns 3 to 10 of a specific session
+chsum recap --full                             # the whole session (same as --messages 1 -1)
+chsum recap --messages 3 10 --dry-run          # what it would cost, no model call
+chsum recap --messages 3 10 --no-cache         # call for every chunk, store nothing
+chsum recap --messages 3 10 --invalidate       # summarise again, replacing what's stored
 ```
 
+### The bare run
+
+`chsum recap` with no arguments is the session you are in, caught mid-run. Run it
+from a second terminal while Claude works. It picks up from the turn after the
+last one already recapped, anchors on the last thing you typed, then shows
+everything since — files changed, commands run, agents at work, and what went
+wrong. Failures get their own section, quoted from the actual error text, because
+that is usually what you came back to find out. Like the verbatim sections the
+timeline is a snapshot: the transcript trails the live screen.
+
+Run from that second terminal there is no env var to say which session is
+running, so it lists the project's recent sessions and asks — newest at the
+bottom, next to the prompt, and Enter takes that one. Inside the session itself,
+or piped, there is no prompt to show: it picks.
+
+### What it costs, and what it stores
+
+The timeline is written by several small, independent `claude -p` calls, not one
+big one — the events are split into chunks at your own turn boundaries (by size
+alone on the bare run) and each chunk gets its own call, run in parallel, none of
+them seeing another's material or output.
+
+`--dry-run` makes no model call: you get the verbatim record as usual, then a
+breakdown of what each chunk would cost, by where its tokens come from (edits,
+command output, what Claude said) and the largest single events. Character counts
+are measured off the exact text that would be piped in; the token figures are
+chars/4, hence the `~`. It also states the fixed cost of the call itself —
+`claude -p` sends its own system prompt and tool definitions unless told not to,
+so chsum strips them (`--tools ""`, `--setting-sources ""`) and supplies its own
+short instructions via `--system-prompt`, which brings that fixed cost down to
+~158 tokens *per call*, counted once for every chunk that actually runs.
+
 After a real run, the terminal gets one line of what it actually cost, summed
-across every chunk call — total input, cache reads and cache writes
-separately, output, elapsed, and how the estimate compared. Measured from the
-calls' own accounting, not guessed. It goes to stderr like the rest of the
-progress chatter, so a piped document is untouched:
+across every chunk call — total input, cache reads and cache writes separately,
+output, elapsed, and how the estimate compared. Measured from the calls' own
+accounting, not guessed. It goes to stderr like the rest of the progress
+chatter, so a piped document is untouched:
 
 ```
 haiku: 5,974 in (5,042 cache read) · 4,866 out · 56.0s · extract estimated ~3,211, harness ~2,763
 ```
 
-Everything scopes to the current project; `--all` widens. Digests land in
-`~/.chsum/digests/<uuid>.md` (`--out` to change).
-
-### Recap
-
-`chsum recap` is the same document over a range you choose. At a terminal it's
-an arrow-key picker: choose a session, press enter, then move to where you want
-to start and press enter — everything from there to the cursor highlights as you
-move down. A second enter sets the end and shows what the call will cost, and a
-third runs it. Escape steps back; escape at the session list exits. Your turns
-are shown in full, never truncated, with what happened after each one on its own
-line:
-
-```
- 33  19:25  can we add all the activity between each of my replies - 3 tools,
-            15 edits, 3 agents. and can we make it interactive, so I can push
-            arrows up and down to select a session
-            ↳ 3 edits · 6 cmds · 2 tools
- 34  19:28  Hmm, finsih what you were doing first
-            ↳ 5 edits · 8 cmds · 1 failure
-```
-
-Piping still works — the wizard draws on the terminal while the document goes to
-stdout. `--no-tui` uses typed prompts instead:
-
-```sh
-chsum recap                                    # pick session, then start and end
-chsum recap --from 3 --to 10                   # same window, no prompts
-chsum recap ch_3654a13c --from 3 --to 10       # a specific session
-chsum recap --from 3 --to 10 --dry-run         # what it would cost, no model call
-chsum recap --from 3 --to 10 --no-cache        # call for every chunk, store nothing
-```
-
 Each turn's bullets are kept, so recapping a window twice costs nothing the
-second time. The breakdown lands in `~/.chsum/turns/<project>/<turn-uuid>.json`
-once that turn's gap has closed — a later turn bounds it, or its last reply
-carries a `stop_reason` that ends the exchange. Measured on one 3-turn window:
-30.1s and two model calls, then 0.4s and none, the same document both times.
+second time. The breakdown lands in the turn store (see
+[Where chsum writes](#where-chsum-writes)) once that turn's gap has closed — a
+later turn bounds it, or its last reply carries a `stop_reason` that ends the
+exchange. Measured on one 3-turn window: 30.1s and two model calls, then 0.4s
+and none, the same document both times.
 
 Existing is not enough to reuse. A stored breakdown is read back only when it
 names the same instructions, the same model, and the same events it was written
 from; change any of the three and the turn is summarised again, with the old
 breakdown kept beside the new one. `--dry-run` prices only what is missing, so
-`0 calls would be made` means the window is already on disk.
+`0 calls would be made` means the window is already on disk. `--no-cache` neither
+reads nor writes the store; `--invalidate` skips the read and still writes, so
+the result replaces what was there for that window and nothing else.
 
-A turn is something you typed *or* an answer you gave the question tool — those
-are marked `?` in the list, because a decision made by menu choice is still a
-turn that steered the session.
-
-The per-turn files-touched bullets come from one of two sources, and the recap
-says which, counted:
-
-```
-## Files touched — 4 of 6 turns from a checkpoint
-
-*Files for the other 2 turns come from the transcript scan, which sees
-`Edit`/`Write`/`MultiEdit` only and carries each edit's line range as recorded
-at the time.*
-```
-
-A git checkpoint sees every change however it was made and its line ranges are
-current; the transcript scan sees neither. The counts are measured — `0 of 6`
-says no checkpoint covered any turn, and does not say why, because a hook that
-never ran and a reflog entry that aged out look the same from here.
+### The document
 
 A recap spans several of your turns, so its timeline is sliced onto them: each
 turn quoted verbatim, and beneath it the bullets covering what happened before
@@ -292,232 +310,53 @@ you spoke again.
 
 - **21:45** Created a new `is_typed_prompt()` helper that filters out
   `<bash-…>` records, and updated five call sites to use it.
-- **21:47** Tested the fix against the live airtouch session; chsum now
-  reports `prompts: 0` for the dead 2-second session and skips it.
+- **21:47** Tested the fix against a live session; chsum now reports
+  `prompts: 0` for the dead 2-second session and skips it.
 
 ### You said (21:50)
 
 > commit the work
 ```
 
-Placement isn't guessed here: each turn's events are their own chunk (or
-chunks, if the gap was large), summarised by a call that sees only that
-turn's own material, so its bullets slot straight under the turn they follow
-— there's nothing to place after the fact, and nothing to get wrong by
-copying a time out of the extract. The verbatim sections above still settle
-any disagreement between a bullet and what actually happened.
+Placement isn't guessed: each turn's events are their own chunk (or chunks, if
+the gap was large), summarised by a call that sees only that turn's own material,
+so its bullets slot straight under the turn they follow — there is nothing to
+place after the fact, and nothing to get wrong by copying a time out of the
+extract. The verbatim sections above settle any disagreement between a bullet and
+what actually happened.
 
-### Names
+The per-turn files-touched bullets come from one of two sources, and the recap
+says which, counted:
 
-Sessions are titled by Claude Code, from the first thing you said — so a session
-that started as one question and became a day's work is filed under the question.
-`chsum name` fixes that:
+```
+## Files touched — 4 of 6 turns from a checkpoint
+
+*Files for the other 2 turns come from the transcript scan, which sees
+`Edit`/`Write`/`MultiEdit` only and carries each edit's line range as recorded
+at the time.*
+```
+
+A git checkpoint (see [`chsum hook`](#chsum-hook)) sees every change however it
+was made and its line ranges are current; the transcript scan sees neither. The
+counts are measured — `0 of 6` says no checkpoint covered any turn, and does not
+say why, because a hook that never ran and a reflog entry that aged out look the
+same from here.
+
+## `chsum digest`
+
+One conversation, verbatim and computed: your prompts in order, each with the
+row it sits on; the files changed and the commands that did something; the last
+exchange; and the `sed` line that opens any row. A bare run prints the digest of
+the session you are in; naming a session (a ref, `--last`, `--file`) writes it to
+a file and prints the path, and `--stdout` prints it instead.
 
 ```sh
-chsum name "marks: design + build"                 # the session you're in
-chsum name ch_3654a13c "marks: design + build"     # one from last week
+chsum digest                                   # this session, printed
+chsum digest <ch_ref>                          # write a digest file
+chsum digest <ch_ref> --stdout                 # print it instead
+chsum digest --file path/to/session.jsonl      # address by file
+chsum digest <ch_ref>/<agent-id>               # one subagent's own digest
 ```
-
-Your name wins everywhere chsum shows a title — listing, digest, journal — and is
-flagged `✎` in the listing, because whose reading of the session it is matters.
-
-It also lands in `/resume`. Claude Code's title is an `ai-title` record it appends
-to the transcript as the conversation grows, dozens per session, last one wins;
-`chsum name` appends one more of exactly that shape. Never a rewrite of a line
-already written — the one thing chsum adds to a transcript, and it is added the
-way Claude Code adds it.
-
-That is why the name is also kept in `~/.chsum/names.json`: rename a
-session that is still running and Claude Code will title it again ten minutes
-later. chsum keeps yours; `/resume` may drift back.
-
-`chsum name --list` shows what you've renamed, `--clear` undoes one — putting
-Claude Code's own title back as another appended record, so `/resume` reverts too.
-`--no-resume` renames in chsum only and leaves the transcript alone.
-
-### Subagents
-
-A subagent's edits and commands fold into its parent's totals — otherwise a
-session that delegated everything reads as no activity. Files no parent turn
-touched are marked `(agent)`. Each agent gets a line in **Delegated**, and its
-task shows in the listing and in `journal` too — five deep, then a count, since
-"3 agents" says nothing about a session that delegated its work. Each has an
-address:
-
-```sh
-chsum context ch_da4e99d42e5efab11ebdedc22fb65145/a728cd49179f1a356
-```
-
-Its task, files, commands, and last message. Everything past the one-line summary
-is fetched on demand, so a heavily-delegated session doesn't produce a digest
-nobody wants to read.
-
-`<parent-ref>/<agent-id>` resolves to `<uuid>/subagents/agent-<id>.jsonl`. chsum's
-own scheme, not claude-history's — see *Notes on correctness*.
-
-### Notes
-
-`chsum note` files a note against the moment you're in, so the digest says which
-part mattered — extraction can tell you what changed, not which of it was the
-point. `chsum annotate` and `chsum mark` are the same command.
-
-```sh
-! chsum note "the shrinkwrap approach, after two dead ends"
-```
-
-It prints nothing. The note goes into chsum's own store (`~/.chsum/turns/`),
-filed under the turn of yours whose gap holds the message it points at, with
-the file, the row and the first line of that message stamped beside it. The
-transcript is never written to. Run outside a session it still files the note,
-against the newest transcript of this project.
-
-To note something further back, list recent messages and name one:
-
-```sh
-! chsum note --recent 20
-47dca7e9  06:27  you     can we make the digest quote the anchor instead
-be74e21f  06:40  claude  That collides — two messages with identical text share one anchor
-a27a1c9c  06:41  claude  Edit: chsum.py
-0b2f4db2  06:42  claude  Bash: python3 -m pytest -x
-! chsum note --at be74e21f "the anchor collision, explained properly"
-```
-
-Everything that happened, in order: both sides' messages *and* every tool call,
-so you can note the edit or the command rather than the sentence near it. Tool
-results are left out — a note resolves to the message containing the action
-either way.
-
-Ids come from the transcript itself. `--at <line>` takes a bare row number too.
-
-Or name the message by something it said:
-
-```sh
-! chsum note --match "worth knowing exactly where it dies" "the subagent gap"
-```
-
-Matching folds case, punctuation, and markdown away — `currently no` finds
-`Currently **no** —`, because nobody retypes the asterisks. Notes still quote the
-original bytes. If more than one message matches, chsum lists the candidates and
-files nothing: asking to note a phrase puts that phrase in your own prompt too,
-so "newest wins" would keep noting the request instead of its subject. `chsum
-note`'s own calls are excluded from matching — its tool call is recorded before
-the command runs, so otherwise every search would find itself.
-
-Notes show up as **Notable** at the top of the digest, verbatim, with the message
-they point at; as a `⚑` count in the listing; inline in `journal`; and
-`chsum find --notes [query]` searches them across sessions.
-
-Noted something you'd rather not keep:
-
-```sh
-! chsum note --list
-the subagent gap, stated plainly    dde43c3c#1  note
-  ↳ Currently **no** — and worth knowing exactly where it dies.
-
-Testing                             dde43c3c#2  note
-  ↳ Left in place — it records the state that prompted the change.
-
-! chsum note --list --full            # whole text, whole targeted message
-! chsum note --show dde43c3c#1        # where it landed, with what surrounds it
-! chsum note --delete dde43c3c#2      # takes several ids at once
-```
-
-`--list` shows every annotation the store holds for this conversation: your
-notes, and the bullets `recap` wrote, each tagged by kind. An id is the turn's
-uuid and a number issued once — a bullet that `recap` rewrites takes a fresh
-number, and a note keeps its own, so an id you copied out still names the
-same text later. `--delete` removes the annotation from the store; deleting a
-recap bullet means the next recap of that turn prints without it.
-
-`--show` takes the same id and answers where: the file, the row in it, the time,
-the agent when the message is a subagent's, then the targeted message whole and
-`--context N` records either side (3 by default). It resolves across the
-project, so an id from any session of it works.
-
-A subagent can note too. Its notes fold into the parent, like its edits and
-commands, tagged `agent <id>` with the row in that sidecar — sidecars' rows
-don't number against the parent's. Either side can delete the other's.
-
-**Marks made before 2.2** were recorded as a marker line in the transcript.
-Nothing reads those any more; the transcripts keep them, and `claude-history`
-still finds their text as conversation.
-
-### claude-history
-
-The same store is what [claude-history](https://github.com/raine/claude-history)
-reads when it renders and searches annotations. Register chsum as an annotator
-in `~/.config/claude-history/config.toml`:
-
-```toml
-[annotations]
-write_to = "chsum"
-
-[annotators.chsum]
-command = "chsum annotations"
-```
-
-Every note and every recap bullet then shows in its viewer at the row it points
-at and matches in `claude-history agent search`, tagged by kind. A note typed in
-its viewer (`a`) is filed by chsum the same way `chsum note` files one, and `d`
-there deletes through chsum. `chsum annotations read|write|delete` is that wire
-— one JSON object on stdin, one on stdout — and not a command you type.
-
-### Search modes
-
-`--hybrid` (default) and `--semantic` are best for conceptual recall but are slow:
-tens of seconds warm, and **several minutes on the very first run** while the
-embedding index builds. Use `--lexical` (sub-second) for identifiers, filenames,
-and error strings, or `--exact` for exact tokens.
-
-### Reporting something that looks wrong
-
-`--debug` goes on the end of any command. It prints what that run read, ran and
-resolved, beneath the normal output:
-
-```sh
-chsum digest ch_8b0a671d… --stdout --debug
-```
-
-```
---- chsum debug ---
-invocation: chsum digest ch_8b0a671d… --stdout --debug
-cwd: ~/Documents/Code/chsum
-projects: ~/.claude/projects/  (…/ below)
-chsum 1.2.0 (9162a1d dirty) · python 3.10.11 · darwin · exit 0
-files (1)
-  ch_8b0a671d…  meta,turns  947.1K  671 recs  …/-Users-…-chsum/9a9e9ac5-….jsonl
-procs (3)
-  0   0.03s  claude-history agent outline ch_8b0a671d… --no-budget  (1005 chars out)
-  0   0.01s  claude-history agent read ch_8b0a671d…:m1..m27 --no-budget  (11084 chars out)
-steps (4)
-  resolve_ref    via=argv ref=ch_8b0a671d…
-  _parent_path   ref=ch_8b0a671d… uuid=9a9e9ac5-…
-  _load_store    dir=-Users-…-chsum files=126 sessions=6
-  read_messages  ref=ch_8b0a671d… asked=m1..m27 messages=7 got=m1..m27
-reproduce
-  chsum digest ch_8b0a671d… --stdout
-  claude-history agent read ch_8b0a671d… --no-budget
---- end chsum debug ---
-```
-
-No transcript text is copied — only paths, refs, record ids and counts — so the
-block names the record behind a line that looks wrong rather than carrying it.
-It assumes the reader is on the same machine: paste it into a session in the
-chsum checkout and the files it names are still there to open.
-
-`steps` is where a wrong line usually comes from. Each one is a resolution with
-its inputs and its result, including the fallbacks that print nothing during a
-normal run: `_stamp_turns … unstamped=126 stamped=126 transcripts=38` (turn files
-from before the store was stamped, resolved against this project's transcripts),
-`_turn_checkpoints … checkpoint=4 transcript=2` (two
-turns had no checkpoint covering them), `_run_chunk … failed=1` (one summariser call
-died and its gap says so). Repeated steps collapse in the middle, and `files`
-and `procs` cap at 24 rows with the remainder counted.
-
-Without the flag nothing is recorded and nothing is printed — verified
-byte-identical against the previous release across thirteen invocations.
-
-## What a digest contains
 
 | Section | Source |
 |---|---|
@@ -531,7 +370,9 @@ byte-identical against the previous release across thirteen invocations.
 | **Drill down** — transcript and sidecar paths, and the `sed` that opens a row | computed |
 
 An agent digest has the same shape minus the intent trail — an agent gets one
-instruction, so **Task** is a single block.
+instruction, so **Task** is a single block. A subagent's edits and commands fold
+into its parent's totals — otherwise a session that delegated everything reads as
+no activity — and files no parent turn touched are marked `(agent)`.
 
 Every reference in a digest is a row: `1f271ca8:441` is line 441 of session
 `1f271ca8…`'s transcript, and `1f271ca8/a190d601:87` is line 87 of that session's
@@ -551,25 +392,40 @@ rest:
 - …and 25 more of these — `chsum digest ch_c77196cc… --commands` lists all 60 in order
 ```
 
+### The row views
+
+Four flags print rather than writing a file: they are lookups reached from a
+hint inside a digest, not artifacts to keep.
+
+```sh
+chsum digest <ch_ref> --messages               # every message in order, unfiltered
+chsum digest <ch_ref> --tools                  # every tool call in order
+chsum digest <ch_ref> --commands               # every Bash call in order
+chsum digest <ch_ref> --call <id>              # one tool call whole, with its output
+chsum digest <ch_ref> --agents                 # every subagent and what it reported back
+chsum digest <ch_ref>/<agent-id> --commands    # narrowed to that sidecar
+```
+
 `--messages`, `--tools` and `--commands` each print one line per row — the id
 where there is one, a `<session>:<line>` locator, local time, the role or tool
 name, and the first line of the text — in timestamp order across the transcript
-and its sidecars, with nothing filtered, deduplicated or collapsed. An agent ref
-(`<ref>/<agent-id>`) narrows any of them to that sidecar. `--call <id>` prints one
-tool call and its captured output whole.
+and its sidecars, with nothing filtered, deduplicated or collapsed. `--call <id>`
+prints one tool call and its captured output whole, which is where the text a row
+clipped actually lives.
 
-One or two numbers beside any of the three narrow it to a window of your turns
-and print those rows whole, so a stretch of conversation reads without leaving
-chsum. A turn is one thing you typed — or one answer you picked from the question
-tool — together with everything that followed it up to your next turn. `1` is
-your first and `-1` your last, one number names one turn and two name a run of
-them, both ends printed, and the pair resolves before it is ordered, so `2 -2`
-and `-2 2` name the same window:
+`--agents` lists every subagent the session ran and each report it sent back,
+numbered where an agent returned more than once. A report is the agent's own
+document and runs to thousands of characters, so it is clipped with the cut
+marked; the row it came from names where the whole text is.
 
-```
-chsum digest --last -1              # your last turn, and everything after it
-chsum digest <ch_ref> 10 11         # your 10th and 11th turns
-chsum digest <ch_ref> --tools -5 -1 # what Claude called across your last five
+One or two numbers beside `--messages`, `--tools` or `--commands` narrow the view
+to a window of your turns and print those rows whole, so a stretch of
+conversation reads without leaving chsum:
+
+```sh
+chsum digest --last --messages -1              # your last turn, and everything after it
+chsum digest <ch_ref> --messages 10 11         # your 10th and 11th turns
+chsum digest <ch_ref> --tools -5 -1            # what Claude called across your last five
 ```
 
 Inside a window the rows a view steps over are listed rather than skipped
@@ -601,9 +457,310 @@ Open a record: `sed -n '18p' ~/.claude/projects/…/f1b9bbc6-….jsonl`
 
 - `01CPKjYaSD`  `f1b9bbc6:26`  11:30:28  Bash  `ls && wc -l chsum.py`
 ```
-`--command <id>` prints one of them whole with its captured output, which is
-where the text the row clipped actually lives. Both print rather than writing a
-file: they are lookups reached from a hint, not artifacts to keep.
+
+## `chsum context`
+
+The digest as a reload artifact: the same content with a provenance header
+stating that no model wrote it, for pasting into a new Claude session.
+
+```sh
+chsum context                                  # this session
+chsum context --last                           # the previous one
+chsum context <ch_ref>                         # a named one
+chsum context <ch_ref>/<agent-id>              # one subagent's own digest
+```
+
+`context` covers a whole conversation and takes no `--messages` window; it says
+so and names `digest --messages` when given one.
+
+## `chsum journal`
+
+A chronological work log across sessions, under day headings: each session's
+title, its duration, project and branch, the `chsum context` line that reloads
+it, each subagent's task line, and your notes inline.
+
+```sh
+chsum journal --since 7d                       # this project, the last week
+chsum journal --since 2w --all                 # every project, the last fortnight
+```
+
+It reads the transcripts' metadata only and spends no subprocess, so a window of
+a couple of hundred sessions renders in a few seconds.
+
+## `chsum find`
+
+Locate a conversation, or a note, by what it said. This is the one command that
+runs `claude-history`, for its embedding index.
+
+```sh
+chsum find "playback rate pitch shift"         # locate a conversation
+chsum find --notes                             # everything you've noted
+chsum find --notes "backoff"                   # notes matching a query
+chsum find "ENOENT" --lexical                  # fast, for identifiers and error text
+```
+
+`--hybrid` (default) and `--semantic` are best for conceptual recall but are slow:
+tens of seconds warm, and **several minutes on the very first run** while the
+embedding index builds. Use `--lexical` (sub-second) for identifiers, filenames,
+and error strings, or `--exact` for exact tokens. `--all` searches every project.
+
+## `chsum note`
+
+Files a note against the moment you're in, so the digest says which part
+mattered — extraction can tell you what changed, not which of it was the point.
+`chsum annotate` and `chsum mark` are the same command.
+
+```sh
+! chsum note "the backoff approach, after two dead ends"
+```
+
+It prints nothing. The note goes into chsum's own store, filed under the turn of
+yours whose gap holds the message it points at, with the file, the row and the
+first line of that message stamped beside it. The transcript is never written
+to. Run outside a session it still files the note, against the newest transcript
+of this project.
+
+### Noting an earlier moment
+
+List recent messages and name one:
+
+```sh
+! chsum note --recent 20
+47dca7e9  06:27  you     can we retry with backoff instead of failing
+be74e21f  06:40  claude  A fixed delay collides — every client retries in the same second
+a27a1c9c  06:41  claude  Edit: client.py
+0b2f4db2  06:42  claude  Bash: python3 -m pytest -x
+! chsum note --at be74e21f "the thundering-herd point, explained properly"
+```
+
+Everything that happened, in order: both sides' messages *and* every tool call,
+so you can note the edit or the command rather than the sentence near it. Tool
+results are left out — a note resolves to the message containing the action
+either way. Ids come from the transcript itself, and `--at <line>` takes a bare
+row number too.
+
+Or name the message by something it said:
+
+```sh
+! chsum note --match "worth knowing exactly where it dies" "the timeout gap"
+```
+
+Matching folds case, punctuation, and markdown away — `currently no` finds
+`Currently **no** —`, because nobody retypes the asterisks. Notes still quote the
+original bytes. If more than one message matches, chsum lists the candidates and
+files nothing: asking to note a phrase puts that phrase in your own prompt too,
+so "newest wins" would keep noting the request instead of its subject. `chsum
+note`'s own calls are excluded from matching — its tool call is recorded before
+the command runs, so otherwise every search would find itself.
+
+### Noting while an agent is working
+
+`!` is not available while you are addressing an agent — what you type goes to the
+agent as a message. Two things do work:
+
+- Note it afterwards, from the session: `chsum note --match "<phrase the agent
+  said>"` searches the sidecars too, so the agent's own words are addressable.
+- Ask the agent to note it as it goes, with the command allowed as described under
+  [Install](#letting-claude-run-it). Its notes fold into the parent, like its
+  edits and commands, tagged `agent <id>` with the row in that sidecar — sidecars'
+  rows don't number against the parent's. Either side can delete the other's.
+
+### Where notes show up
+
+As **Notable** at the top of the digest, verbatim, with the message they point at;
+as a `⚑` count in the listing; inline in `journal`; in `chsum find --notes`; and
+in claude-history's viewer (see [`chsum annotations`](#chsum-annotations)).
+
+### Listing, locating and deleting
+
+```sh
+! chsum note --list
+the timeout gap, stated plainly     dde43c3c#1  note
+  ↳ Currently **no** — and worth knowing exactly where it dies.
+
+Testing                             dde43c3c#2  note
+  ↳ Left in place — it records the state that prompted the change.
+
+! chsum note --list --full            # whole text, whole targeted message
+! chsum note --show dde43c3c#1        # where it landed, with what surrounds it
+! chsum note --delete dde43c3c#2      # takes several ids at once
+```
+
+`--list` shows every annotation the store holds for this conversation: your
+notes, and the bullets `recap` wrote, each tagged by kind. An id is the turn's
+uuid and a number issued once — a bullet that `recap` rewrites takes a fresh
+number, and a note keeps its own, so an id you copied out still names the
+same text later. `--delete` removes the annotation from the store; deleting a
+recap bullet means the next recap of that turn prints without it.
+
+`--show` takes the same id and answers where: the file, the row in it, the time,
+the agent when the message is a subagent's, then the targeted message whole and
+`--context N` records either side (3 by default). It resolves across the
+project, so an id from any session of it works.
+
+**Marks made before 2.2** were recorded as a marker line in the transcript.
+Nothing reads those any more; the transcripts keep them, and `claude-history`
+still finds their text as conversation.
+
+## `chsum name`
+
+Sessions are titled by Claude Code, from the first thing you said — so a session
+that started as one question and became a day's work is filed under the question.
+`chsum name` fixes that:
+
+```sh
+chsum name "retry: design + build"                 # the session you're in
+chsum name ch_3654a13c "retry: design + build"     # one from last week
+chsum name --list                                  # everything you've renamed
+chsum name --clear                                 # back to Claude Code's title
+chsum name --no-resume "…"                         # rename in chsum only
+```
+
+Your name wins everywhere chsum shows a title — listing, digest, journal — and is
+flagged `✎` in the listing, because whose reading of the session it is matters.
+
+It also lands in `/resume`. Claude Code's title is an `ai-title` record it appends
+to the transcript as the conversation grows, dozens per session, last one wins;
+`chsum name` appends one more of exactly that shape. Never a rewrite of a line
+already written — the one thing chsum adds to a transcript, and it is added the
+way Claude Code adds it.
+
+That is why the name is also kept in the store's `names.json`: rename a session
+that is still running and Claude Code will title it again ten minutes later.
+chsum keeps yours; `/resume` may drift back. `--clear` undoes a rename by
+appending Claude Code's own title back as another record, so `/resume` reverts
+too. `--no-resume` renames in chsum only and leaves the transcript alone.
+
+## `chsum annotations`
+
+The wire [claude-history](https://github.com/raine/claude-history) calls when it
+renders and searches annotations — not a command you type. Register chsum as an
+annotator in `~/.config/claude-history/config.toml`:
+
+```toml
+[annotations]
+write_to = "chsum"
+
+[annotators.chsum]
+command = "chsum annotations"
+```
+
+Every note and every recap bullet then shows in its viewer at the row it points
+at and matches in `claude-history agent search`, tagged by kind. A note typed in
+its viewer (`a`) is filed by chsum the same way `chsum note` files one, and `d`
+there deletes through chsum. `chsum annotations read|write|delete` takes one JSON
+object on stdin and answers with one on stdout.
+
+## `chsum hook`
+
+What Claude Code runs from the plugin's `hooks/hooks.json` — not a command you
+type. It exists so `recap`'s files-touched section can come from git rather than
+from the transcript.
+
+```
+chsum hook stop             # on every Stop: checkpoint the working tree
+chsum hook session-start    # on every SessionStart: raise the opt-in, once
+```
+
+The hooks are declared by the plugin, which installs globally, so they run in
+every repository — and do nothing until that repository opts in. The gate is
+`.git/chsum-checkpoint`, containing `enabled` or `declined`; it is per-checkout
+and never committed. When the file is absent, the SessionStart hook asks Claude
+to put the question to you once, and the answer is what writes the file.
+
+Once enabled, the Stop hook commits the working tree on every turn with
+`--no-verify`, then `git reset --soft` back to where `HEAD` was. The checkpoint
+commit ends up referenced by no branch — invisible to `git log` and `git status`
+— but sits in `HEAD`'s reflog, tagged `chsum-checkpoint: <session> @
+<timestamp>`. `recap` reads those back and diffs consecutive checkpoints, which
+sees every change however it was made and carries current line ranges; the
+transcript scan sees `Edit`/`Write`/`MultiEdit` only. Retention is the reflog's
+(~90 days, shorter once `git gc` runs), so the transcript stays the permanent
+fallback and the recap states, as counts, which source each turn came from.
+
+The hook writes a state file before the commit-and-reset and removes it after,
+so a process killed in between leaves a checkpoint as the branch tip only until
+the next invocation's self-heal resets it away.
+
+## Where chsum writes
+
+Digests, your session names and the turn store share one directory:
+
+```
+<data dir>/chsum/
+  digests/<uuid>.md                              `chsum digest <ref>`'s output (`--out` to change)
+  names.json                                     your names for sessions
+  turns/<project>/<turn-uuid>.json               one turn's recap bullets and notes
+```
+
+`CHSUM_DIR` in the environment names the directory outright. Otherwise
+`XDG_DATA_HOME` set puts it at `$XDG_DATA_HOME/chsum`; on Windows it is
+`%LOCALAPPDATA%\chsum`; everywhere else `~/.local/share/chsum`, macOS included.
+A `~/.chsum` from an earlier version moves there on the next run, once, with a
+line on stderr naming both paths.
+
+Nothing is written to a transcript, with one exception: `chsum name` appends an
+`ai-title` record, the shape Claude Code itself appends.
+
+## Which version am I running
+
+```sh
+chsum --version
+chsum 2.0.0 (dc12598) · python 3.10.11 · darwin
+```
+
+The version comes from the checkout's own `pyproject.toml`, and the commit
+beside it is what built it. An editable install freezes the packaged metadata at
+install time and nothing refreshes it on its own, so after a version bump the
+two can disagree — the line then says so and names the fix:
+
+```
+chsum 2.0.1 (1c8e002) · packaged metadata says 2.0.0 and no longer describes
+what runs; `pipx install --editable . --force` from the checkout refreshes it
+```
+
+## Reporting something that looks wrong
+
+`--debug` goes on the end of any command. It prints what that run read, ran and
+resolved, beneath the normal output:
+
+```sh
+chsum digest ch_8b0a671d… --stdout --debug
+```
+
+```
+--- chsum debug ---
+invocation: chsum digest ch_8b0a671d… --stdout --debug
+cwd: ~/src/chsum
+projects: ~/.claude/projects/  (…/ below)
+chsum 1.2.0 (9162a1d dirty) · python 3.10.11 · darwin · exit 0
+files (1)
+  ch_8b0a671d…  meta,turns  947.1K  671 recs  …/-Users-…-chsum/9a9e9ac5-….jsonl
+procs (0)
+steps (3)
+  resolve_ref    via=argv ref=ch_8b0a671d…
+  _parent_path   ref=ch_8b0a671d… uuid=9a9e9ac5-…
+  _load_store    dir=-Users-…-chsum files=126 sessions=6
+reproduce
+  chsum digest ch_8b0a671d… --stdout
+--- end chsum debug ---
+```
+
+No transcript text is copied — only paths, refs, record ids and counts — so the
+block names the record behind a line that looks wrong rather than carrying it.
+It assumes the reader is on the same machine: paste it into a session in the
+chsum checkout and the files it names are still there to open.
+
+`steps` is where a wrong line usually comes from. Each one is a resolution with
+its inputs and its result, including the fallbacks that print nothing during a
+normal run: `_stamp_turns … unstamped=126 stamped=126 transcripts=38` (turn files
+from before the store was stamped, resolved against this project's transcripts),
+`_turn_checkpoints … checkpoint=4 transcript=2` (two turns had no checkpoint
+covering them), `_run_chunk … failed=1` (one summariser call died and its gap
+says so). Repeated steps collapse in the middle, and `files` and `procs` cap at
+24 rows with the remainder counted.
+
+Without the flag nothing is recorded and nothing is printed.
 
 ## Notes on correctness
 
@@ -612,19 +769,20 @@ Several things here are non-obvious and were established by measuring, not assum
 - **Duration excludes idle time.** Sessions get resumed hours or days later, so
   first-record-to-last-record wildly overstates effort — one session in the corpus
   reads as 92 hours. Gaps over 30 minutes are treated as "walked away".
-- **Anchors are content-addressed, so they can collide.** Two messages with
-  byte-identical text (`[Request interrupted by user]`, say) share one anchor, and
-  `read --anchor` then fails with `ambiguous-ref`. Ambiguous anchors are detected
-  and never published — every anchor a digest prints resolves to exactly one message.
 - **Most "user" records aren't from you.** They're tool results, interrupts, and
   harness scaffolding. Those are filtered out; `prompts:` counts what you typed.
-- **`outline` has two output shapes** — segment ranges for long conversations,
-  per-message lines for short ones. Both are handled.
+  A `!` run is something you did, not something you said, and is not a prompt.
+- **An API error is not a reply.** A record carrying `isApiErrorMessage` — "Prompt
+  is too long", a session limit — is how the session stopped, and is reported as
+  the notice rather than quoted as the last thing Claude said.
 - **Subagent transcripts** aren't conversations in their own right and never appear
   in the listing, matching `claude-history`'s discovery rules.
 - **`claude-history` has no per-agent ref.** `--subagents` inlines agent messages
   into the parent read untagged, so they can't be sliced apart. Sidecars are
-  parsed directly. Every digest reads the JSONL this way now, parent included.
+  parsed directly. Every digest reads the JSONL this way, parent included.
+- **An agent's report is a record, not a tool result.** An async agent's own
+  `tool_result` holds launch metadata; the report arrives later as a
+  `<task-notification>` record, which is what `--agents` reads.
 - **An agent's last message isn't necessarily its conclusion**, so the section is
   *Last thing it said*. An interrupted agent ends mid-thought.
 - **Agent counts take the larger of two sources** — `Agent`/`Task` calls in the

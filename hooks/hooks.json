@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/chsum_checkpoint.py",
+            "command": "chsum hook stop",
             "timeout": 30
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/chsum_session_start.py",
+            "command": "chsum hook session-start",
             "timeout": 30
           }
         ]

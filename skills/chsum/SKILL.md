@@ -17,7 +17,7 @@ on as fact.
 |---|---|
 | `chsum` | List this project's five most recent sessions (default). `-n 25`, `--since 7d`, `--all` |
 | `chsum recap` | This session, from wherever the last recap stopped. `--full` for all of it |
-| `chsum context --last` | The most recent session that isn't this one. `-n 2` for the one before |
+| `chsum context --last` | The most recent session that isn't this one. `--last 2` for the one before |
 | `chsum find "<query>"` | Find a session by content. `--lexical` for identifiers/filenames/errors |
 | `chsum context <ref>` | Full digest, for reloading into the conversation |
 | `chsum context <ref>/<agent-id>` | One subagent's own digest |
@@ -29,8 +29,8 @@ on as fact.
 | `chsum digest <ref> --agents` | Every subagent and each report it sent back, numbered where one returned more than once |
 | `chsum digest <ref> -3 -1` | A window of your turns, rows printed whole — `1` your first, `-1` your last, one number one turn, two a range; `--tools`/`--commands` take the same numbers |
 | `chsum journal --since 7d` | Chronological work log across sessions |
-| `chsum recap <ref> --from N --to M` | Reload a specific turn range from a past session |
-| `chsum recap --last` | Recap the most recent session that isn't this one, whole |
+| `chsum recap <ref> --messages N M` | Reload a specific turn window from a past session; same numbering as `digest` |
+| `chsum recap --last` | Recap the most recent session that isn't this one, from the turn after the last recap; `--full` for the whole of it |
 | `chsum recap --invalidate` | Summarise this window again, replacing what's stored for it |
 | `chsum note "<text>"` | Note this moment, for the digest and claude-history |
 | `chsum note --show <id>` | Where a note landed: file, row, time, agent, message |
@@ -99,11 +99,13 @@ viewer and one typed here are the same thing.
 
 ## Catching up
 
-`chsum recap <ref> --from N --to M` reloads a specific window of a past
-session: your turns in that range verbatim, with a model-written timeline
-sliced under each one. Run non-interactively with `--no-tui` plus both
-`--from`/`--to` — without a terminal there's no session/turn picker to fall
-back on. `--dry-run` prices the call without making it — `0 calls would be made` means the window is already in the turn store and rerunning it is free. Each turn's bullets are kept under `~/.chsum/turns/` once that turn's gap has closed; `--no-cache` bypasses the store in both directions.
+`chsum recap <ref> --messages N M` reloads a specific window of a past
+session: your turns in that window verbatim, with a model-written timeline
+sliced under each one. `1` is the user's first turn and `-1` their last, in
+either order, and the numbers are the ones `chsum digest --messages` takes, so
+a window found in a digest runs here unchanged. Without numbers the window runs
+from the turn after the last one already recapped; `--full` takes the whole
+session. `--dry-run` prices the call without making it — `0 calls would be made` means the window is already in the turn store and rerunning it is free. Each turn's bullets are kept under `~/.local/share/chsum/turns/` once that turn's gap has closed; `--no-cache` bypasses the store in both directions.
 
 `chsum recap` with no arguments is the live case — what's happened in the *current*
 session since the last typed prompt. It's a second-terminal tool for the
@@ -129,14 +131,14 @@ was resolved, the `claude-history agent read` that opens the conversation.
 
 ## Per-turn git checkpoints (offer once, per project)
 
-This plugin ships a Stop hook (`hooks/chsum_checkpoint.py`) that, *if enabled
+This plugin ships a Stop hook (`chsum hook stop`) that, *if enabled
 for the current project*, commits the working tree after each turn and
 immediately resets the commit away — invisible in `git log`/`git status`,
 recoverable via `git reflog` — so `recap`'s files-touched section can read
 real `git diff`s instead of reconstructing them from the transcript. It ships
 installed but inert everywhere: nothing happens until a project opts in.
 
-A SessionStart hook (`hooks/chsum_session_start.py`) checks this at the start
+A SessionStart hook (`chsum hook session-start`) checks this at the start
 of every session in a git repo: if `.git/chsum-checkpoint` doesn't exist yet
 (never asked, or a fresh clone), it injects a note asking you to raise this
 with the user. When it does, ask once, plainly: do they want per-turn
@@ -158,7 +160,7 @@ nudge again next session.
   most recent session is often not the one meant.
 - What's been happening → `journal --since 7d`.
 - A specific stretch of a past session, not the whole thing → `recap <ref>
-  --from N --to M --no-tui`.
+  --messages N M`.
 
 ## Reading the output
 
