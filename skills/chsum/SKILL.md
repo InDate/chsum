@@ -71,9 +71,9 @@ For something further back — "note that bit about the sidecars":
 `<text>` is free text, copied verbatim into the digest — write the note you'd
 want to read cold months later, not a label.
 
-`chsum note --list` shows this conversation's annotations with ids: the user's
-notes and the bullets `recap` wrote, tagged by kind (`--full` for the whole
-targeted message); `--delete <id>` removes one from the store. Never delete a
+`chsum note --list` shows this conversation's notes with their ids (`--full` for
+the whole targeted message), and `chsum recap --list` the bullets `recap` wrote;
+`--delete <id>` takes either kind and removes it from the store. Never delete a
 note the user made without being asked.
 
 `chsum note --show <id>` takes the same id and prints where it landed — the file,

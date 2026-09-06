@@ -179,16 +179,16 @@ chsum digest ch_da4e99d42e5efab11ebdedc22fb65145/a728cd49179f1a356 --stdout
 Bare `chsum` lists the project's sessions, newest activity first:
 
 ```
-Thu 06 Aug 2026                        dur    prompts  files  agents  notes  recap
-  ch_c120431a267b202aebf0b38f6c3c1b69  5h38m  78       14     -       ⚑2     3/12 · 2h ago
+Thu 06 Aug 2026                        dur    prompts  files  agents  notes  digest   recap
+  ch_c120431a267b202aebf0b38f6c3c1b69  5h38m  78       14     -       ⚑2     current  3/12 · 2h ago
     ↳ Plan the import pipeline from the sample files
 
 Wed 05 Aug 2026
-  ch_da4e99d42e5efab11ebdedc22fb65145  3h03m  30       12     2       -      -
+  ch_da4e99d42e5efab11ebdedc22fb65145  3h03m  30       12     2       -      stale    -
     ↳ Set up the dev server
       a43c4ff4401ca693e  Quieten the test suite
       a81d77b6cba4a46b3  Fix the retry backoff
-  ch_b99f11b7c257dafc8b93f53480ba3804  6s     1        0      -       -      -
+  ch_b99f11b7c257dafc8b93f53480ba3804  6s     1        0      -       -      -        -
     ↳ (untitled)
 ```
 
@@ -196,7 +196,7 @@ Wed 05 Aug 2026
 chsum                 # the five most recent in this project
 chsum -n 25           # more of them; 0 for all
 chsum --since 7d      # only the last week
-chsum --all           # across every project
+chsum --all           # across every project, fifteen of them, each row named
 ```
 
 Listing is the default because picking is the common case, and "most recent" is
@@ -209,12 +209,20 @@ numbers trail the conversation, since Claude Code is still appending.
 Subagents are named, not just counted, because "3 agents" says nothing about a
 session that delegated its work — and the id is the one `chsum digest
 <ref>/<id> --stdout` takes. Five deep, then a count. Five sessions too, by
-default: the listing is usually read into a context window, and `-n 0 --all`
-is the whole corpus.
+default, and fifteen under `--all`, which spans every project and so lands you
+in one of them at five: the listing is usually read into a context window, and
+`-n 0 --all` is the whole corpus. `--all` adds a `project` column, since a row
+otherwise names no project.
 
-A `recap` column states the turn store's coverage of each session — `3/12 · 2h
+A `digest` column states whether a digest file covers the session — `current`,
+`stale` where the transcript holds records written after the file, `-` where
+there is none. A `recap` column states the turn store's coverage — `3/12 · 2h
 ago` is turns holding a breakdown over turns there are — and a `✎` marks a title
 you gave with `chsum name` rather than Claude Code's.
+
+Sessions chsum's own summariser records are left out: `recap` calls `claude -p`
+from the store directory, and Claude Code files each of those as a session of
+its own. A run from inside that directory still lists them.
 
 ## `chsum recap`
 
@@ -357,18 +365,36 @@ chsum digest <ch_ref>                          # write a digest file
 chsum digest <ch_ref> --stdout                 # print it instead
 chsum digest --file path/to/session.jsonl      # address by file
 chsum digest <ch_ref>/<agent-id>               # one subagent's own digest
+chsum digest --list                            # the digest files written so far
 ```
+
+`--list` reads the digest directory rather than a conversation, so it takes no
+ref: one row per file, newest first, carrying the ref that reproduces it, when
+it was written, the session's project, duration, prompts and files, and whether
+the file is `current` or `stale` against the transcript.
 
 | Section | Source |
 |---|---|
 | Frontmatter — ref, title, project, branch, start, duration, counts | computed |
 | **Notable** — what you filed with `chsum note`, verbatim | copied |
-| **What I asked for** — your prompts, verbatim, in order | copied |
+| **What I asked for** — your prompts, verbatim, in order, each under a line naming its row and what the turn did | copied, counts parsed from tool calls |
 | **Files changed** / **Commands run** | parsed from tool calls |
 | **Delegated** — one line per subagent, with its address | parsed from sidecars |
 | **Where I left off** — last prompt and last reply, verbatim | copied |
 | — *found by two separate backward scans, so they may be far apart and are not a Q&A pair* | |
 | **Drill down** — transcript and sidecar paths, and the `sed` that opens a row | computed |
+
+Each prompt leads, with its metadata beneath it — the row it sits on, how long
+the turn ran, and how many tool calls, files, commands and replies followed it:
+
+```
+> when I do --list on a note, it prints out the entire directory which looks terrible
+
+*`49932ac7:37` · 19s · 2 commands · 1 reply*
+```
+
+The counts come from one walk of the transcript and its sidecars, so an agent's
+work counts toward the turn that launched it, and no model is asked anything.
 
 An agent digest has the same shape minus the intent trail — an agent gets one
 instruction, so **Task** is a single block. A subagent's edits and commands fold
@@ -381,7 +407,7 @@ Every reference in a digest is a row: `1f271ca8:441` is line 441 of session
 second tool to resolve.
 
 Output is budgeted, because it lands in a future context window: quotes clip,
-lists cap. Every truncation is marked (`[+N chars, read the anchor]`, `…and N
+lists cap. Every truncation is marked (`[+N chars, sed the row below]`, `…and N
 more`) so you always know when you're seeing a fragment.
 
 **Commands run** shows ten, and it shows them after a filter that drops
@@ -561,23 +587,26 @@ in claude-history's viewer (see [`chsum annotations`](#chsum-annotations)).
 
 ```sh
 ! chsum note --list
-the timeout gap, stated plainly     dde43c3c#1  note
+the timeout gap, stated plainly     dde43c3c#1
   ↳ Currently **no** — and worth knowing exactly where it dies.
 
-Testing                             dde43c3c#2  note
+Testing                             dde43c3c#2
   ↳ Left in place — it records the state that prompted the change.
 
 ! chsum note --list --full            # whole text, whole targeted message
+! chsum recap --list                  # the bullets `recap` wrote, same ids
 ! chsum note --show dde43c3c#1        # where it landed, with what surrounds it
 ! chsum note --delete dde43c3c#2      # takes several ids at once
 ```
 
-`--list` shows every annotation the store holds for this conversation: your
-notes, and the bullets `recap` wrote, each tagged by kind. An id is the turn's
-uuid and a number issued once — a bullet that `recap` rewrites takes a fresh
-number, and a note keeps its own, so an id you copied out still names the
-same text later. `--delete` removes the annotation from the store; deleting a
-recap bullet means the next recap of that turn prints without it.
+The store holds two kinds and each has its own listing: `chsum note --list` is
+your notes, `chsum recap --list` is the bullets `recap` wrote. A bullet is a
+model's and a note is yours, and one listing holding both reads as one kind of
+thing. An id is the turn's uuid and a number issued once — a bullet that `recap`
+rewrites takes a fresh number, and a note keeps its own, so an id you copied out
+still names the same text later. `--show` and `--delete` take an id of either
+kind; deleting a recap bullet means the next recap of that turn prints without
+it.
 
 `--show` takes the same id and answers where: the file, the row in it, the time,
 the agent when the message is a subagent's, then the targeted message whole and
