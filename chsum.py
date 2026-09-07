@@ -5,7 +5,7 @@ Every line of output is copied verbatim or computed, never invented. Prose
 generation lives behind the `Summariser` seam and prints beneath the verbatim
 record, labelled model-written.
 
-Commands: sessions (default), last, find, digest, mark, journal.
+Commands: sessions (default), last, find, digest, mark.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ import sys
 import textwrap
 import threading
 import time
+import urllib.parse
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -306,6 +307,23 @@ def project_dir_name(cwd: pathlib.Path) -> str:
     return re.sub(r"[^A-Za-z0-9-]", "-", str(cwd))
 
 
+def _project_dirs(all_projects: bool) -> list[str]:
+    """The store directories a listing reads: this project's alone, or every
+    project the store holds. One name per directory, in the same slug the
+    transcript tree uses, so a directory here keys a transcript there."""
+    if not all_projects:
+        return [project_dir_name(pathlib.Path.cwd())]
+    if not TURNS_DIR.is_dir():
+        return []
+    return sorted(d.name for d in TURNS_DIR.iterdir() if d.is_dir())
+
+
+def _scope_label(all_projects: bool) -> str:
+    """What an empty listing searched, named the way the flag that widens it is.
+    An empty list under the default scope reads as "nothing exists" without it."""
+    return "any project" if all_projects else pathlib.Path.cwd().name
+
+
 # Where the store has lived: `~/.chsum`, then `~/.claude/chsum`, now the XDG
 # data home. Resolved at import, so `CHSUM_DIR` set in the environment is covered.
 _STORE_PROJECT_DIRS = {project_dir_name(d) for d in (
@@ -349,11 +367,13 @@ def _history(*args: str, timeout: int = 600) -> str:
     proc = subprocess.run([exe, *args], capture_output=True, text=True, timeout=timeout)
     TRACE.proc(["claude-history", *args], proc.returncode, time.monotonic() - started,
                f"{len(proc.stdout)} chars out")
-    if "agent-error" in proc.stdout:
-        raise HistoryError(
-            f"claude-history rejected {' '.join(args)}: "
-            f"{proc.stdout.strip().splitlines()[0]}"
-        )
+    # Anchored to the start of a line, not searched across the body: a hit's
+    # text carries whatever the conversation said, and a conversation that
+    # quoted this protocol reads as a rejection under a substring test.
+    failed = next((ln for ln in proc.stdout.splitlines()
+                   if ln.startswith("protocol agent-error")), "")
+    if failed:
+        raise HistoryError(f"claude-history rejected {' '.join(args)}: {failed}")
     if proc.returncode != 0:
         raise HistoryError(proc.stderr.strip() or proc.stdout.strip() or "unknown failure")
     return proc.stdout
@@ -365,25 +385,100 @@ def _fields(line: str) -> dict:
     return dict(t.split("=", 1) for t in head.split() if "=" in t)
 
 
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                      re.IGNORECASE)
+
+
 @dataclass
 class Hit:
     ref: str
     uuid: str
     title: str
+    score: float = 0.0
+    # The first `hit` line under the conversation: where the match sits and the
+    # text around it. Without them a row states a conversation and not a reason.
+    focus: str = ""
+    excerpt: str = ""
+    shows_term: bool = False  # the excerpt holds a query term, so it reads as evidence
 
 
-def search(query: str, *, local: bool, mode: str, top: int) -> list[Hit]:
+@dataclass
+class Search:
+    """What one `agent search` returned: the conversations, and the warnings the
+    run emitted. A warning reports a rank the search could not compute, which
+    changes what the scores beside the hits mean."""
+    hits: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)  # (kind, detail), detail decoded
+    # A semantic score reached the ranking. Absent it, every score is a
+    # reciprocal rank and the spread measures position, not match strength.
+    semantic: bool = False
+
+
+def _warning_text(kind: str, fields: dict) -> str:
+    """A warning's own words. `detail` carries them where a kind raised one
+    warning; where it raised several they are folded to a bare `count=`, which
+    drops the refs and the reason, so the reason is restored from the kind."""
+    said = kind.replace("-", " ")
+    detail = urllib.parse.unquote(fields.pop("detail", ""))
+    if detail:
+        return f"{said} — {detail}"
+    count = fields.pop("count", "")
+    if kind == "skipped" and count:
+        # Raised per transcript that loads but holds no visible messages and no
+        # searchable metadata: those conversations were never looked inside.
+        return (f"{count} transcripts skipped — empty, or carrying no searchable "
+                f"conversation metadata")
+    rest = " ".join(f"{k}={v}" for k, v in fields.items())
+    return f"{said} — {count} {rest}".strip() if count or rest else said
+
+
+def _warning_text_line(text: str) -> str:
+    """A warning as one line: newlines would break a blockquote and a wrap."""
+    return " ".join(text.split())
+
+
+def _text_after_bar(line: str) -> str:
+    return line.split(" | ", 1)[1].strip() if " | " in line else ""
+
+
+def search(query: str, *, local: bool, mode: str, top: int,
+           terms: list | None = None) -> Search:
+    # `--no-budget`: the default trims the protocol to 6000 characters by
+    # dropping records from the tail, and warnings sit last, so a wide search
+    # arrived with its warnings already gone. This output is parsed, not read.
     args = ["agent", "search", query, "--top", str(top), f"--{mode}",
-            "--local" if local else "--all"]
-    hits = []
+            "--no-budget", "--local" if local else "--all"]
+    out = Search()
+    sources: set = set()
+    by_ref: dict = {}
     for line in _history(*args).splitlines():
         if line.startswith("conversation "):
             f = _fields(line)
-            hits.append(Hit(
-                ref=f.get("ref", ""), uuid=f.get("uuid", ""),
-                title=line.split(" | ", 1)[1].strip() if " | " in line else "(untitled)",
-            ))
-    return hits
+            hit = Hit(ref=f.get("ref", ""), uuid=f.get("uuid", ""),
+                      title=_text_after_bar(line) or "(untitled)",
+                      score=float(f.get("score") or 0.0))
+            by_ref[hit.ref] = hit
+            out.hits.append(hit)
+        elif line.startswith("hit "):
+            f = _fields(line)
+            sources.add(f.get("source", ""))
+            hit = by_ref.get(f.get("ref", ""))
+            if hit is None:
+                continue
+            text = _text_after_bar(line)
+            shows = bool(terms) and any(t.lower() in text.lower() for t in terms)
+            # The best-ranked hit comes first and is taken first. A later one
+            # replaces it only where it shows a term and the one held does not,
+            # so a row states the reason it is in the listing.
+            if not hit.excerpt or (shows and not hit.shows_term):
+                hit.focus = (f.get("focus") or "").split("..")[0]
+                hit.excerpt, hit.shows_term = text, shows
+        elif line.startswith("protocol agent-warning"):
+            f = _fields(line)
+            kind = f.pop("kind", "warning")
+            out.warnings.append((kind, _warning_text(kind, f)))
+    out.semantic = "semantic" in sources
+    return out
 
 
 @dataclass
@@ -476,24 +571,6 @@ def _tool_injected(rec: dict, command_ids: frozenset[str] = frozenset()) -> bool
     if rec.get("sourceToolUseID"):
         return True
     return bool(rec.get("isMeta")) and rec.get("promptId") in command_ids
-
-
-# Steering turns with no standalone meaning ("yes", "ok, do that") — counted,
-# not shown in the trail.
-_ACK_RE = re.compile(
-    r"^(y(es|ep|eah|up)?|no(pe)?|ok(ay)?|sure|thanks|ta|cool|nice|good|great|perfect|"
-    r"do (it|that)|go ahead|carry on|continue|next|yes please|please do|"
-    r"correct|right|exactly|agreed|fine|stop|wait|hmm+)"
-    r"[\s.,!?*)]*$",
-    re.IGNORECASE,
-)
-
-
-def is_substantive(text: str) -> bool:
-    """Does this prompt say anything on its own? Filtered from the trail but
-    still counted, not silently erased."""
-    t = text.strip()
-    return len(t) >= 12 and not _ACK_RE.match(t)
 
 
 # Harness-generated last words — matched (fixed strings), not guessed, so
@@ -599,7 +676,16 @@ class Meta:
 
     @property
     def project_name(self) -> str:
-        return pathlib.Path(self.project).name if self.project else "?"
+        """The last segment of the conversation's `cwd`. An ingested document
+        carries a uuid there, which names nothing a reader can search for, so the
+        transcript's own directory stands in — that is where the ingest is
+        named."""
+        name = pathlib.Path(self.project).name if self.project else ""
+        if name and not _UUID_RE.fullmatch(name):
+            return name
+        if self.path is not None:
+            return self.path.parent.name
+        return name or "?"
 
 
 # ---------------------------------------------------------------------------
@@ -709,7 +795,10 @@ class Annotation:
     kind: str  # "note" | "recap" | as received on the wire
     text: str
     targets: list = field(default_factory=list)  # parent rows, int or "a..b"; [] is session-level
-    written: str = ""
+    # Stamped by whoever wrote the annotation, RFC 3339. A write that carries
+    # neither takes chsum's clock for both; both travel back out on the read.
+    created: str = ""
+    modified: str = ""
     turn: str = ""  # the turn file's uuid; "" under a session file
     session: str = ""
     agent: str = ""  # sidecar the target sits in — its rows don't order against the parent's
@@ -878,7 +967,7 @@ def extract_agent(side: pathlib.Path) -> AgentRun:
 # The meta cache
 # ---------------------------------------------------------------------------
 # `_meta_from_transcript` parses a whole JSONL — 17 ms per session measured over
-# 367, so a listing of 15 costs a quarter-second and `journal` over the corpus
+# 367, so a listing of 15 costs a quarter-second and one of the whole corpus
 # costs six. The parse is a pure function of the file's bytes, so its result is
 # cached against `(mtime, size)` and re-read instead. `notes`, `recapped` and
 # `recapped_at` are excluded, being the store's and not the transcript's.
@@ -1062,7 +1151,7 @@ def extract_meta(path: pathlib.Path) -> Meta:
     # model's. Agents' notes are in the same files, by the `agent` they carry.
     docs = _load_store(path.parent.name).get(path.stem, [])
     meta.notes = sorted((a for doc in docs for a in _annotations_of(doc) if a.kind == "note"),
-                        key=lambda a: a.written)
+                        key=lambda a: a.created)
     # Summaries, not files, as `_recap_start`: a file holding notes alone recaps nothing.
     latest = [e for e in (_latest_summary(doc) for doc in docs) if e]
     meta.recapped = len(latest)
@@ -1093,41 +1182,44 @@ _CMD_SEP_RE = re.compile(r"&&|\|\||;|\n")
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*$")
 
 
-def _first_command(cmd: str) -> str:
-    """The part of a command worth showing: the first line that does something.
-    `cd repo` then `python3 build.py` is the build, and a reader wants to see it."""
+def _command_work(cmd: str) -> str:
+    """The first thing a command does, past every leading `cd somewhere` and
+    `NAME=value` — those set up what follows and name no work of their own,
+    whether they sit on their own line or ahead of the work behind `&&`. A digest
+    line clips at 120 characters, and a scratchpad path left on the front spends
+    that width on the path instead of the command. "" where every line is setup.
+
+    The first word carries the assignment test unsplit: the basename of
+    `F=/a/b.jsonl` is `b.jsonl`, which stops looking like an assignment."""
     for line in cmd.strip().splitlines():
         head = line.strip()
-        if not head:
-            continue
-        word = head.split()[0].rsplit("/", 1)[-1] if head.split() else ""
-        rest = _CMD_SEP_RE.split(head, maxsplit=1)
-        # A line that is only `cd somewhere`, or only `VAR=value`, sets up the
-        # next line and names no work of its own; skip past it.
-        if (word == "cd" or _ASSIGN_RE.match(head)) and (
-                len(rest) == 1 or not rest[1].strip()):
-            continue
-        return head
-    return next((l.strip() for l in cmd.strip().splitlines() if l.strip()), "")
+        while head:
+            word = head.split()[0]
+            if not (word.rsplit("/", 1)[-1] == "cd" or _ASSIGN_RE.match(word)):
+                return head
+            rest = _CMD_SEP_RE.split(head, maxsplit=1)
+            head = rest[1].strip() if len(rest) > 1 else ""
+    return ""
+
+
+def _first_command(cmd: str) -> str:
+    """The part of a command worth showing: `cd repo && python3 build.py` is the
+    build, and a reader wants to see it. A command that is setup throughout falls
+    back to its own first line, so `--commands` lists it rather than a blank."""
+    return _command_work(cmd) or next(
+        (l.strip() for l in cmd.strip().splitlines() if l.strip()), "")
 
 
 def _is_notable_command(cmd: str) -> bool:
     """Did this command change something, build, or test?"""
-    cmd = _first_command(cmd)
-    # Before the basename split: that reduces `F=/a/b.jsonl` to `b.jsonl` and an
-    # assignment stops looking like one.
-    head = cmd.split()[0] if cmd.split() else ""
-    first = head.rsplit("/", 1)[-1]
-    if first in ("sudo", "time", "nohup"):
-        parts = cmd.split()
-        first = parts[1].rsplit("/", 1)[-1] if len(parts) > 1 else first
-    if first == "cd" or _ASSIGN_RE.match(head):
-        rest = _CMD_SEP_RE.split(cmd, maxsplit=1)
-        if len(rest) > 1 and rest[1].strip():
-            return _is_notable_command(rest[1])
-        # Nothing follows: the command set a variable or changed directory and
-        # did no work of its own.
+    work = _command_work(cmd)
+    if not work:
+        # Every line set a variable or changed directory and did no work of its own.
         return False
+    first = work.split()[0].rsplit("/", 1)[-1]
+    if first in ("sudo", "time", "nohup"):
+        parts = work.split()
+        first = parts[1].rsplit("/", 1)[-1] if len(parts) > 1 else first
     return first not in _INSPECTION_CMDS
 
 
@@ -1265,12 +1357,88 @@ def _colour_ok(stream=None) -> bool:
     return bool(stream.isatty() or os.environ.get("FORCE_COLOR"))
 
 
+# Mid-luminance 256-colour codes, legible on a light and on a dark terminal.
+# Twelve of them: past twelve projects a colour repeats, which costs a glance,
+# where a code near the terminal's own background costs the whole cell.
+_PROJECT_COLOURS = (31, 66, 71, 97, 101, 108, 131, 136, 168, 173, 175, 180)
+
+
+def _project_palette(names) -> dict[str, str]:
+    """One escape per project name across a listing. A digest of the name picks
+    its place in the palette, not the row's position, so reordering the listing
+    leaves the colours where they were. A place already held moves the later
+    name to the next free one, so two projects in one listing never share a
+    colour; that probe reads the set of names present, so a project whose first
+    choice collides here takes a different colour in a listing without the name
+    that beat it. Past twelve projects every place is held and a colour repeats.
+
+    Empty where the terminal takes no colour, which leaves the cells unpainted."""
+    if not _colour_ok():
+        return {}
+    taken: set[int] = set()
+    out: dict[str, str] = {}
+    for name in sorted({n for n in names if n}):
+        i = int(hashlib.blake2s(name.encode(), digest_size=4).hexdigest(), 16)
+        slot = i % len(_PROJECT_COLOURS)
+        for step in range(len(_PROJECT_COLOURS)):
+            slot = (i + step) % len(_PROJECT_COLOURS)
+            if slot not in taken:
+                break
+        taken.add(slot)
+        out[name] = f"\033[38;5;{_PROJECT_COLOURS[slot]}m"
+    return out
+
+
+def _paint_project(cell: str, name: str, palette: dict[str, str]) -> str:
+    """The already-padded cell in its project's colour. Padded first and coloured
+    second: an escape sequence counted into a column width shifts every column
+    after it by the length of the sequence."""
+    colour = palette.get(name, "")
+    return f"{colour}{cell}\033[0m" if colour else cell
+
+
 def _dim(text: str) -> str:
     """Grey for quoted transcript text, so a reason and the message it marks don't
     read as one voice."""
     if not _colour_ok():
         return text
     return f"\033[2m{text}\033[0m"
+
+
+# Blue against the muted project palette, which holds no blue, so a term never
+# reads as a project name.
+_TERM_COLOUR = "\033[38;5;39m"
+# Red for the `warning:` label alone, so the prose beside it stays readable.
+_WARN_COLOUR = "\033[38;5;203m"
+
+
+def _lit_terms(text: str, terms) -> str:
+    """A dimmed line with the query's words picked out. A highlight closes with a
+    reset, which closes the dim run with it, so every match reopens the dim
+    behind itself and the rest of the line stays grey."""
+    if not terms or not _colour_ok():
+        return _dim(text)
+    pattern = re.compile("|".join(re.escape(t) for t in terms), re.IGNORECASE)
+    lit = pattern.sub(lambda m: f"\033[0m{_TERM_COLOUR}{m.group(0)}\033[0m\033[2m", text)
+    return f"\033[2m{lit}\033[0m"
+
+
+def _term_window(text: str, terms, limit: int) -> str:
+    """The excerpt clipped around its first matching term rather than from the
+    start. A hit's preview opens at the message's first character and the term
+    that matched often sits past `limit`, which printed a row whose reason for
+    being there was cut off. No term in the preview leaves the head, which is
+    all the text there is to show."""
+    text = " ".join(text.split())
+    if not terms:
+        return _clip_line(text, limit)
+    found = re.search("|".join(re.escape(t) for t in terms), text, re.IGNORECASE)
+    if not found or found.start() < limit:
+        return _clip_line(text, limit)
+    # Opened a little before the match so the term is not the first word, and
+    # marked as opening mid-message.
+    start = max(0, found.start() - 12)
+    return "… " + _clip_line(text[start:], limit - 2)
 
 
 def _clip_line(text: str, limit: int) -> str:
@@ -1610,8 +1778,8 @@ def _prompt_activity(path: pathlib.Path) -> dict[int, tuple[int, str]]:
     call. Agents' rows count with the parent's, as every other total here does.
 
     The number counts `starts_turn` rows, which is the unit `--messages` takes —
-    not the digest's own position, which drops steering replies and would name a
-    window that lands somewhere else."""
+    not the digest's own position, which counts prompts and would name a window
+    that lands somewhere else."""
     rows = collect_rows(path, ("message", "tool", "command"))
     starts = [i for i, r in enumerate(rows) if r.starts_turn]
     out: dict[int, tuple[int, str]] = {}
@@ -1638,10 +1806,12 @@ def _prompt_activity(path: pathlib.Path) -> dict[int, tuple[int, str]]:
 
 def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
                   path: pathlib.Path | None = None,
-                  prompt_clip: int = 2000, max_prompts: int = 100) -> str:
-    typed = [m for m in msgs if m.role == "user" and is_typed_prompt(m.text)]
-    prompts = [m for m in typed if is_substantive(m.text)]
-    steering = len(typed) - len(prompts)
+                  prompt_clip: int = 2000) -> str:
+    # Every typed prompt, uncapped and unfiltered. The trail is what the digest
+    # exists to carry, and a prompt dropped for being short or for arriving late
+    # in a long session is the one a reader came for. The whole trail of the
+    # longest session in the corpus costs 40 KB against 21 KB for its first 100.
+    prompts = [m for m in msgs if m.role == "user" and is_typed_prompt(m.text)]
     parts = [frontmatter(meta, ref), ""]
 
     parts.append(f"# {meta.title}\n")
@@ -1667,9 +1837,8 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
     if not prompts:
         parts.append("*No user prompts recorded.*\n")
     else:
-        shown = prompts[:max_prompts]
         activity = _prompt_activity(path) if path else {}
-        for m in shown:
+        for m in prompts:
             # What you said leads; the row it sits on and what followed it are
             # metadata, on one dim line beneath. The row, not an ordinal: a
             # reader opens this with `sed`.
@@ -1680,14 +1849,6 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
             # one command away.
             meta_bits = ([f"turn {turn}"] if turn else []) + [where] + ([did] if did else [])
             parts.append(f"*{' · '.join(meta_bits)}*\n")
-        trailer = []
-        if len(prompts) > len(shown):
-            trailer.append(f"{len(prompts) - len(shown)} more prompts")
-        if steering:
-            trailer.append(f"{steering} short steering replies not shown "
-                           f"(“yes”, “ok, do that”)")
-        if trailer:
-            parts.append(f"*…and {', '.join(trailer)}.*\n")
 
     if meta.edited:
         parts.append("## Files changed\n")
@@ -1842,27 +2003,25 @@ def resolve_ref(args) -> str:
 
 
 def _find_notes(args) -> int:
-    """Notes matching a query, read off the store: one directory per project,
-    plain substring matching — there are few notes and they're short."""
+    """Notes whose text contains the query, read off the store: plain substring
+    matching — there are few notes and they're short. `find` is a search and a
+    search takes a query; the whole-scope listing is `chsum note --list`."""
     q = (args.query or "").lower()
-    dirs = ([project_dir_name(pathlib.Path.cwd())] if not args.all
-            else sorted(p.name for p in TURNS_DIR.iterdir() if p.is_dir())
-            if TURNS_DIR.is_dir() else [])
-    paths = {p.stem: p for p in transcripts(local=not args.all)}
-    rows = []
-    for d in dirs:
-        for session, docs in _load_store(d).items():
-            for a in (a for doc in docs for a in _annotations_of(doc) if a.kind == "note"):
-                if q and q not in a.text.lower():
-                    continue
-                rows.append((session, paths.get(session), a))
+    if not q:
+        raise SystemExit("find --notes searches note text and needs a query — "
+                         "`chsum note --list` lists them all")
+    rows = [(path, a) for _d, path, a in _pooled_annotations("note", args.all)
+            if q in a.text.lower()]
     if not rows:
-        print("no notes" + (f" matching {args.query!r}" if q else ""), file=sys.stderr)
+        print(f"no notes matching {args.query!r} in {_scope_label(args.all)}",
+              file=sys.stderr)
         return 1
-    rows.sort(key=lambda r: r[2].written, reverse=True)
-    for session, path, a in rows[:args.top]:
-        ref = ch_ref_for_path(path) if path else session[:8]
-        print(f"{ref}  {a.written[:10]}  ⚑ {a.text}")
+    for path, a in rows[:args.top]:
+        ref = ch_ref_for_path(path) if path else a.session[:8]
+        print(f"{ref}  {a.created[:10]}  ⚑ {a.text}")
+    # Flushed first, or the hint jumps the list: stdout is block-buffered when
+    # piped, stderr never is.
+    sys.stdout.flush()
     print(f"\nRead one: `chsum digest <ref> --stdout`", file=sys.stderr)
     return 0
 
@@ -1871,21 +2030,82 @@ def cmd_find(args) -> int:
     if args.notes:
         return _find_notes(args)
     if not args.query:
-        raise SystemExit("find: need a query (or --notes to list notes)")
-    if args.mode in ("hybrid", "semantic"):
-        # Embedding search is tens of seconds warm, and several minutes the very
-        # first time while the index builds. Say so rather than looking hung.
-        print(f"searching ({args.mode}; --lexical is much faster for exact terms)…",
-              file=sys.stderr)
-    hits = search(args.query, local=not args.all, mode=args.mode, top=args.top)
-    if not hits:
+        raise SystemExit("find: need a query")
+    # Single-character words are dropped: they land inside other words and paint
+    # the line rather than the term.
+    terms = [t for t in re.split(r"\W+", args.query) if len(t) > 1]
+    # A terminal gets the padded, coloured layout; everything else gets the
+    # markdown document, which is what a grep or a chat reads.
+    dressed = sys.stdout.isatty()
+    # The query stands alone here, so it takes the term colour directly rather
+    # than through `_lit_terms`, whose dim run is for text surrounding a match.
+    said = f"{_TERM_COLOUR}{args.query}\033[0m" if dressed else args.query
+    print(f"searching for {said} ({args.mode})…", file=sys.stderr)
+    found = search(args.query, local=not args.all, mode=args.mode, top=args.top,
+                   terms=terms)
+    # Gathered before either branch prints: on a terminal they are progress on
+    # stderr, and in the document they are part of the answer, since a reader
+    # capturing stdout alone would otherwise not learn the search was degraded.
+    said = [_warning_text_line(text) for _kind, text in found.warnings]
+    if not found.hits:
+        for line in said:
+            print(f"warning: {line}", file=sys.stderr)
         print("no matches", file=sys.stderr)
         return 1
-    for h in hits:
-        path = _path_for_uuid(h.uuid)
-        meta = extract_meta(path) if path else Meta()
-        print(f"{h.ref}  {meta.date or '??????????'}  "
-              f"{meta.project_name[:22]:<22}  {h.title}")
+    scores = [h.score for h in found.hits]
+    if not found.semantic and len(scores) > 1:
+        # One source ranked every hit, so each score is its reciprocal rank and
+        # the spread measures position rather than how well a passage matched.
+        said.append(f"{_plural(len(found.hits), 'hit')} ranked by position only "
+                    f"({min(scores):.4f}–{max(scores):.4f}): no semantic score "
+                    f"contributed.")
+    # Wrapped to the terminal and hung under its label: a warning is prose, and
+    # unwrapped it ran off the line as one unread block.
+    cols = max(40, min(shutil.get_terminal_size((100, 24)).columns, 88))
+    if dressed:
+        for i, line in enumerate(said):
+            print(file=sys.stderr)
+            body = f"warning: {line}" if i < len(found.warnings) else line
+            # Painted after wrapping: an escape counted into the width shortens
+            # the first line by the length of the sequence.
+            lines = _wrap(body, cols, subsequent_indent="  ")
+            if _colour_ok(sys.stderr):
+                lines[0] = lines[0].replace("warning:", f"{_WARN_COLOUR}warning:\033[0m", 1)
+            print("\n".join(lines), file=sys.stderr)
+    # The metas are read before the first row prints, so the palette covers every
+    # project in the listing and a colour is not reassigned partway down it.
+    found_meta = [(h, extract_meta(path) if (path := _path_for_uuid(h.uuid)) else Meta())
+                  for h in found.hits]
+    palette = _project_palette(m.project_name for _h, m in found_meta)
+    if not dressed:
+        # Piped or captured, the same contract the documents hold: markdown, one
+        # bullet per hit and its excerpt beneath, so a grep reads whole records.
+        out = [f"# Search — {args.query}",
+               f"*{_plural(len(found.hits), 'hit')} · {args.mode}*", ""]
+        for i, line in enumerate(said):
+            out.append(f"> {'warning: ' if i < len(found.warnings) else ''}{line}")
+        if said:
+            out.append("")
+        for h, meta in found_meta:
+            # Clipped, generously: a book's first message runs to hundreds of
+            # characters of cover description, which buries the row it names.
+            out.append(f"- `{h.ref}` · {h.score:.3f} · {meta.date or '??????????'}"
+                       f" · {meta.project_name or '-'} — {_clip_line(h.title, 120)}")
+            if h.excerpt:
+                out.append(f"  - `{h.focus or '?'}` — {h.excerpt}")
+        sys.stdout.write("\n".join(out) + "\n")
+        return 0
+    sys.stderr.flush()
+    print(f"\n{_dim('results')}")
+    for i, (h, meta) in enumerate(found_meta):
+        if i:
+            print()
+        cell = _paint_project(f"{meta.project_name[:22]:<22}", meta.project_name, palette)
+        print(f"  {h.ref}  {h.score:.3f}  {meta.date or '??????????'}  "
+              f"{cell}  {_clip_line(h.title, 40)}")
+        if h.excerpt:
+            print(_lit_terms(f"    ↳ {h.focus or '?':<6} "
+                             f"{_term_window(h.excerpt, terms, 72)}", terms))
     return 0
 
 
@@ -2625,48 +2845,101 @@ def _strip_frontmatter(text: str) -> str:
 
 def _write_md(text: str) -> None:
     """A rendered document to stdout, coloured on a terminal and byte-identical
-    markdown anywhere else — the gate `recap`, `journal` and the listing use."""
+    markdown anywhere else — the gate `recap` and the listing use."""
     if sys.stdout.isatty():
         text = _strip_frontmatter(text)
     sys.stdout.write(_md_ansi(text) if _colour_ok() else text)
 
 
-def _list_digests(out: pathlib.Path) -> int:
+def _md_cell(text: str) -> str:
+    """A cell for a markdown table. A pipe inside the text would close the cell
+    and shift every column after it, so it is escaped; newlines cannot appear in
+    a row at all and become spaces."""
+    return " ".join(str(text).split()).replace("|", "\\|")
+
+
+def _md_table(heads: tuple[str, ...], rows: list[tuple[str, ...]]) -> str:
+    """The same rows as a markdown table. Each row carries one field past
+    `heads` — the prose the terminal prints beneath it — which becomes the last
+    column under a blank heading, so one grep-able line holds the whole record."""
+    n = len(heads) + 1
+    out = ["| " + " | ".join(_md_cell(h) for h in (*heads, "")) + " |",
+           "|" + " --- |" * n]
+    for r in rows:
+        cells = [_md_cell(c) for c in r[:n]]
+        cells += [""] * (n - len(cells))
+        out.append("| " + " | ".join(cells) + " |")
+    return "\n".join(out) + "\n"
+
+
+def _print_table(heads: tuple[str, ...], rows: list[tuple[str, ...]],
+                 cols: int, project_col: int | None = None) -> None:
+    """One padded column line per row, its trailing prose wrapped and dimmed
+    beneath. Each row carries one field more than `heads`: the columns, then
+    that prose. Wrapped here rather than left to the terminal — prose folding at
+    column 0 reads as another row. `project_col` names the column carrying a
+    project name, which is painted per project so rows from one project group by
+    eye down a listing that crosses several."""
+    # Piped or captured, the listing is markdown, the same contract `_write_md`
+    # holds for a document: what a terminal pretty-prints, a grep reads as rows.
+    # The terminal decides the shape; colour lives only inside that branch.
+    if not sys.stdout.isatty():
+        sys.stdout.write(_md_table(heads, rows))
+        return
+    n = len(heads)
+    widths = [max(len(r[i]) for r in (*rows, heads)) for i in range(n)]
+    palette = ({} if project_col is None
+               else _project_palette(r[project_col] for r in rows))
+    print(_dim("  ".join(f"{h:<{w}}" for h, w in zip(heads, widths)).rstrip()))
+    for r in rows:
+        cells = [f"{c:<{w}}" for c, w in zip(r[:n], widths)]
+        if project_col is not None:
+            cells[project_col] = _paint_project(cells[project_col],
+                                                r[project_col], palette)
+        print("  ".join(cells).rstrip())
+        if r[n]:
+            print(_dim("\n".join(textwrap.wrap(r[n], cols, initial_indent="  ↳ ",
+                                               subsequent_indent="    "))))
+
+
+def _list_digests(out: pathlib.Path, all_projects: bool) -> int:
     """The digest files `chsum digest <ref>` has written, newest first. Named by
     session uuid on disk, so each row carries the ref that reproduces it."""
-    files = sorted(out.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
-    if not files:
-        print(f"no digests in {out}", file=sys.stderr)
-        return 1
     # The ref, not the stem: it is what `chsum digest <ref> --stdout` takes. The
     # session's own figures come with it, since one flat directory holds every
     # project's digests and a date alone does not say which conversation this is.
-    by_stem = {p.stem: p for p in transcripts()}
-    heads = ("written", "project", "dur", "prompts", "files", "state")
+    by_stem = {p.stem: p for p in transcripts(local=not all_projects)}
+    files = sorted(out.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
+    if not all_projects:
+        # A digest whose transcript is gone carries no project to scope it by, so
+        # project scope drops it and `--all` is where it stays reachable.
+        files = [f for f in files if f.stem in by_stem]
+    if not files:
+        print(f"no digests for {_scope_label(all_projects)} in {out}", file=sys.stderr)
+        return 1
+    heads = ("", "written", *(("project",) if all_projects else ()),
+             "dur", "prompts", "files", "state")
     rows = []
     for f in files:
         src = by_stem.get(f.stem)
         written = f.stat().st_mtime
         if src is None:
-            rows.append((f"ch_? {f.stem[:8]}", _local_when("", written),
-                         "-", "-", "-", "-", "no transcript", ""))
+            rows.append((f"ch_? {f.stem[:8]}", _age_or_date("", written),
+                         *(("-",) if all_projects else ()),
+                         "-", "-", "-", "no transcript", ""))
             continue
         m = extract_meta(src)
         # A session appended to after its digest was written is covered short by
         # whatever followed; the figures beside it are the transcript's now.
         end = _parse_ts(m.ended)
         state = "stale" if end and end.timestamp() > written else "current"
-        rows.append((ch_ref_for_path(src), _local_when("", written),
-                     m.project_name, m.duration or "-", str(m.prompts),
+        rows.append((ch_ref_for_path(src), _age_or_date("", written),
+                     *((m.project_name,) if all_projects else ()),
+                     m.duration or "-", str(m.prompts),
                      str(len(m.edited)), state, m.title or "(untitled)"))
-    widths = [max(len(r[i]) for r in (*rows, ("", *heads, ""))) for i in range(7)]
-    cols = max(40, min(shutil.get_terminal_size((100, 24)).columns, 88))
-    print(_dim("  ".join(f"{h:<{w}}" for h, w in
-                         zip(("", *heads), widths)).rstrip()))
-    for r in rows:
-        print("  ".join(f"{c:<{w}}" for c, w in zip(r[:7], widths)).rstrip())
-        print(_dim("\n".join(textwrap.wrap(r[7], cols, initial_indent="  ↳ ",
-                                           subsequent_indent="    "))))
+    _print_table(heads, rows,
+                 max(40, min(shutil.get_terminal_size((100, 24)).columns, 88)),
+                 project_col=2 if all_projects else None)
     sys.stdout.flush()
     print(f"\n{out}\nRead one: `chsum digest <ref> --stdout`  ·  "
           f"{_plural(len(files), 'digest')}", file=sys.stderr)
@@ -2675,12 +2948,10 @@ def _list_digests(out: pathlib.Path) -> int:
 
 def cmd_digest(args) -> int:
     if args.list:
-        # `--all` scopes a conversation search across projects, and the digest
-        # directory is one flat tree, so it has nothing here to widen.
-        if args.spec or args.file or args.last or args.all:
+        if args.spec or args.file or args.last:
             raise SystemExit("--list reads the digest directory and takes no "
                              "conversation — `chsum digest <ref> --stdout` prints one")
-        return _list_digests(args.out)
+        return _list_digests(args.out, args.all)
     # One view at a time, stated: two flags together printed the first and
     # dropped the second along with any numbers attached to it.
     picked = [f"--{k}" for k in _ROW_KINDS if getattr(args, k, None) is not None]
@@ -2951,8 +3222,10 @@ def _show_note(path: pathlib.Path, a: Annotation, context: int, cols: int) -> in
     src = _sidecar_path(path, a.agent)
     row = a.row if a.agent else _first_row(a.targets)
     where = [f"{src}:{row}" if row else str(src)]
-    if a.written:
-        where.append(_hhmmss(a.written))
+    if a.created:
+        where.append(_hhmmss(a.created))
+    if a.modified and a.modified != a.created:
+        where.append(f"edited {_hhmmss(a.modified)}")
     if a.agent:
         where.append(f"agent {a.agent}")
     where.append(a.kind)
@@ -2992,42 +3265,33 @@ def cmd_note(args) -> int:
     """A note against a row of this conversation, into the store. Prints
     nothing on success: nothing is recorded by the harness any more, so there
     is nothing for output to carry."""
-    path = pathlib.Path(args.file).expanduser().resolve() if args.file else live_transcript()
-    if not path.exists():
-        raise SystemExit(f"no such transcript: {path}")
-    project_dir = path.parent.name
-
     # Named on every path that quotes the transcript: a result that disagrees with
     # another invocation is unreadable without knowing which file each one searched.
     cols = max(40, min(shutil.get_terminal_size((100, 24)).columns, 88))
 
-    if args.show:
-        # Across the project: the store is per project and an id names a file in it.
-        anns = [a for docs in _load_store(project_dir).values()
-                for doc in docs for a in _annotations_of(doc)]
-        a = _find_annotation(anns, args.show)
-        src = path if a.session == path.stem else next(
-            (p for p in transcripts() if p.stem == a.session), path)
-        return _show_note(src, a, args.context, cols)
-
+    # Ahead of the transcript: the listing reads the store across the project and
+    # runs where this project holds no conversation at all, which `live_transcript`
+    # exits on.
     if args.list:
-        anns = [a for a in _annotations_for(path) if a.kind == "note"]
-        if not anns:
-            print(f"nothing noted in {_source_label(path)}", file=sys.stderr)
+        pooled = _pooled_annotations("note", args.all)
+        if not pooled:
+            print(f"nothing noted in {_scope_label(args.all)}", file=sys.stderr)
             return 1
         if args.full:
             # Keyed by file: a note can point into a sidecar, whose line numbers mean nothing here.
             lines_of: dict[pathlib.Path, list[str]] = {}
-            for i, a in enumerate(anns):
+            for i, (_d, src, a) in enumerate(pooled):
                 if i:
                     print()
                 print(f"{a.id[:8]}#{a.n}  {a.text}")
-                src = _sidecar_path(path, a.agent)
                 row = a.row if a.agent else _first_row(a.targets)
-                if src not in lines_of:
-                    lines_of[src] = src.read_text(errors="replace").splitlines()
-                    TRACE.file(src, "list-full", records=len(lines_of[src]))
-                body = _text_at_line(lines_of[src], row) or a.quote
+                body = a.quote
+                if src is not None:
+                    src = _sidecar_path(src, a.agent)
+                    if src not in lines_of:
+                        lines_of[src] = src.read_text(errors="replace").splitlines()
+                        TRACE.file(src, "list-full", records=len(lines_of[src]))
+                    body = _text_at_line(lines_of[src], row) or a.quote
                 first = True  # the ↳ opens the message, it doesn't bullet its paragraphs
                 for para in (body or "(session-level)").splitlines():
                     if not para.strip():
@@ -3038,16 +3302,33 @@ def cmd_note(args) -> int:
                         subsequent_indent="    "))))
                     first = False
             sys.stdout.flush()
-            print(f"\n{_plural(len(anns), 'note')} in {_source_label(path)}",
+            print(f"\n{_plural(len(pooled), 'note')} in {_scope_label(args.all)}",
                   file=sys.stderr)
             return 0
-        return _list_annotations(path, "note", cols, "note")
+        return _list_annotations("note", cols, args.all)
+
+    path = pathlib.Path(args.file).expanduser().resolve() if args.file else live_transcript()
+    if not path.exists():
+        raise SystemExit(f"no such transcript: {path}")
+    project_dir = path.parent.name
+
+    if args.show:
+        # Across the project: the store is per project and an id names a file in it.
+        anns = [r[2] for r in _pooled_annotations("", args.all)]
+        a = _find_annotation(anns, args.show)
+        src = path if a.session == path.stem else next(
+            (p for p in transcripts() if p.stem == a.session), path)
+        return _show_note(src, a, args.context, cols)
 
     if args.delete:
-        anns = _annotations_for(path)
+        # The directory the annotation is filed under, not the cwd's: under
+        # `--all` an id names a file in another project and the write goes there.
+        pooled = _pooled_annotations("", args.all)
+        anns = [r[2] for r in pooled]
+        home = {(r[2].id, r[2].n): r[0] for r in pooled}
         for spec in args.delete:
             a = _find_annotation(anns, spec)
-            _remove_annotation(project_dir, a.id)
+            _remove_annotation(home.get((a.id, a.n), project_dir), a.id)
             print(f"deleted {a.id}  {_clip_line(a.text, 80)}", file=sys.stderr)
         return 0
 
@@ -3120,7 +3401,13 @@ def cmd_annotations(args) -> int:
             p = pathlib.Path(conv)
             for a in _annotations_for(p):
                 row: dict = {"conversation": conv, "id": a.id, "targets": a.targets,
-                             "kind": a.kind, "text": a.text, "written": a.written}
+                             "kind": a.kind, "text": a.text}
+                # Absent where the stored annotation carries no stamp, which
+                # renders without times rather than with a fabricated one.
+                if a.created:
+                    row["created"] = a.created
+                if a.modified:
+                    row["modified"] = a.modified
                 if a.turn:
                     row["turn"] = a.turn
                 if a.agent:
@@ -3151,16 +3438,39 @@ def cmd_annotations(args) -> int:
             quote = next((ln for ln in _text_at_line(
                 p.read_text(errors="replace").splitlines(), _first_row(targets)).splitlines()
                 if ln.strip()), "")
-        note_id = _file_note(p.parent.name, p.stem, p, targets,
-                             str(req.get("kind") or "note"), text, quote=quote)
+        kind = str(req.get("kind") or "note")
+        created = str(req.get("created") or "")
+        modified = str(req.get("modified") or "")
+        # `replaces` names the note this write supersedes. Answering with the
+        # same id says the record was updated and claude-history issues no
+        # delete; answering with a different one has it drop the old note, which
+        # is the path a move to another turn takes.
+        old = str(req.get("replaces") or "")
+        note_id = _rewrite_note(p.parent.name, p.stem, p, old, targets, kind, text,
+                                quote=quote, modified=modified) if old else None
+        if note_id is None:
+            if old:
+                # A note moved to another turn is a new record in the store and
+                # the same note to a reader, so its first stamp travels with it
+                # where the request sends none of its own.
+                gone = _remove_annotation(p.parent.name, old)
+                if gone is not None and not created:
+                    created = gone.created
+                # A move is an edit, so it stamps `modified` now. Left to
+                # `_file_note` the field would copy `created` and the record
+                # would read as never touched since it was written.
+                modified = modified or _now_iso()
+            note_id = _file_note(p.parent.name, p.stem, p, targets, kind, text,
+                                 quote=quote, created=created, modified=modified)
         print(json.dumps({"id": note_id}))
         return 0
     if args.op == "delete":
         spec = str(req.get("id") or "")
+        # An id the store does not hold answers false rather than failing: a
+        # non-zero exit drops chsum from the merge and takes every other
+        # annotation on the transcript out of the render with it.
         hit = _remove_annotation(p.parent.name, spec)
-        if hit is None:
-            raise SystemExit(f"annotations delete: no annotation {spec!r} for {p.stem[:8]}")
-        print(json.dumps({"deleted": True}))
+        print(json.dumps({"deleted": hit is not None}))
         return 0
     raise SystemExit(f"annotations: unknown op {args.op!r}")
 
@@ -3207,13 +3517,15 @@ def cmd_name(args) -> int:
         args.ref = words.pop(0)
 
     if args.list:
-        names = load_names()
+        # Keyed by the transcripts in scope: the name store is one flat file for
+        # every project, and a uuid absent from the scope belongs to another one.
+        paths = {p.stem: p for p in transcripts(local=not args.all)}
+        names = {uuid: title for uuid, title in load_names().items() if uuid in paths}
         if not names:
-            print("nothing renamed yet", file=sys.stderr)
+            print(f"nothing renamed in {_scope_label(args.all)}", file=sys.stderr)
             return 1
         for uuid, title in names.items():
-            path = _path_for_uuid(uuid)
-            print(f"{ch_ref_for_path(path) if path else uuid}  {title}")
+            print(f"{ch_ref_for_path(paths[uuid])}  {title}")
         sys.stdout.flush()  # or the hint lands above what it is a hint about
         print("\nUndo one: `chsum name <ref> --clear`", file=sys.stderr)
         return 0
@@ -4030,7 +4342,7 @@ def _annotations_of(doc: dict) -> list[Annotation]:
                     origin and k < len(agents) and agents[k]) else ""
                 out.append(Annotation(f"{uuid}#{n}", int(n), "recap",
                                       f"{desc}: {body}" if desc else body,
-                                      own or run, str(latest.get("written") or ""),
+                                      own or run, str(latest.get("written") or ""), "",
                                       turn, session, origin=origin))
     for note in doc.get("notes") or []:
         if not isinstance(note, dict):
@@ -4039,26 +4351,64 @@ def _annotations_of(doc: dict) -> list[Annotation]:
         out.append(Annotation(
             f"{uuid}#{n}", n, str(note.get("kind") or "note"), str(note.get("text") or ""),
             [t for t in (note.get("targets") or []) if isinstance(t, (int, str))],
-            str(note.get("written") or ""), turn, session, str(note.get("agent") or ""),
+            str(note.get("created") or ""), str(note.get("modified") or ""),
+            turn, session, str(note.get("agent") or ""),
             int(note.get("row") or 0), str(note.get("quote") or ""),
             str(note.get("record") or "")))
     return out
 
 
+def _turn_for_targets(path: pathlib.Path | None, targets: list,
+                      agent: str = "") -> "_Turn | None":
+    """The turn whose gap holds the first target row — the rightmost turn at or
+    before it, the bisect `_chunk_events` uses. None where there is no row to
+    place, which files the note under the session."""
+    if not (targets and path is not None and path.exists() and not agent):
+        return None
+    turns = _your_turns(path)
+    i = bisect.bisect_right([t.line for t in turns], _first_row(targets)) - 1
+    return turns[i] if i >= 0 and turns[i].uuid else None
+
+
+def _rewrite_note(project_dir: str, session: str, path: pathlib.Path | None,
+                  spec: str, targets: list[int], kind: str, text: str, *,
+                  quote: str = "", modified: str = "") -> str | None:
+    """An edit onto the note `spec` names, keeping its number and its `created`.
+    Returns the unchanged id. None where the id names nothing, or where the new
+    targets belong under a different turn — that note is filed afresh, and the
+    id it comes back with is what tells claude-history to drop the old one."""
+    uuid, _, num = spec.partition("#")
+    if not (uuid and num.isdigit()):
+        return None
+    turn = _turn_for_targets(path, targets)
+    if (turn.uuid if turn else session) != uuid:
+        return None
+    target = _turn_path(project_dir, uuid)
+    doc = _load_doc(target)
+    if not doc:
+        return None
+    for note in doc.get("notes") or []:
+        if int(note.get("n") or 0) != int(num):
+            continue
+        note.update({"kind": kind, "text": text, "targets": targets,
+                     "modified": modified or _now_iso()})
+        if quote:
+            note["quote"] = quote
+        _save_doc(target, doc)
+        TRACE.step("_rewrite_note", file=target.name, n=num, kind=kind)
+        return spec
+    return None
+
+
 def _file_note(project_dir: str, session: str, path: pathlib.Path | None,
                targets: list[int], kind: str, text: str, *, agent: str = "",
                row: int = 0, quote: str = "", record: str = "",
-               written: str = "") -> str:
+               created: str = "", modified: str = "") -> str:
     """A hand-typed annotation into the store: under the turn whose gap holds
     its row — the rightmost turn at or before it, the bisect `_chunk_events`
     uses — or under the session file where there is no parent row. Returns the
     id, which names the file and the number the note took."""
-    turn: _Turn | None = None
-    if targets and path is not None and path.exists() and not agent:
-        turns = _your_turns(path)
-        i = bisect.bisect_right([t.line for t in turns], _first_row(targets)) - 1
-        if i >= 0 and turns[i].uuid:
-            turn = turns[i]
+    turn = _turn_for_targets(path, targets, agent)
     target = _turn_path(project_dir, turn.uuid if turn else session)
     doc = _load_doc(target) or {}
     if turn:
@@ -4072,8 +4422,9 @@ def _file_note(project_dir: str, session: str, path: pathlib.Path | None,
     _number_bullets(doc)
     n = int(doc.get("issued") or 0) + 1
     doc["issued"] = n
+    stamp = created or _now_iso()
     note: dict = {"n": n, "kind": kind, "text": text, "targets": targets,
-                  "written": written or _now_iso()}
+                  "created": stamp, "modified": modified or stamp}
     if agent:
         note["agent"], note["row"] = agent, row
     if quote:
@@ -4125,34 +4476,39 @@ def _remove_annotation(project_dir: str, spec: str) -> Annotation | None:
 _KIND_WORD = {"note": "note", "recap": "recap bullet"}
 
 
-def _list_annotations(path: pathlib.Path, kind: str, cols: int, command: str) -> int:
-    """One kind of the store's annotations for one transcript, two lines each.
-    Split by kind because a `recap` bullet is a model's and a `note` is yours,
-    and one listing holding both reads as one kind of thing."""
-    anns = [a for a in _annotations_for(path) if a.kind == kind]
-    if not anns:
-        print(f"no {_KIND_WORD[kind]}s in {_source_label(path)}", file=sys.stderr)
+def _list_annotations(kind: str, cols: int, all_projects: bool) -> int:
+    """One kind of the store's annotations across the scope, in the shape the
+    digest listing uses: a column line each carrying the text, the message it
+    points at wrapped beneath. Split by kind because a `recap` bullet is a
+    model's and a `note` is yours, and one listing holding both reads as one
+    kind of thing.
+
+    The id leads and the ref is absent: the id is what `--show` and `--delete`
+    take, and a 35-character ref beside it folds the row on an 88-column
+    terminal, where a fold reads as another row."""
+    pooled = _pooled_annotations(kind, all_projects)
+    if not pooled:
+        print(f"no {_KIND_WORD[kind]}s in {_scope_label(all_projects)}", file=sys.stderr)
         return 1
-    # Two lines each: the text and the message it targets are both prose.
-    rows = [(_clip_line(a.text, 60),
-             f"{a.id[:8]}#{a.n}" + (f"  agent {a.agent[:8]}" if a.agent else ""),
-             _clip_line(a.quote, 96) or ("(session-level)" if not a.targets
-                                         else f"row {_first_row(a.targets)}")) for a in anns]
-    width = max(len(r[0]) for r in rows)
-    # Wrapped here rather than left to the terminal: a quote that folds at
-    # column 0 reads as a new entry.
-    for i, (text, tag, quote) in enumerate(rows):
-        if i:
-            print()
-        print(f"{text:<{width}}  {tag}")
-        print(_dim("\n".join(textwrap.wrap(quote, cols, initial_indent="  ↳ ",
-                                           subsequent_indent="    "))))
+    heads = ("id", "created", *(("project",) if all_projects else ()), "")
+    rows = []
+    for _d, src, a in pooled:
+        # The project column costs a transcript head each, so it is read only
+        # where it distinguishes rows — under `--all`.
+        m = extract_meta(src) if all_projects and src else Meta()
+        rows.append((f"{a.id[:8]}#{a.n}" + (f"/{a.agent[:8]}" if a.agent else ""),
+                     _age_or_date(a.created),
+                     *((m.project_name or "-",) if all_projects else ()),
+                     _clip_line(a.text, 60),
+                     _clip_line(a.quote, 160) or ("(session-level)" if not a.targets
+                                                  else f"row {_first_row(a.targets)}")))
+    _print_table(heads, rows, cols, project_col=2 if all_projects else None)
     # Flushed first, or the hint jumps the list: stdout is block-buffered when
     # piped, stderr never is.
     sys.stdout.flush()
-    print(f"\n{_source_label(path)}\nShow one: `chsum note --show <id>`  ·  "
+    print(f"\n{_scope_label(all_projects)}\nShow one: `chsum note --show <id>`  ·  "
           f"drop one: `chsum note --delete <id>`  ·  "
-          f"{_plural(len(anns), _KIND_WORD[kind])}",
+          f"{_plural(len(pooled), _KIND_WORD[kind])}",
           file=sys.stderr)
     return 0
 
@@ -4183,6 +4539,27 @@ def _annotations_for(path: pathlib.Path) -> list[Annotation]:
     """Everything the store holds for one transcript, file order then number."""
     return [a for doc in _load_store(path.parent.name).get(path.stem, [])
             for a in _annotations_of(doc)]
+
+
+def _pooled_annotations(
+        kind: str, all_projects: bool
+) -> list[tuple[str, pathlib.Path | None, Annotation]]:
+    """Every annotation of one kind in scope, newest first, each beside the
+    project directory holding it and the transcript it points at. The directory
+    travels with the annotation because `--delete` writes back into the file it
+    came from, which under `--all` is not the directory of the cwd. A transcript
+    deleted since leaves `None`, and the row falls back to the session id. An
+    empty `kind` takes every kind."""
+    paths = {p.stem: p for p in transcripts(local=not all_projects)}
+    out = []
+    for d in _project_dirs(all_projects):
+        for session, docs in _load_store(d).items():
+            for a in (a for doc in docs for a in _annotations_of(doc)):
+                if kind and a.kind != kind:
+                    continue
+                out.append((d, paths.get(session), a))
+    out.sort(key=lambda r: r[2].created, reverse=True)
+    return out
 
 
 # A gap that closed with no assistant record in it. Distinct from "", which is
@@ -5143,6 +5520,21 @@ def _ago(ts: str, mtime: float) -> str:
     return f"{int(secs)}w ago"
 
 
+def _age_or_date(ts: str, mtime: float = 0.0) -> str:
+    """A stamp from the last seven days as its age, anything older as its date.
+    Inside a week the age answers the question the column is read for; past a
+    week `_ago` counts in whole weeks and stops separating rows a date separates.
+    `ts` empty falls back to `mtime`, the same fallback `_ago` and `_local_when`
+    take; both empty leaves no time to render and prints the listing's dash."""
+    t = _parse_ts(ts) if ts else None
+    stamp = t.timestamp() if t else mtime
+    if not stamp:
+        return "-"
+    if time.time() - stamp < 7 * 86400:
+        return _ago(ts, mtime)
+    return datetime.fromtimestamp(stamp).astimezone().strftime("%Y-%m-%d")
+
+
 def _local_when(ts: str, mtime: float) -> str:
     """Full local datetime for the picker's `when` column, in the same form the
     day headings use — `_ago`'s coarse age reads two same-day sessions as one.
@@ -5755,16 +6147,18 @@ def cmd_recap(args) -> int:
     if args.messages == []:
         raise SystemExit("--messages needs one or two turn numbers "
                          "(1 your first, -1 your last)")
+    # Ahead of `_target`, which picks a conversation: the listing reads the store
+    # across the scope and has no conversation to pick.
+    if args.list:
+        if args.spec or args.file or args.last:
+            raise SystemExit("--list reads the store across the project and takes "
+                             "no conversation — `chsum recap <ref>` recaps one")
+        return _list_annotations(
+            "recap", max(40, min(shutil.get_terminal_size((100, 24)).columns, 88)),
+            args.all)
     # `_pick_transcript` lists the live sessions when nothing is named; inside
     # Claude Code it returns the one you are in without asking.
     path, span = _target(args, here=_pick_transcript)
-    if args.list:
-        if span:
-            raise SystemExit("--list covers the conversation and takes no turn "
-                             "numbers")
-        return _list_annotations(
-            path, "recap", max(40, min(shutil.get_terminal_size((100, 24)).columns, 88)),
-            "recap")
     if args.full and span:
         raise SystemExit("--full is the whole conversation and --messages names "
                          "a window: one or the other")
@@ -5865,16 +6259,16 @@ def cmd_sessions(args) -> int:
     scope = "all projects" if args.all else pathlib.Path.cwd().name
     window = f" · last {args.since}" if args.since else ""
     empty = sum(1 for m in shown if not _has_activity(m))
-    # The two markdown lines go through the same gate `recap` and `journal` use;
+    # The two markdown lines go through the same gate `recap` uses;
     # the rows below are padded columns and `_dim`, not markdown.
     head = f"# Sessions — {scope}{window}\n*{_plural(len(shown), 'session')} · {empty} with no activity*\n"
-    print(_md_ansi(head) if _colour_ok() else head)
+    print(_md_ansi(head) if sys.stdout.isatty() and _colour_ok() else head)
 
     # Two lines each, as `mark --list`: a title is prose, and in a column the long
     # ones pushed every other field off the terminal.
     cols = max(40, min(shutil.get_terminal_size((100, 24)).columns, 88))
-    # By last activity, as `journal`: a resumed session belongs to the day you
-    # last worked on it.
+    # By last activity: a resumed session belongs to the day you last worked
+    # on it.
     by_day: dict[str, list[tuple]] = defaultdict(list)
     for m in shown:
         assert m.path is not None  # every `m` here came from extract_meta, which always sets it
@@ -5907,7 +6301,37 @@ def cmd_sessions(args) -> int:
     # Widths across every day: columns that shift per group read as separate tables.
     widths = [max(len(r[i]) for rs in by_day.values() for r in (*rs, heads))
               for i in range(len(heads))]
-    row = lambda r: "  " + "  ".join(f"{c:<{w}}" for c, w in zip(r, widths)).rstrip()
+    # Last of the padded columns under `--all`, and absent without it.
+    proj_i = len(heads) - 1 if args.all else None
+    palette = ({} if proj_i is None else _project_palette(
+        r[proj_i] for rs in by_day.values() for r in rs))
+
+    def row(r, paint: bool = False) -> str:
+        cells = [f"{c:<{w}}" for c, w in zip(r, widths)]
+        if paint and proj_i is not None:
+            cells[proj_i] = _paint_project(cells[proj_i], r[proj_i], palette)
+        return "  " + "  ".join(cells).rstrip()
+
+    if not sys.stdout.isatty():
+        # Piped or captured, one day per heading and one bullet per session, the
+        # same markdown contract the listings and documents hold.
+        doc = []
+        for day, rows in by_day.items():
+            doc.append(f"## {_pretty_day(day)}\n")
+            for r in rows:
+                fields = " · ".join(f"{h}: {c}" for h, c in zip(heads[1:], r[1:title_i])
+                                    if h)
+                doc.append(f"- `{r[0]}` — {r[title_i]}")
+                doc.append(f"  - {fields}")
+                for line in r[title_i + 1]:
+                    doc.append(f"  - agent `{line}`")
+            doc.append("")
+        sys.stdout.write("\n".join(doc) + "\n")
+        sys.stdout.flush()
+        print("Read one: `chsum digest <ref> --stdout`   "
+              "Most recent real session: `chsum digest --last --stdout`",
+              file=sys.stderr)
+        return 0
     gutter = 2 + widths[0] + 2  # past the ref column, where `dur` starts
     for day_no, (day, rows) in enumerate(by_day.items()):
         label = _pretty_day(day)
@@ -5916,7 +6340,7 @@ def cmd_sessions(args) -> int:
         else:  # headers once, on the first date's line
             print(f"{label:<{gutter}}" + _dim(row(heads).strip()))
         for r in rows:
-            print(row(r))
+            print(row(r, paint=True))
             # Wrapped here, not by the terminal: a title folded at column 0 reads
             # as the next session.
             print(_dim("\n".join(textwrap.wrap(r[title_i], cols, initial_indent="    ↳ ",
@@ -5951,81 +6375,6 @@ def _parse_since(spec: str) -> float:
         raise SystemExit(f"--since expects forms like 7d, 24h, 2w (got {spec!r})")
     mult = {"h": 3600, "d": 86400, "w": 604800}[m.group(2)]
     return time.time() - int(m.group(1)) * mult
-
-
-def cmd_journal(args) -> int:
-    """Chronological work log. Pure JSONL — no claude-history calls, so it stays
-    fast across the whole corpus. Colour is presentation only, so it is gated on
-    `_colour_ok` exactly as `_render_window`'s is: a piped or redirected log stays
-    byte-identical markdown."""
-    def out(text: str = "", **kw) -> None:
-        print(_md_ansi(text) if _colour_ok() else text, **kw)
-
-    cutoff = _parse_since(args.since)
-    metas = []
-    for p in transcripts(local=not args.all):
-        # mtime is a cheap superset filter; a resumed old session has a recent one.
-        if p.stat().st_mtime < cutoff:
-            continue
-        meta = extract_meta(p)
-        if not _has_activity(meta):  # aborted, tool-only, or went nowhere
-            continue
-        end = _parse_ts(meta.ended)
-        if end and end.timestamp() < cutoff:
-            continue
-        metas.append(meta)
-    if not metas:
-        print("no conversations in that window", file=sys.stderr)
-        return 1
-
-    # By last activity: a resumed session belongs to the day you last worked on it.
-    metas.sort(key=lambda m: m.ended or "")
-    by_day: dict[str, list[Meta]] = defaultdict(list)
-    for m in metas:
-        by_day[(m.ended or "")[:10] or "undated"].append(m)
-
-    total_files = len({f for m in metas for f in m.edited})
-    span = f"last {args.since}" + ("" if args.all else " · this project")
-    out(f"# Work log — {span}\n")
-    out(f"*{_plural(len(metas), 'session')} · {_plural(len(by_day), 'day')} · "
-          f"{_plural(total_files, 'file')} changed*\n")
-
-    for day, sessions in by_day.items():
-        out(f"## {_pretty_day(day)}\n")
-        for m in sessions:
-            assert m.path is not None  # every `m` here came from extract_meta, which always sets it
-            bits = [b for b in (m.duration, m.project_name,
-                                f"`{m.branch}`" if m.branch else "",
-                                f"resumed from {m.date}"
-                                if m.resumed and m.date != (m.ended or "")[:10] else "") if b]
-            out(f"### {m.title}")
-            out(f"*{' · '.join(bits)}*\n")
-            for a in m.notes:
-                out(f"⚑ {a.text}")
-            if m.notes:
-                out()
-            # Same five-then-count as the listing. A week's log is mostly a
-            # question of what got worked on, and "2 agents" doesn't answer it.
-            for run in m.agents[:5]:
-                bits = [b for b in (run.duration,
-                                    f"{_plural(len(run.edited), 'file')}"
-                                    if run.edited else "",
-                                    f"{_plural(len(run.commands), 'command')}"
-                                    if run.commands and not run.edited else "") if b]
-                out(f"↳ {run.description or run.id}"
-                      + (f" ({', '.join(bits)})" if bits else ""))
-            if m.agent_count > len(m.agents[:5]):
-                # agent_count can exceed the sidecars there are names for.
-                out(f"↳ …and {m.agent_count - len(m.agents[:5])} more")
-            if m.agent_count:
-                out()
-            if m.edited:
-                out(f"Changed {len(m.edited)} file(s): "
-                      + ", ".join(f"`{f}`" for f in m.edited[:6])
-                      + (f" +{len(m.edited) - 6} more" if len(m.edited) > 6 else ""))
-                out()
-            out(f"`chsum digest {ch_ref_for_path(m.path)} --stdout`\n")
-    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -6213,7 +6562,7 @@ def main(argv=None) -> int:
                      help="the Nth most recent conversation that isn't this one "
                           "(default: 1)")
     win.add_argument("--all", action="store_true",
-                     help="with --last: all projects (default: this one)")
+                     help="all projects (default: this one) — scopes --last and --list")
     # The numbers sit on the flag as well as on `spec`: argparse fills one run
     # of positionals, so `<ref> --messages -1` leaves the `-1` with nowhere to go.
     win.add_argument("--messages", nargs="*", metavar="N",
@@ -6234,7 +6583,7 @@ def main(argv=None) -> int:
     p.add_argument("--all", action="store_true", help="all workspaces (default: this one)")
     p.add_argument("--top", type=int, default=8)
     p.add_argument("--notes", "--marks", dest="notes", action="store_true",
-                   help="search what you noted with `chsum note` (query optional)")
+                   help="search what you noted with `chsum note`")
     for mode in ("hybrid", "semantic", "lexical", "exact"):
         p.add_argument(f"--{mode}", dest="mode", action="store_const", const=mode)
     p.set_defaults(mode="hybrid", func=cmd_find)
@@ -6254,8 +6603,8 @@ def main(argv=None) -> int:
                    help="treat what's stored for this window as no longer standing: "
                         "call for every chunk and replace it")
     p.add_argument("--list", action="store_true",
-                   help="the recap bullets stored for that conversation, with the "
-                        "ids `chsum note --delete` takes")
+                   help="this project's stored recap bullets, with the ids "
+                        "`chsum note --delete` takes (--all: every project)")
     p.set_defaults(func=cmd_recap)
 
     p = sub.add_parser("digest", parents=[dbg, win],
@@ -6270,7 +6619,7 @@ def main(argv=None) -> int:
     p.add_argument("--call", metavar="ID",
                    help="one tool call whole, with its output")
     p.add_argument("--list", action="store_true",
-                   help="the digest files written so far, newest first")
+                   help="this project's digest files, newest first (--all: every project)")
     p.set_defaults(func=cmd_digest)
 
     p = sub.add_parser(
@@ -6292,7 +6641,8 @@ def main(argv=None) -> int:
     p.add_argument("--session", action="store_true",
                    help="note the conversation itself, not the message you are at")
     p.add_argument("--list", action="store_true",
-                   help="this conversation's notes, with the ids --delete takes")
+                   help="this project's notes, with the ids --delete takes "
+                        "(--all: every project)")
     p.add_argument("--show", metavar="ID",
                    help="where an annotation landed: file, row, time, agent, and the "
                         "message it points at")
@@ -6301,6 +6651,8 @@ def main(argv=None) -> int:
     p.add_argument("--full", action="store_true",
                    help="with --list: whole text and whole targeted message, unclipped")
     p.add_argument("--delete", nargs="+", metavar="ID", help="remove annotations")
+    p.add_argument("--all", action="store_true",
+                   help="all projects (default: this one) — scopes --list, --show, --delete")
     p.add_argument("--file", help="transcript path (default: the session you're in)")
     p.set_defaults(func=cmd_note)
 
@@ -6325,16 +6677,14 @@ def main(argv=None) -> int:
                         "rename a past conversation instead of this one")
     p.add_argument("--clear", action="store_true",
                    help="drop your name, back to Claude Code's")
-    p.add_argument("--list", action="store_true", help="every conversation you renamed")
+    p.add_argument("--list", action="store_true",
+                   help="this project's renamed conversations (--all: every project)")
+    p.add_argument("--all", action="store_true",
+                   help="all projects (default: this one)")
     p.add_argument("--no-resume", action="store_true",
                    help="rename in chsum only — leave the transcript, and /resume, alone")
     p.add_argument("--file", help="transcript path (default: the session you're in)")
     p.set_defaults(func=cmd_name)
-
-    p = sub.add_parser("journal", parents=[dbg], help="chronological work log")
-    p.add_argument("--since", default="7d", help="window, e.g. 7d, 24h, 2w")
-    p.add_argument("--all", action="store_true", help="all projects (default: this one)")
-    p.set_defaults(func=cmd_journal)
 
     # No `parents=[dbg]`: this is a wire Claude Code calls, and `session-start`
     # writes JSON on stdout that Claude Code parses.

@@ -42,8 +42,8 @@ from.
   phrase. → [`chsum note`](#chsum-note)
 - **A session is titled after its first question, not what it became.** — `chsum
   name "…"` renames it, in chsum and in `/resume`. → [`chsum name`](#chsum-name)
-- **What did I work on this week, across every project?** — `chsum journal --since
-  7d --all` renders a day-headed work log. → [`chsum journal`](#chsum-journal)
+- **What did I work on this week, across every project?** — `chsum --since 7d
+  --all -n 0` lists every session, under day headings. → [`chsum`](#chsum-1)
 - **You read transcripts in claude-history and want your notes there too.** —
   register `chsum annotations` as its annotator. → [`chsum annotations`](#chsum-annotations)
 - **`recap`'s files-touched section misses edits made outside Edit/Write.** — opt in
@@ -56,7 +56,6 @@ The commands, one section each:
 | [`chsum`](#chsum-1) | list this project's sessions, newest activity first |
 | [`chsum recap`](#chsum-recap) | what happened over a window of turns, with a model-written timeline |
 | [`chsum digest`](#chsum-digest) | one conversation, verbatim and computed, plus row-level views |
-| [`chsum journal`](#chsum-journal) | a work log across sessions |
 | [`chsum find`](#chsum-find) | locate a conversation or a note by what it said |
 | [`chsum note`](#chsum-note) | mark the moment that mattered |
 | [`chsum name`](#chsum-name) | rename a session to what it actually was |
@@ -365,13 +364,15 @@ chsum digest <ch_ref>                          # write a digest file
 chsum digest <ch_ref> --stdout                 # print it instead
 chsum digest --file path/to/session.jsonl      # address by file
 chsum digest <ch_ref>/<agent-id>               # one subagent's own digest
-chsum digest --list                            # the digest files written so far
+chsum digest --list                            # this project's digest files
+chsum digest --list --all                      # every project's
 ```
 
 `--list` reads the digest directory rather than a conversation, so it takes no
 ref: one row per file, newest first, carrying the ref that reproduces it, when
-it was written, the session's project, duration, prompts and files, and whether
-the file is `current` or `stale` against the transcript.
+it was written, the session's duration, prompts and files, and whether the file
+is `current` or `stale` against the transcript. `--all` adds a project column
+and the digests whose transcript is gone, which carry no project to scope by.
 
 | Section | Source |
 |---|---|
@@ -485,20 +486,6 @@ Open a record: `sed -n '18p' ~/.claude/projects/…/f1b9bbc6-….jsonl`
 - `01CPKjYaSD`  `f1b9bbc6:26`  11:30:28  Bash  `ls && wc -l chsum.py`
 ```
 
-## `chsum journal`
-
-A chronological work log across sessions, under day headings: each session's
-title, its duration, project and branch, the `chsum digest --stdout` line that
-reloads it, each subagent's task line, and your notes inline.
-
-```sh
-chsum journal --since 7d                       # this project, the last week
-chsum journal --since 2w --all                 # every project, the last fortnight
-```
-
-It reads the transcripts' metadata only and spends no subprocess, so a window of
-a couple of hundred sessions renders in a few seconds.
-
 ## `chsum find`
 
 Locate a conversation, or a note, by what it said. This is the one command that
@@ -506,8 +493,8 @@ runs `claude-history`, for its embedding index.
 
 ```sh
 chsum find "playback rate pitch shift"         # locate a conversation
-chsum find --notes                             # everything you've noted
-chsum find --notes "backoff"                   # notes matching a query
+chsum find --notes "backoff"                   # notes whose text matches
+chsum find --notes "backoff" --all             # across every project
 chsum find "ENOENT" --lexical                  # fast, for identifiers and error text
 ```
 
@@ -515,6 +502,20 @@ chsum find "ENOENT" --lexical                  # fast, for identifiers and error
 tens of seconds warm, and **several minutes on the very first run** while the
 embedding index builds. Use `--lexical` (sub-second) for identifiers, filenames,
 and error strings, or `--exact` for exact tokens. `--all` searches every project.
+
+Each hit carries its score, the project, and the passage that matched, clipped
+around the query term. Where the ranking could not run — an unbuilt embedding
+index, a transcript with no searchable metadata — the run says so rather than
+printing the hits alone: `warning: semantic unavailable — …`, and a line reading
+`8 hits ranked by position only (0.0147–0.0164)`, which means each score is a
+reciprocal rank and the spread measures position, not how well a passage matched.
+
+On a terminal the results are padded columns, coloured per project, with the
+query term picked out in the excerpt. Everywhere else — a pipe, a capture, a
+chat — the same results are markdown, so `grep` and a reading model get whole
+records rather than clipped columns. Every listing follows that rule:
+`sessions`, `note --list`, `recap --list` and `digest --list` print a table or a
+bullet per row when stdout is not a terminal.
 
 ## `chsum note`
 
@@ -580,24 +581,29 @@ agent as a message. Two things do work:
 ### Where notes show up
 
 As **Notable** at the top of the digest, verbatim, with the message they point at;
-as a `⚑` count in the listing; inline in `journal`; in `chsum find --notes`; and
+as a `⚑` count in the listing; in `chsum find --notes <query>`; and
 in claude-history's viewer (see [`chsum annotations`](#chsum-annotations)).
 
 ### Listing, locating and deleting
 
 ```sh
 ! chsum note --list
-the timeout gap, stated plainly     dde43c3c#1
+id            created
+dde43c3c#1    2026-09-04  the timeout gap, stated plainly
   ↳ Currently **no** — and worth knowing exactly where it dies.
-
-Testing                             dde43c3c#2
+dde43c3c#2    2026-09-04  Testing
   ↳ Left in place — it records the state that prompted the change.
 
+! chsum note --list --all             # every project, with a project column
 ! chsum note --list --full            # whole text, whole targeted message
 ! chsum recap --list                  # the bullets `recap` wrote, same ids
 ! chsum note --show dde43c3c#1        # where it landed, with what surrounds it
 ! chsum note --delete dde43c3c#2      # takes several ids at once
 ```
+
+Every listing covers this project and `--all` widens it to every project. The
+project column `--all` adds is painted a colour per project, so rows from one
+project group by eye down a listing that crosses several.
 
 The store holds two kinds and each has its own listing: `chsum note --list` is
 your notes, `chsum recap --list` is the bullets `recap` wrote. A bullet is a
@@ -626,12 +632,13 @@ that started as one question and became a day's work is filed under the question
 ```sh
 chsum name "retry: design + build"                 # the session you're in
 chsum name ch_3654a13c "retry: design + build"     # one from last week
-chsum name --list                                  # everything you've renamed
+chsum name --list                                  # renamed in this project
+chsum name --list --all                            # renamed anywhere
 chsum name --clear                                 # back to Claude Code's title
 chsum name --no-resume "…"                         # rename in chsum only
 ```
 
-Your name wins everywhere chsum shows a title — listing, digest, journal — and is
+Your name wins everywhere chsum shows a title — listing, digest — and is
 flagged `✎` in the listing, because whose reading of the session it is matters.
 
 It also lands in `/resume`. Claude Code's title is an `ai-title` record it appends
@@ -665,6 +672,15 @@ at and matches in `claude-history agent search`, tagged by kind. A note typed in
 its viewer (`a`) is filed by chsum the same way `chsum note` files one, and `d`
 there deletes through chsum. `chsum annotations read|write|delete` takes one JSON
 object on stdin and answers with one on stdout.
+
+A note carries `created` and `modified`, RFC 3339, which the viewer prints beside
+it. A write stores the stamps it is sent and takes chsum's clock where it is sent
+none. A write carrying `replaces` supersedes the note that id names: the same id
+comes back where the text changed under the same turn, and claude-history issues
+no delete; a different id comes back where the new targets belong under another
+turn, and claude-history drops the superseded note. `delete` answers
+`{"deleted": false}` for an id the store does not hold — a non-zero exit would
+drop chsum from the merge and take every other note on that transcript with it.
 
 <img src="https://raw.githubusercontent.com/InDate/chsum/main/meta/chsum_notes_in_claude-history.webp" alt="chsum notes shown at their rows in claude-history's viewer" width="800" />
 

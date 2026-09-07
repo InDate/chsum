@@ -28,13 +28,12 @@ on as fact.
 | `chsum digest <ref> --call <id>` | One tool call whole, with its captured output |
 | `chsum digest <ref> --agents` | Every subagent and each report it sent back, numbered where one returned more than once |
 | `chsum digest <ref> -3 -1` | A window of your turns, rows printed whole — `1` your first, `-1` your last, one number one turn, two a range; `--tools`/`--commands` take the same numbers |
-| `chsum journal --since 7d` | Chronological work log across sessions |
 | `chsum recap <ref> --messages N M` | Reload a specific turn window from a past session; same numbering as `digest` |
 | `chsum recap --last` | Recap the most recent session that isn't this one, from the turn after the last recap; `--full` for the whole of it |
 | `chsum recap --invalidate` | Summarise this window again, replacing what's stored for it |
 | `chsum note "<text>"` | Note this moment, for the digest and claude-history |
 | `chsum note --show <id>` | Where a note landed: file, row, time, agent, message |
-| `chsum find --notes [query]` | What's been noted, across sessions |
+| `chsum find --notes <query>` | Notes whose text matches; `chsum note --list` lists them all |
 | `chsum name "<title>"` | Rename this session; lead with a `ch_` ref to rename a past one |
 
 Scoped to the current project unless `--all`.
@@ -71,8 +70,9 @@ For something further back — "note that bit about the sidecars":
 `<text>` is free text, copied verbatim into the digest — write the note you'd
 want to read cold months later, not a label.
 
-`chsum note --list` shows this conversation's notes with their ids (`--full` for
+`chsum note --list` shows this project's notes with their ids (`--full` for
 the whole targeted message), and `chsum recap --list` the bullets `recap` wrote;
+`--all` widens either to every project;
 `--delete <id>` takes either kind and removes it from the store. Never delete a
 note the user made without being asked.
 
@@ -158,7 +158,7 @@ nudge again next session.
   takes tens of seconds warm, minutes on a cold index; `--lexical` is sub-second.
 - "Yesterday" / "last time" → `chsum` first, match on date, then `digest <ref>
   --stdout`. The most recent session is often not the one meant.
-- What's been happening → `journal --since 7d`.
+- What's been happening → `chsum --since 7d -n 0`.
 - A specific stretch of a past session, not the whole thing → `recap <ref>
   --messages N M`.
 

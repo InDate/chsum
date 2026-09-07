@@ -179,7 +179,7 @@ Six gaps named. Two taken, four deferred.
 
 ### Deferred, not ruled dead
 
-- **A raw row view.** `digest`, `recap` and `journal` are all summary-shaped.
+- **A raw row view.** `digest` and `recap` are both summary-shaped.
   Nothing prints a `tool_use` input or a `tool_result` body verbatim. The
   evidence that settled the investigation was `Edit.new_string` byte lengths and
   `message.id` values, which no chsum surface exposes.
