@@ -1,22 +1,22 @@
 {
   "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "chsum hook stop",
-            "timeout": 30
-          }
-        ]
-      }
-    ],
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "chsum hook session-start",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/chsum_session_start.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/chsum_post_tool_use.py",
             "timeout": 30
           }
         ]

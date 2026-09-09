@@ -88,25 +88,29 @@ branch, files, commands — is parsed straight out of the transcript.
 
 ## Install
 
-```sh
-pipx install chsum            # from a checkout: pipx install .
-```
-
-Or as a Claude Code plugin, which brings the skill and the hooks with it:
+As a Claude Code plugin, which brings the skill, the hooks and the code:
 
 ```
 /plugin marketplace add InDate/indate-tools
 /plugin install chsum@indate-tools
 ```
 
-The plugin carries the skill and the hook declarations; the `chsum` command still
-comes from pipx.
+One installed tree runs everything. The hooks import the `chsum.py` sitting
+beside them, so nothing has to be on `PATH`; a plugin places no command there,
+and a hook naming one would fail at every tool call on a machine without it.
 
-pipx, not `pip install --user`: chsum is an application, so it gets its own venv
-and one symlink on `PATH`. `pipx install --editable .` while working on it.
+Where no `chsum` command resolves, the SessionStart hook names the file to run —
+`python3 <plugin>/chsum.py digest --last` — so a session reaches the tool
+without a second copy.
 
-A real command rather than a shell alias, because an alias doesn't exist for
-scripts, hooks, or agents.
+For a command of your own, symlink the plugin's file once:
+
+```sh
+ln -s ~/.claude/plugins/cache/indate-tools/chsum/<version>/chsum.py ~/.local/bin/chsum
+```
+
+Working on chsum itself takes `pipx install --editable .` from the checkout,
+which puts that checkout on `PATH` and leaves the plugin's copy unused.
 
 Requirements:
 

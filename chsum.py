@@ -11,6 +11,7 @@ Commands: sessions (default), last, find, digest, mark.
 from __future__ import annotations
 
 import argparse
+import ast
 import bisect
 import concurrent.futures
 import dataclasses
@@ -30,6 +31,10 @@ import textwrap
 import threading
 import time
 import urllib.parse
+try:
+    import fcntl
+except ImportError:  # Windows: the checkpoint runs unserialised, as it did before
+    fcntl = None
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1208,6 +1213,150 @@ def _first_command(cmd: str) -> str:
     back to its own first line, so `--commands` lists it rather than a blank."""
     return _command_work(cmd) or next(
         (l.strip() for l in cmd.strip().splitlines() if l.strip()), "")
+
+
+_HEREDOC_OPEN = re.compile(
+    r"""<<(-?)\s*(?:'([^']*)'|"([^"]*)"|(\\?)([A-Za-z0-9_]+))""")
+
+
+def _heredoc_bodies(cmd: str) -> list[tuple[int, int, str]]:
+    """(start, end, tag) for every heredoc body in `cmd`, in source order.
+
+    Each `<<TAG` queues a tag; the queued bodies follow at the next newline,
+    one after another, each running to a line equal to its own tag. Quoting is
+    carried through the scan because `echo "a << b"` is text and the shell
+    opens no body there. A `<<-` tag matches with leading tabs stripped, and
+    `<<<` is a here-string with no body at all.
+
+    A body left unterminated runs to the end of the command, which is what the
+    shell would report and what a truncated transcript leaves behind."""
+    i, n = 0, len(cmd)
+    pending: list[tuple[str, bool]] = []
+    bodies: list[tuple[int, int, str]] = []
+    single = double = False
+    while i < n:
+        ch = cmd[i]
+        if single:
+            single = ch != "'"
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2
+            continue
+        if double:
+            # `$(` inside a double-quoted run opens a context where quoting
+            # starts over. Leaving the run here is coarse and it keeps the
+            # scan from reading the substitution's own quotes as closers.
+            double = not (ch == '"' or cmd.startswith("$(", i))
+            i += 1
+            continue
+        if ch == "'":
+            single = True
+        elif ch == '"':
+            double = True
+        elif ch == "#" and (i == 0 or cmd[i - 1] in " \t\n;|&("):
+            j = cmd.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        elif cmd.startswith("<<<", i):
+            i += 3
+            continue
+        elif cmd.startswith("<<", i):
+            m = _HEREDOC_OPEN.match(cmd, i)
+            if m:
+                pending.append((m.group(2) or m.group(3) or m.group(5), m.group(1) == "-"))
+                i = m.end()
+                continue
+        elif ch == "\n" and pending:
+            pos = i + 1
+            for tag, dash in pending:
+                start = pos
+                while True:
+                    j = cmd.find("\n", pos)
+                    line = cmd[pos:] if j < 0 else cmd[pos:j]
+                    if (line.lstrip("\t") if dash else line) == tag:
+                        bodies.append((start, pos, tag))
+                        pos = n if j < 0 else j + 1
+                        break
+                    if j < 0:
+                        bodies.append((start, n, tag))
+                        pos = n
+                        break
+                    pos = j + 1
+            pending = []
+            i = pos
+            continue
+        i += 1
+    return bodies
+
+
+def _write_target(body: str) -> str:
+    """The file a Python body writes, where the body's own grammar names it as
+    a constant. `open("x", "w")` and `Path("x").write_text(...)` name it
+    directly; a name bound once to a string constant carries it too.
+
+    "" where the path is built at runtime, which leaves the mask carrying a
+    line count and no file. Anything but Python parses to nothing here."""
+    try:
+        tree = ast.parse(textwrap.dedent(body))
+    except (SyntaxError, ValueError):
+        return ""
+    const: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)):
+            const[node.targets[0].id] = node.value.value
+
+    def named(arg) -> str:
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+        if isinstance(arg, ast.Name):
+            return const.get(arg.id, "")
+        if isinstance(arg, ast.Call):  # pathlib.Path("x") wrapping the name
+            return named(arg.args[0]) if arg.args else ""
+        return ""
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if isinstance(fn, ast.Name) and fn.id == "open" and len(node.args) > 1:
+            mode = node.args[1]
+            if isinstance(mode, ast.Constant) and set(str(mode.value)) & set("wax"):
+                if path := named(node.args[0]):
+                    return path
+        if isinstance(fn, ast.Attribute) and fn.attr in ("write_text", "write_bytes"):
+            if path := named(fn.value):
+                return path
+    return ""
+
+
+def _mask_bodies(cmd: str) -> str:
+    """`cmd` with every heredoc body replaced by its line count and, for a
+    Python body whose grammar names one, the file it writes.
+
+    A body of 300 lines is what forced commands to be clipped at 200
+    characters, and that clip cut them mid-word: a command ending `ls -l
+    src/config.` carries no fragment a reader can match against the
+    transcript, and the file a `python3 - <<'PY'` wrote is named nowhere else
+    in the extract. `<<'PY' [38 lines, writes chsum.py]` costs 30 characters
+    where the body costs 1,900."""
+    bodies = _heredoc_bodies(cmd)
+    if not bodies:
+        return cmd
+    out, at = [], 0
+    for start, end, _ in bodies:
+        body = cmd[start:end]
+        note = f"{body.count(chr(10))} lines"
+        if target := _write_target(body):
+            note += f", writes {target}"
+        out.append(cmd[at:start])
+        out.append(f"[{note}]\n")
+        at = end
+    out.append(cmd[at:])
+    return "".join(out)
 
 
 def _is_notable_command(cmd: str) -> bool:
@@ -3739,30 +3888,47 @@ def _tool_event(part: dict) -> tuple[str, str]:
     """(kind, text) for one tool_use block."""
     name, inp = str(part.get("name") or "?"), part.get("input") or {}
     if name == "Bash" and isinstance(inp.get("command"), str):
-        # The first line that does something, not a flattened clip: a heredoc
-        # squashed onto one line is 200 chars of its own source, where
-        # `python3 - <<'PY'` identifies it, and a leading `cd` names no work.
-        return "ran", _clip_line(_first_command(inp["command"]), 200)
+        # The description first, verbatim, then the command. It carries the
+        # intent stated before the command ran — 31,148 of 32,947 Bash calls
+        # carry one, mean 38 characters — and the `output:` event that follows
+        # carries what came back. Without it a reader reconstructs the intent
+        # from the command text and the result, which is a guess.
+        said = str(inp.get("description") or "").strip()
+        # The whole command, every heredoc body replaced by its line count and
+        # the file it writes. The 200-character clip took the first work line
+        # and dropped the rest, so `cd X && sed -i ... && npx tsc` arrived as
+        # the `sed` alone and the verdict that followed it went missing. Masked,
+        # the corpus costs 9.3M characters against 4.3M clipped, 25.1M raw.
+        cmd = _mask_bodies(inp["command"].strip())
+        return "ran", f'"{said}"\n{cmd}' if said else cmd
     if name in _FILE_TOOLS and isinstance(inp.get("file_path"), str):
         # Edited text rides along verbatim — what the summariser reads function
-        # names out of, instead of chsum parsing code. `content` (a Write) is
-        # capped lower since it's a whole file, not a change.
+        # names out of, instead of chsum parsing code. Uncapped: a clip at 1500
+        # cut a replacement mid-token, and a half-identifier matches nothing in
+        # the transcript a reader checks it against. Across 8,441 edit and write
+        # events the caps held 8.5M characters and the whole text costs 12.0M.
         bits = [inp["file_path"]]
-        for key, label, lim in (("old_string", "was", 1500), ("new_string", "now", 4000),
-                                ("content", "now", 2000)):
+        for key, label in (("old_string", "was"), ("new_string", "now"),
+                           ("content", "now")):
             if isinstance(inp.get(key), str) and inp[key].strip():
-                bits.append(f"--- {label} ---\n{_clip(inp[key], lim, 'clipped')}")
+                bits.append(f"--- {label} ---\n{inp[key]}")
         return "edit", "\n".join(bits)
     if name in _AGENT_TOOLS:
+        # The spawn point, not the instruction. A spawn marks where the main
+        # session handed work off, and that place is what a reader of the main
+        # session follows. The prompt itself is already written to the rules a
+        # bullet is written to, so a model passed it rewrites prose that needs
+        # no rewriting — at 1.7M characters across 447 calls. The agent's own
+        # transcript holds it verbatim, and the report comes back on its own.
         desc, prompt = str(inp.get("description") or ""), str(inp.get("prompt") or "")
-        return "spawn", _clip_line(f"{desc}: {prompt}" if desc else prompt, 400)
+        return "spawn", desc or _clip_line(prompt, 200)
     if name == "Skill" and isinstance(inp.get("skill"), str):
         # The loaded body is dropped as a turn, so this call is the only record
         # of which skill ran and what it was asked — `skill`/`args` are its keys,
-        # neither of which the generic detail scan below covers.
+        # neither of which the generic detail scan below covers. Uncapped: across
+        # 106 Skill calls the args reach 306 characters, so the 400 never fired.
         args = str(inp.get("args") or "").strip()
-        return "tool", _clip_line(f"Skill: {inp['skill']}"
-                                  + (f" — {args}" if args else ""), 400)
+        return "tool", f"Skill: {inp['skill']}" + (f" — {args}" if args else "")
     detail = next((inp[k].strip().splitlines()[0]
                    for k in ("file_path", "command", "description", "pattern", "query", "path")
                    if isinstance(inp.get(k), str) and inp[k].strip()), "")
@@ -4717,10 +4883,22 @@ def _cached_turns(project_dir: str, spine: list[_Turn], chunks: list[list[_Event
 
 def _store_turn(project_dir: str, turn: _Turn, closed_by: str, parts: list[dict],
                 failed: bool, instructions: str, model: str, session: str) -> bool:
-    """One finished turn onto disk, the moment its own chunks are in — a run
-    killed part-way keeps every turn that completed. A turn holding a failed
-    call is not written, or the missing part would come back as a hit."""
-    if failed or not turn.uuid or not closed_by:
+    """One turn onto disk, the moment its own chunks are in — a run killed
+    part-way keeps every turn that completed. A turn holding a failed call is
+    not written, or the missing part would come back as a hit.
+
+    A turn whose gap is still open is written too, with `closed_by` empty. That
+    gap takes more records after the ones these bullets were built from, and
+    the next run's material carries them: `_cached_turns` fingerprints each
+    chunk's material, the fingerprint moves, the turn misses, and a fresh entry
+    lands beside this one under a later `written`. Holding the open turn back
+    instead leaves the run that produced its bullets as the only place they
+    exist, and every later run re-derives it from nothing.
+
+    Between the two runs a reader is served bullets that describe the work up
+    to the moment of the run and no further. The empty `closed_by` is what
+    separates those from a settled turn's."""
+    if failed or not turn.uuid:
         return False
     # A turn whose every chunk was quiet is covered: nothing happened between it
     # and your next one, so there is nothing to summarise and no call was made.
@@ -4771,12 +4949,21 @@ def _files_touched(events: list[_Event]) -> list[str]:
 # ---------------------------------------------------------------------------
 # The hooks Claude Code runs (`chsum hook`)
 # ---------------------------------------------------------------------------
-# `hooks/hooks.json` runs `chsum hook stop` and `chsum hook session-start`, one
-# JSON payload per event on stdin. The Stop hook writes the checkpoint commits
-# `_checkpoint_shas` below reads back.
+# `hooks/hooks.json` runs `chsum hook post-tool-use` and `chsum hook
+# session-start`, one JSON payload per event on stdin. The PostToolUse hook
+# writes the checkpoint commits `_checkpoint_shas` reads back.
 
 GATE_NAME = "chsum-checkpoint"  # "enabled" / "declined" / absent (never asked)
 STATE_NAME = "chsum-checkpoint-state"
+# The sha of the last checkpoint this repo wrote. The tree behind it is what a
+# new call is compared against.
+LAST_NAME = "chsum-checkpoint-last"
+LOCK_NAME = "chsum-checkpoint.lock"
+# Polled rather than waited on: the hook is killed at 30 seconds, and a kill
+# inside the commit-then-reset sequence leaves the branch tip on a checkpoint
+# commit — the failure the lock prevents.
+_LOCK_POLL = 0.05
+_LOCK_WAIT = 20.0
 _CHECKPOINT_PREFIX = "chsum-checkpoint: "
 _HOOK_GIT_TIMEOUT = 30  # seconds per git call — this must never be what hangs a turn
 
@@ -4852,10 +5039,56 @@ def _self_heal(cwd: pathlib.Path, git_dir: pathlib.Path) -> None:
     state.unlink(missing_ok=True)
 
 
-def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str) -> None:
-    """The per-turn commit-then-reset sequence. Every early return leaves git
-    exactly as it was. `_enabled` is checked here rather than in `_hook_stop`,
-    so `_self_heal` still runs in a project that has since declined."""
+def _hold_checkpoint_lock(git_dir: pathlib.Path) -> tuple[bool, int | None]:
+    """(proceed, fd) for an exclusive advisory lock on the checkpoint sequence.
+
+    Parallel subagents share one working tree and one `HEAD`, and each hook is
+    its own process. Two sequences overlapping means the second reads `HEAD` as
+    the first's checkpoint, stores it as its baseline, and resets to it, leaving
+    that commit as the branch tip. One holder at a time removes that read.
+
+    The kernel releases the lock when the process exits, including a kill, so
+    nothing on disk goes stale. `os.close` on the returned fd releases it.
+
+    (True, fd) where it is held here. (True, None) where `fcntl` is absent,
+    which runs the sequence unserialised. (False, None) where another process
+    holds it past `_LOCK_WAIT`, which writes no checkpoint: the files land in
+    the next checkpoint's diff, under a later row."""
+    if fcntl is None:
+        return True, None
+    try:
+        fd = os.open(str(git_dir / LOCK_NAME), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return True, None
+    deadline = time.monotonic() + _LOCK_WAIT
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True, fd
+        except OSError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                return False, None
+            time.sleep(_LOCK_POLL)
+
+
+def _restore_index(cwd: pathlib.Path, index_tree: str) -> None:
+    """Put the index back the way `_write_checkpoint` found it, after a staging
+    step that produced no commit. Never raises: a failure here leaves a staged
+    index, which the next checkpoint restages anyway."""
+    try:
+        _git(["git", "read-tree", index_tree], cwd)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str,
+                      ref: str = "") -> None:
+    """The commit-then-reset sequence, one per tool call that changed the tree.
+    `ref` is the `tool_use` id of the call that caused it, "" where the payload
+    carries none. Every early return leaves git
+    exactly as it was. `_enabled` is checked here rather than in the hook, so
+    `_self_heal` still runs in a project that has since declined."""
     if not _enabled(git_dir):
         return
     try:
@@ -4863,7 +5096,7 @@ def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str)
     except (OSError, subprocess.SubprocessError):
         return
     if status.returncode != 0 or not status.stdout.strip():
-        return  # nothing changed this turn — nothing to checkpoint
+        return  # the tree matches HEAD — nothing to checkpoint
 
     try:
         before = _git(["git", "rev-parse", "HEAD"], cwd)
@@ -4881,6 +5114,32 @@ def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str)
         return
     index_tree = tree.stdout.strip()
 
+    # Staged here rather than below, so the tree it produces is comparable
+    # against the last checkpoint's. A tree equal to that one records a call
+    # that wrote nothing: an uncommitted working tree differs from `HEAD` for
+    # the whole session, so the status check above passes on every call and
+    # a `Read` would otherwise commit a copy of the last checkpoint.
+    try:
+        _git(["git", "add", "-A"], cwd)
+        staged = _git(["git", "write-tree"], cwd)
+    except (OSError, subprocess.SubprocessError):
+        _restore_index(cwd, index_tree)
+        return
+    if staged.returncode != 0:
+        _restore_index(cwd, index_tree)
+        return
+    last = git_dir / LAST_NAME
+    prev_sha = last.read_text().strip() if last.exists() else ""
+    if prev_sha:
+        try:
+            prev_tree = _git(["git", "rev-parse", f"{prev_sha}^{{tree}}"], cwd)
+        except (OSError, subprocess.SubprocessError):
+            prev_tree = None
+        if (prev_tree is not None and prev_tree.returncode == 0
+                and prev_tree.stdout.strip() == staged.stdout.strip()):
+            _restore_index(cwd, index_tree)
+            return
+
     state = git_dir / STATE_NAME
     # Written before the one step that moves `HEAD`, so a process killed before
     # the reset leaves `_self_heal` what it needs.
@@ -4892,8 +5151,14 @@ def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str)
     now = datetime.now(timezone.utc)
     ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
     message = f"{_CHECKPOINT_PREFIX}{session_id} @ {ts}"
+    if ref:
+        # The `tool_use` id of the call that wrote this. chsum addresses every
+        # action as `<session>:<line>`, and `_transcript_row` turns this id into
+        # that address at read time — the transcript record holding the call is
+        # flushed after the hook fires, so the row does not exist yet here.
+        # Absent where the payload carries no id.
+        message += f" {ref}"
     try:
-        _git(["git", "add", "-A"], cwd)
         # --no-verify: this commit is reset away a few lines down, so the user's
         # own commit hooks would mutate the working tree for nothing.
         commit = _git(["git", "commit", "-q", "--no-verify", "-m", message], cwd)
@@ -4903,6 +5168,17 @@ def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str)
     if commit.returncode != 0:
         state.unlink(missing_ok=True)  # nothing landed on HEAD — nothing to reset away
         return
+
+    # Read before the reset moves HEAD off it. This sha is the baseline the
+    # next call's tree is compared against; a reflog that has aged it out
+    # fails the `rev-parse` above and the next call commits, which is the
+    # forgiving direction.
+    try:
+        made = _git(["git", "rev-parse", "HEAD"], cwd)
+        if made.returncode == 0:
+            last.write_text(made.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
 
     if os.environ.get("CHSUM_CHECKPOINT_TEST_CRASH_AFTER_COMMIT"):
         # Test-only: leaves the stray commit a later `_self_heal` is verified against.
@@ -4916,31 +5192,13 @@ def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str)
     state.unlink(missing_ok=True)
 
 
-def _hook_stop(payload: dict) -> int:
-    """Stop: one checkpoint per turn. Exit 2 is the code that blocks a turn, so
-    every condition here exits 0 and every exception stops at this frame."""
-    session_id = payload.get("session_id")
-    cwd_str = payload.get("cwd")
-    if not isinstance(session_id, str) or not session_id:
-        return 0
-    if not isinstance(cwd_str, str) or not cwd_str:
-        return 0
-    cwd = pathlib.Path(cwd_str)
-    if not cwd.is_dir():
-        return 0
-    if shutil.which("git") is None:
-        return 0
-
-    try:
-        git_dir = _git_dir(cwd)
-        if git_dir is None:
-            return 0
-        _self_heal(cwd, git_dir)
-        _write_checkpoint(cwd, git_dir, session_id)
-    except Exception as e:  # noqa: BLE001 — never let this hook fail the turn
-        print(f"chsum checkpoint hook: {e}", file=sys.stderr)
-    return 0
-
+# No `chsum` on PATH: a plugin installs into its own directory and places no
+# command, so the file the hook imported is the one a session runs.
+_ENTRYPOINT_CONTEXT = (
+    "chsum has no command on PATH here. It runs from this plugin: invoke it as "
+    "`python3 {path}` wherever a chsum command is called for — "
+    "`python3 {path} digest --last`, `python3 {path} recap`."
+)
 
 _OPT_IN_CONTEXT = (
     "chsum: per-turn git checkpointing is undecided for this project "
@@ -4963,10 +5221,103 @@ def _opt_in_context(git_dir: pathlib.Path) -> str | None:
     return _OPT_IN_CONTEXT.format(gate=gate)
 
 
-def _hook_session_start(payload: dict) -> int:
+def _hook_session_start(payload: dict, entrypoint: str = "") -> int:
     """SessionStart: fires on startup, resume, clear, compact and fork, before
-    the first turn. Nothing here blocks a session starting."""
+    the first turn. Nothing here blocks a session starting.
+
+    `entrypoint` is the `chsum.py` the hook imported — the plugin's own copy.
+    A plugin places nothing on PATH, so a session with no `chsum` command
+    reaches the tool by running that file. The line emits where `chsum` is
+    absent from PATH; where the command resolves, it runs and the line would
+    name a second copy of the same file."""
+    parts: list[str] = []
+    if entrypoint and shutil.which("chsum") is None:
+        parts.append(_ENTRYPOINT_CONTEXT.format(path=entrypoint))
     cwd_str = payload.get("cwd")
+    if not isinstance(cwd_str, str) or not cwd_str:
+        return _emit_session_context(parts)
+    cwd = pathlib.Path(cwd_str)
+    if not cwd.is_dir():
+        return _emit_session_context(parts)
+    if shutil.which("git") is None:
+        return _emit_session_context(parts)
+
+    try:
+        git_dir = _git_dir(cwd)
+        if git_dir is None:
+            return _emit_session_context(parts)
+        context = _opt_in_context(git_dir)
+        if context is not None:
+            parts.append(context)
+        return _emit_session_context(parts)
+    except Exception as e:  # noqa: BLE001 — never let this hook fail a session
+        print(f"chsum session-start hook: {e}", file=sys.stderr)
+    return 0
+
+
+def _emit_session_context(parts: list[str]) -> int:
+    """The SessionStart reply Claude Code parses, or nothing where no part was
+    built. Stdout carries the JSON, so every diagnostic goes to stderr."""
+    if not parts:
+        return 0
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": "\n\n".join(parts),
+    }}))
+    return 0
+
+
+def _transcript_row(transcript_path: str, tool_use_id: str) -> str:
+    """`<session>:<line>` for the `tool_use` a checkpoint names — the address
+    every other chsum surface uses, so a commit and a digest row name the same
+    place.
+
+    Read-side, not hook-side. The transcript record holding a `tool_use` is
+    flushed after PostToolUse fires: a probe in session `6c650975` found 1,055
+    rows in the file and the firing call's own id in none of them, so a row
+    resolved inside the hook is always "". The commit carries the id, and the
+    row resolves here once the file is complete.
+
+    A subagent's call reaches this hook carrying the parent's session and the
+    parent's transcript path, and its own record is written to that session's
+    `subagents/agent-<id>.jsonl`. The sidecars are searched after the parent
+    and address as `<session>/<agent>:<line>`, the form a digest already uses.
+
+    "" where the path is absent, unreadable, or holds no matching row."""
+    if not transcript_path or not tool_use_id:
+        return ""
+    src = pathlib.Path(transcript_path)
+    for at, base in [(src, src.stem[:8])] + [
+            (side, f"{src.stem[:8]}/{side.stem.removeprefix('agent-')[:8]}")
+            for side in sorted(src.with_suffix("").glob("subagents/agent-*.jsonl"))]:
+        try:
+            lines = at.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for i in range(len(lines) - 1, -1, -1):
+            row = lines[i]
+            if '"tool_use"' in row and (f'"id": "{tool_use_id}"' in row
+                                        or f'"id":"{tool_use_id}"' in row):
+                return f"{base}:{i + 1}"
+    return ""
+
+
+def _hook_post_tool_use(payload: dict) -> int:
+    """PostToolUse: one checkpoint per tool call that changed the tree, stamped
+    with the transcript row of the call.
+
+    Every tool reaches here, and `_write_checkpoint`'s `git status` decides.
+    A list of the tools that write would carry a Task agent's edits, an MCP
+    tool's writes and a Skill's writes to the next matching call's checkpoint,
+    under a row that did not make them. The cost is one working-tree scan per
+    call — 0.041s over 21 files, growing with the tree.
+
+    Exit 2 is the code that blocks a turn, so every condition here exits 0 and
+    every exception stops at this frame."""
+    session_id = payload.get("session_id")
+    cwd_str = payload.get("cwd")
+    if not isinstance(session_id, str) or not session_id:
+        return 0
     if not isinstance(cwd_str, str) or not cwd_str:
         return 0
     cwd = pathlib.Path(cwd_str)
@@ -4979,35 +5330,38 @@ def _hook_session_start(payload: dict) -> int:
         git_dir = _git_dir(cwd)
         if git_dir is None:
             return 0
-        context = _opt_in_context(git_dir)
-        if context is None:
+        proceed, lock_fd = _hold_checkpoint_lock(git_dir)
+        if not proceed:
             return 0
-        print(json.dumps({
-            "hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "additionalContext": context,
-            }
-        }))
-    except Exception as e:  # noqa: BLE001 — never let this hook fail a session
-        print(f"chsum session-start hook: {e}", file=sys.stderr)
+        try:
+            _self_heal(cwd, git_dir)
+            _write_checkpoint(cwd, git_dir, session_id,
+                              str(payload.get("tool_use_id") or ""))
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+    except Exception as e:  # noqa: BLE001 — never let this hook fail the turn
+        print(f"chsum checkpoint hook: {e}", file=sys.stderr)
     return 0
 
 
 def cmd_hook(args) -> int:
     payload = _read_payload()
-    if args.event == "stop":
-        return _hook_stop(payload)
+    if args.event == "post-tool-use":
+        return _hook_post_tool_use(payload)
     return _hook_session_start(payload)
 
 
 _CHECKPOINT_RE = re.compile("^" + re.escape(_CHECKPOINT_PREFIX)
-                            + r"(\S+) @ (\S+)$")
+                            + r"(\S+) @ (\S+)(?: (\S+))?$")
 
 
-def _checkpoint_shas(project_dir: pathlib.Path | None, session_uuid: str) -> list[tuple[str, str]]:
-    """(timestamp, sha) per turn the `chsum hook stop` Stop hook
-    committed-then-reset-away for this session, oldest first (the raw reflog
-    is newest-first). Never raises: no repo, no `git`, no hook installed, or
+def _checkpoint_shas(project_dir: pathlib.Path | None,
+                     session_uuid: str) -> list[tuple[str, str, str]]:
+    """(timestamp, sha, ref) per checkpoint the hooks committed-then-reset-away
+    for this session, oldest first (the raw reflog is newest-first). `ref` is the
+    `tool_use` id of the call that wrote it, which `_transcript_row` resolves to
+    a `<session>:<line>`, and "" where the payload carried no id. Never raises: no repo, no `git`, no hook installed, or
     a reflog that's already aged the entries out all degrade
     to `[]`, same as a session that never had checkpoints at all — this must
     be exactly as forgiving as the rest of this file's summariser-failure
@@ -5028,7 +5382,7 @@ def _checkpoint_shas(project_dir: pathlib.Path | None, session_uuid: str) -> lis
                f"{len(proc.stdout.splitlines())} reflog entries")
     if proc.returncode != 0:
         return []
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, str]] = []
     for line in proc.stdout.splitlines():
         sha, _, rest = line.partition(" ")
         if not sha:
@@ -5041,7 +5395,7 @@ def _checkpoint_shas(project_dir: pathlib.Path | None, session_uuid: str) -> lis
             continue
         m = _CHECKPOINT_RE.match(subject)
         if m and m.group(1) == session_uuid:
-            out.append((m.group(2), sha))
+            out.append((m.group(2), sha, m.group(3) or ""))
     out.reverse()
     TRACE.step("_checkpoint_shas", repo=str(project_dir), session=session_uuid[:8],
                checkpoints=len(out),
@@ -5115,17 +5469,19 @@ def _checkpoint_diff_files(project_dir: pathlib.Path | None, prev_ref: str, cur_
     return out
 
 
-def _turn_checkpoints(spine: list[_Turn], until_ts: str,
-                      project_dir: pathlib.Path | None, session_uuid: str) -> list[str]:
-    """Per turn, the sha of the checkpoint covering its window, or "". The
-    reflog arithmetic alone — no diffs — so the counts are available before the
-    model calls that `_turn_files` runs after, and the reflog is read once.
+def _turn_checkpoints(spine: list[_Turn], until_ts: str, project_dir: pathlib.Path | None,
+                      session_uuid: str) -> list[list[tuple[str, str]]]:
+    """Per turn, every (sha, tool_use id) checkpoint covering its window,
+    oldest first, or []. The reflog arithmetic alone — no diffs — so the counts
+    are available before the model calls that `_turn_files` runs after, and the
+    reflog is read once.
 
     `spine[i].when` to `spine[i+1].when` (or `until_ts` for the last turn) is
     each turn's window — same rightmost-boundary convention `_chunk_events`
-    bisects on. A window holding more than one checkpoint (shouldn't normally
-    happen — one hook firing per turn) takes the last."""
-    covers = [""] * len(spine)
+    bisects on. A window holds one checkpoint per tool call that changed the
+    tree, and each is kept: collapsing them to the last carries the turn's
+    whole diff under one call's id, naming a row that made part of it."""
+    covers: list[list[tuple[str, str]]] = [[] for _ in spine]
     if not spine:
         return covers
     checkpoints = _checkpoint_shas(project_dir, session_uuid)
@@ -5145,8 +5501,7 @@ def _turn_checkpoints(spine: list[_Turn], until_ts: str,
         while j < n and ((not until_ts or checkpoints[j][0] <= until_ts) if is_last
                           else checkpoints[j][0] < spine[i + 1].when):
             j += 1
-        if j > ci:
-            covers[i] = checkpoints[j - 1][1]
+        covers[i] = [(sha, ref) for _, sha, ref in checkpoints[ci:j]]
         ci = j
     covered = sum(1 for c in covers if c)
     TRACE.step("_turn_checkpoints", turns=len(spine), checkpoints=n,
@@ -5155,8 +5510,9 @@ def _turn_checkpoints(spine: list[_Turn], until_ts: str,
     return covers
 
 
-def _turn_files(turn_events: list[list[_Event]], covers: list[str],
-                project_dir: pathlib.Path | None) -> list[list[str]]:
+def _turn_files(turn_events: list[list[_Event]], covers: list[list[tuple[str, str]]],
+                project_dir: pathlib.Path | None,
+                transcript: str = "") -> list[list[str]]:
     """Per-turn files-touched, one entry per turn — a real `git diff` between
     checkpoints wherever `covers[i]` names one, since a checkpoint sees every
     change regardless of how it was made (a raw `sed -i`, not just
@@ -5166,23 +5522,39 @@ def _turn_files(turn_events: list[list[_Event]], covers: list[str],
     last_sha: str | None = None
     diffs = 0
     for i, evs in enumerate(turn_events):
-        sha = covers[i] if i < len(covers) else ""
-        if not sha:
+        marks = covers[i] if i < len(covers) else []
+        if not marks:
             out.append(_files_touched(evs))
             continue
-        # The very first checkpoint seen has no prior checkpoint to diff
-        # from, so its baseline is its own first parent — the branch tip
-        # right before checkpointing started, not "nothing".
-        prev = last_sha if last_sha is not None else f"{sha}^"
-        out.append([f"- checkpoint `{sha[:12]}` — `git show {sha[:12]}` for this "
-                    "turn's exact snapshot"] + _checkpoint_diff_files(project_dir, prev, sha))
-        last_sha = sha
-        diffs += 1
+        rows: list[str] = []
+        for sha, ref in marks:
+            # The very first checkpoint seen has no prior checkpoint to diff
+            # from, so its baseline is its own first parent — the branch tip
+            # right before checkpointing started, not "nothing".
+            prev = last_sha if last_sha is not None else f"{sha}^"
+            # "after", not "at": the diff holds every change in the tree
+            # between two checkpoints, and a checkpoint stages the whole tree.
+            # Parallel subagents share that tree, so a call's checkpoint
+            # carries whatever the others wrote in the same window — measured
+            # in session `6c650975`, where the agent writing `scratch-note-c`
+            # has checkpoints at `ab820108:24` whose diff holds
+            # `scratch-note-b`. The row places the diff in time. It does not
+            # name what produced it.
+            at = _transcript_row(transcript, ref)
+            head = f"- checkpoint `{sha[:12]}`"
+            head += f" after `{at}`" if at else ""
+            head += (f" — the tree's changes since the previous checkpoint"
+                     f" (`git show {sha[:12]}` for the snapshot)")
+            rows.append(head)
+            rows += [f"  {f}" for f in _checkpoint_diff_files(project_dir, prev, sha)]
+            last_sha = sha
+            diffs += 1
+        out.append(rows)
     TRACE.step("_turn_files", turns=len(turn_events), diffs=diffs)
     return out
 
 
-def _checkpoint_source(covers: list[str]) -> list[str]:
+def _checkpoint_source(covers: list[list[tuple[str, str]]]) -> list[str]:
     """Which source produced each turn's files, as counts chsum measured. A
     turn whose files came from the transcript scan must not read as one backed
     by a checkpoint — the two differ in what they can see and in whether their
@@ -5965,6 +6337,8 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
     pending = [i for i in range(len(chunks)) if i not in cached]
     # Read once, ahead of the first call rather than after the last: a turn is
     # written the moment it finishes, and its gap has to already be known closed.
+    # An open gap yields "" here and the turn still stores — the closer is the
+    # record of whether it had settled, not the gate on writing it.
     closers = ([] if not write_store or all(h is not None for h in hits)
                else _turn_closers(path, spine, until_ts))
     # One read of the parent for the whole run, not one per chunk: every chunk
@@ -6069,8 +6443,9 @@ def _render_window(path: pathlib.Path, meta: Meta, anchor_line: int, anchor_ts: 
         # Computed, not model-narrated — prepended ahead of the bullets it sits
         # beside, same reasoning as `_failures_section`/`_compaction_section`.
         # Prefers a git checkpoint diff over the transcript scan per turn,
-        # wherever the `chsum hook stop` Stop hook covered it — see `_turn_files`.
-        for idx, files in enumerate(_turn_files(turn_events, covers, project_dir)):
+        # wherever the PostToolUse hook covered it — see `_turn_files`.
+        for idx, files in enumerate(_turn_files(turn_events, covers, project_dir,
+                                                str(meta.path or ""))):
             if files:
                 turn_bullets[idx] = files + turn_bullets[idx]
         sliced = _interleaved(spine, turn_bullets, [])
@@ -6410,6 +6785,12 @@ built this extract. The message itself was complete. Never describe it as cut
 off, interrupted, incomplete, or unfinished — that is a fact about the extract,
 not about what happened.
 
+A `ran:` event opening with a quoted line carries the description typed
+before the command ran, and the command follows on the lines beneath it. The
+`output:` event after it carries what came back. Quote the description as the
+stated intent and the output as the result; the description states nothing
+about what the command returned.
+
 Who did what, by event kind. `said:`, `ran:`, `edit:`, `tool:`, `output:`,
 `failed:` and `spawn:` are all Claude's own work — `ran:` is a command Claude
 ran through its Bash tool, however shell-like it looks. Only three kinds are
@@ -6692,11 +7073,14 @@ def main(argv=None) -> int:
         "hook", help="what Claude Code runs from hooks/hooks.json, not a command you type",
         description="A wire Claude Code calls from hooks/hooks.json, not a command you "
                     "type: one JSON hook payload per event, on stdin. "
-                    "`stop` writes the per-turn checkpoint commit `recap` reads back "
-                    "out of the reflog; `session-start` prints the checkpoint opt-in "
+                    "`post-tool-use` writes the checkpoint commit `recap` reads back "
+                    "out of the reflog, one per tool call that changed the tree, "
+                    "stamped with the transcript row that caused it; "
+                    "`session-start` prints the checkpoint opt-in "
                     "where this project's gate file is absent.",
     )
-    p.add_argument("event", choices=["stop", "session-start"], help="which hook fired")
+    p.add_argument("event", choices=["post-tool-use", "session-start"],
+                   help="which hook fired")
     p.set_defaults(func=cmd_hook)
 
     # Bare `chsum` lists sessions: you usually want to pick one, and "most recent"
