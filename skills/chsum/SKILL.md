@@ -2,7 +2,7 @@
 name: chsum
 description: Recover whole past Claude Code sessions with the `chsum` CLI — list this project's sessions, digest one verbatim (prompts in order, files changed, commands run, where it left off), drill into a subagent's own work, or produce a work log across a time window. Use when the user refers to earlier work you don't have in context ("what did we do yesterday", "pick up where we left off", "which session touched this file"), or asks to reload a past session. For searching or quoting *inside* conversations, use the claude-history CLI directly.
 compatibility: Runs from this plugin's own directory — no PATH install. Where `chsum` resolves on PATH it runs; otherwise the SessionStart hook names the file to invoke as `python3 <plugin>/chsum.py`. `claude-history` is needed for anything beyond the session listing.
-version: 2.2.0
+version: 2.2.1
 ---
 
 # chsum

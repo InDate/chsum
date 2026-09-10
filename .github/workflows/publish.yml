@@ -35,13 +35,18 @@ jobs:
       # chsum is stdlib-only and shells out to claude-history, so there is no
       # meaningful unit suite. This checks the thing that actually breaks on a
       # bad release: that the CLI still starts and its commands are wired up.
+      # The list comes off the parser's own usage line, so a command added or
+      # removed in chsum.py needs no edit here; a hardcoded list drifts from
+      # the code and fails the release on a command that no longer exists.
       - name: Smoke test
         run: |
           python3 chsum.py --help > /dev/null
-          for cmd in sessions find recap digest context mark name journal; do
+          CMDS=$(python3 chsum.py --help 2>&1 | grep -o '{[a-z,]\+}' | head -1 | tr -d '{}' | tr ',' ' ')
+          [ -n "$CMDS" ] || { echo "::error::no subcommands in the usage line"; exit 1; }
+          for cmd in $CMDS; do
             python3 chsum.py "$cmd" --help > /dev/null || { echo "::error::$cmd is broken"; exit 1; }
           done
-          echo "CLI responds on every subcommand"
+          echo "CLI responds on every subcommand: $CMDS"
 
       - name: Build
         run: |
