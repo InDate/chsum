@@ -430,20 +430,40 @@ Four flags print rather than writing a file: they are lookups reached from a
 hint inside a digest, not artifacts to keep.
 
 ```sh
-chsum digest <ch_ref> --messages               # every message in order, unfiltered
+chsum digest <ch_ref> --messages               # every message in order, whole
 chsum digest <ch_ref> --tools                  # every tool call in order
 chsum digest <ch_ref> --commands               # every Bash call in order
 chsum digest <ch_ref> --call <id>              # one tool call whole, with its output
 chsum digest <ch_ref> --agents                 # every subagent and what it reported back
 chsum digest <ch_ref>/<agent-id> --commands    # narrowed to that sidecar
+chsum digest <ch_ref>/<agent-id> --messages    # everything that agent said
 ```
 
-`--messages`, `--tools` and `--commands` each print one line per row — the id
-where there is one, a `<session>:<line>` locator, local time, the role or tool
-name, and the first line of the text — in timestamp order across the transcript
-and its sidecars, with nothing filtered, deduplicated or collapsed. `--call <id>`
-prints one tool call and its captured output whole, which is where the text a row
-clipped actually lives.
+All three print in timestamp order across the transcript and its sidecars, with
+nothing filtered, deduplicated or collapsed. `--tools` and `--commands` print one
+line per row — the call id, a `<session>:<line>` locator, local time, the tool
+name and the first line of the call. A row runs long and lets the terminal
+soft-wrap it rather than folding at a space: a command broken across lines can
+no longer be copied in one selection.
+
+`--messages` prints its rows **whole**, on every ref. Messages are prose, and a
+conversation clipped to a line each is the one thing this view cannot be used
+for. There is no flag or size limit behind that: the turn numbers below already
+select the part of a conversation you want, and a second way to ask for less
+would only be a worse one.
+
+Every view is broken by turn, each headed with the line the digest already
+prints under that prompt:
+
+```
+*turn 8 · 16m · 6 tool calls · 5 files · 108 commands · 12 replies*
+```
+
+The head names the turn a row sits in, not the row that opens one, so a view
+that keeps no messages — `--tools`, `--commands` — still shows its boundaries,
+and a window opening mid-conversation says which turn it landed in. `--call <id>`
+prints one tool call and its captured output whole, which is where the text a
+clipped call row actually lives.
 
 `--agents` lists every subagent the session ran and each report it sent back,
 numbered where an agent returned more than once. A report is the agent's own
@@ -458,7 +478,13 @@ conversation reads without leaving chsum:
 chsum digest --last --messages -1              # your last turn, and everything after it
 chsum digest <ch_ref> --messages 10 11         # your 10th and 11th turns
 chsum digest <ch_ref> --tools -5 -1            # what Claude called across your last five
+chsum digest <ch_ref>/<agent-id> --tools 2 -1  # an agent's own turns, not yours
 ```
+
+On an agent ref the turns counted are the sidecar's own: the task it was handed
+is turn 1, and a prompt sent to it while it worked opens the next. Most agents
+have exactly one turn, so the numbers earn their keep on a `/btw` fork that was
+talked to repeatedly.
 
 Inside a window the rows a view steps over are listed rather than skipped
 silently, one line each with its own locator, so a jump from `2500` to `2513`
@@ -476,19 +502,26 @@ A tool call carries its tool and the size of what it returned, and its result ro
 folds into it. A `thinking` row is named and nothing more — the JSONL keeps its
 signature and drops the text. Harness bookkeeping rows are left out.
 
-A `## Sources` block at the top expands every locator to a full path and gives a
-worked `sed` line, so a row reaches its raw record without chsum:
+A `## Sources` block at the top expands every locator to a path, `~`-relative so
+it fits the width and still pastes into a shell. Where the view clipped its rows
+it also gives a worked `sed` line, so a row reaches its raw record without chsum:
 
 ```
 ## Sources
 
-- `f1b9bbc6` — `~/.claude/projects/…/f1b9bbc6-….jsonl`
-- `f1b9bbc6/a190d601` — `~/.claude/projects/…/f1b9bbc6-…/subagents/agent-a190d601….jsonl`
+- `f1b9bbc6`  `~/.claude/projects/…/f1b9bbc6-….jsonl`
+- `f1b9bbc6/a190d601`  `~/.claude/projects/…/subagents/agent-a190d601….jsonl`
 
-Open a record: `sed -n '18p' ~/.claude/projects/…/f1b9bbc6-….jsonl`
+A row's whole text — `sed` the line its locator names:
+
+- `sed -n '18p' ~/.claude/projects/…/f1b9bbc6-….jsonl | jq -r '…'`
 
 - `01CPKjYaSD`  `f1b9bbc6:26`  11:30:28  Bash  `ls && wc -l chsum.py`
 ```
+
+The `sed` line is an escape hatch for text a row clipped, so a view that prints
+every row whole — `--messages`, or any turn window — leaves it out. One source prints as the path alone: there is nothing for a locator to pick
+out, and the bare path is a line the terminal leaves intact to copy.
 
 ## `chsum find`
 

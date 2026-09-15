@@ -1459,7 +1459,7 @@ def _plural(n: int, word: str) -> str:
 
 
 def _bullets(items: list[str], limit: int) -> list[str]:
-    out = [f"- `{i}`" for i in items[:limit]]
+    out = [f"- {_span(i)}" for i in items[:limit]]
     if len(items) > limit:
         out.append(f"- …and {len(items) - limit} more")
     return out
@@ -1471,7 +1471,7 @@ def _timed_bullets(pairs: list[tuple[str, str, str, int]], limit: int) -> list[s
     has no room for the extra columns. An empty locator prints nothing in its
     place. `runs` above 1 is stated rather than collapsed silently: a command is
     shown by its first line, so several different scripts share one bullet."""
-    out = [f"- {_hhmm(when)}  " + (f"`{loc}`  " if loc else "") + f"`{text}`"
+    out = [f"- {_hhmm(when)}  " + (f"`{loc}`  " if loc else "") + _span(text)
            + (f"  ×{runs}" if runs > 1 else "")
            for when, loc, text, runs in pairs[:limit]]
     if len(pairs) > limit:
@@ -1482,7 +1482,8 @@ def _timed_bullets(pairs: list[tuple[str, str, str, int]], limit: int) -> list[s
 def _located_bullets(items: list[str], where: dict[str, str], limit: int) -> list[str]:
     """`_bullets` with the row each item was first seen on. Deduplicated lists lose
     the event behind them, so the row is carried alongside rather than recovered."""
-    out = [f"- `{i}`" + (f"  `{where[i]}`" if where.get(i) else "") for i in items[:limit]]
+    out = [f"- {_span(i)}" + (f"  `{where[i]}`" if where.get(i) else "")
+           for i in items[:limit]]
     if len(items) > limit:
         out.append(f"- …and {len(items) - limit} more")
     return out
@@ -1590,6 +1591,15 @@ def _term_window(text: str, terms, limit: int) -> str:
     return "… " + _clip_line(text[start:], limit - 2)
 
 
+def _span(text: str) -> str:
+    """Transcript text as a code span. The backticks come out of it first: one of
+    its own closes the span early, and the rest of the line then reads as markup
+    — the forgery `_quote` guards whole text from, which a span has to guard
+    too. A command's backtick is shell substitution and survives in the record
+    the row points at; here it only breaks the line it sits on."""
+    return "`" + text.replace("`", "") + "`"
+
+
 def _clip_line(text: str, limit: int) -> str:
     """Clip inside one line. `_clip`'s hint is its own line, which would break out
     of a bold run or a blockquote — but the truncation still has to be visible."""
@@ -1619,25 +1629,62 @@ _CODE_ONLY_RE = re.compile(r"^`[^`]+`$")
 # time — the `_bullets`/`_timed_bullets` shape — gets coloured whole instead of
 # fighting a wrap boundary that might land inside the backticks.
 _MD_BULLET_CODE_RE = re.compile(r"^(?:(\d\d:\d\d)  )?`([^`]+)`$")
+# A line ending in a code span, with a head of its own before it — a row view's
+# bullet (`id  locator  time  label  `text``) or a label naming the command it
+# runs. The span is left unwrapped for the same reason `_CODE_ONLY_RE` is: see
+# the bullet branch.
+_MD_TAIL_CODE_RE = re.compile(r"`[^`]+`$")
 _MD_INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 _MD_INLINE_BOLD_RE = re.compile(r"\*\*([^*]+)\*\*")
 
 
-def _md_inline(segment: str) -> str:
+# The runs a whole line can be styled with, named so a branch can hand its own
+# run to `_md_inline` to reopen — a backslash cannot appear inside an f-string
+# expression before 3.12, and chsum runs on 3.10.
+_ANSI_BOLD = "\033[1m"
+_ANSI_DIM = "\033[2m"
+_ANSI_OFF = "\033[0m"
+
+
+def _md_inline(segment: str, reopen: str = "") -> str:
     """`code`/`**bold**` styling for one already-wrapped segment. The regexes
     only see this segment, so a pair split across a wrap boundary just leaves
-    its marker literal on both sides — total, never raises (see `_md_ansi`)."""
-    segment = _MD_INLINE_CODE_RE.sub(lambda m: f"\033[36m{m.group(1)}\033[0m", segment)
-    segment = _MD_INLINE_BOLD_RE.sub(lambda m: f"\033[1m{m.group(1)}\033[0m", segment)
+    its marker literal on both sides — total, never raises (see `_md_ansi`).
+
+    `reopen` is the run this segment sits inside — a heading's bold, an italic
+    line's dim. An inline style closes with a reset, and that reset closes the
+    surrounding run with it, so each match reopens the run behind itself and the
+    rest of the line keeps the style it was given. Same guard as `_lit_terms`.
+    Without it a line styled as a whole could not carry a code span at all: the
+    backticks printed literally, since nothing rendered them."""
+    segment = _MD_INLINE_CODE_RE.sub(
+        lambda m: f"\033[36m{m.group(1)}\033[0m{reopen}", segment)
+    segment = _MD_INLINE_BOLD_RE.sub(
+        lambda m: f"\033[1m{m.group(1)}\033[0m{reopen}", segment)
     return segment
 
 
+# Stands in for a space inside a code span while a line is wrapped. Not
+# whitespace, so `textwrap` cannot break on it; one character wide, so the
+# column math is the same as the space it replaces.
+_SPAN_SPACE = "\x00"
+
+
 def _wrap(text: str, cols: int, **kw) -> list[str]:
-    """`textwrap.wrap` that never splits a word. A rendered document is mostly
-    paths, refs and commands; broken across a line one stops being copyable, and
-    an over-long line costs a soft wrap the terminal does anyway."""
-    return textwrap.wrap(text, cols, break_long_words=False,
-                         break_on_hyphens=False, **kw)
+    """`textwrap.wrap` that never splits a word, nor a code span. A rendered
+    document is mostly paths, refs and commands; broken across a line one stops
+    being copyable, and an over-long line costs a soft wrap the terminal does
+    anyway.
+
+    A span is held together because `_md_inline` colours one line at a time: a
+    span split by the wrap matches on neither side, so its backticks print
+    literally and the run is not coloured at all. Held whole it overflows the
+    line instead, which is the trade every other long token here takes."""
+    held = _MD_INLINE_CODE_RE.sub(
+        lambda m: m.group(0).replace(" ", _SPAN_SPACE), text)
+    return [line.replace(_SPAN_SPACE, " ")
+            for line in textwrap.wrap(held, cols, break_long_words=False,
+                                      break_on_hyphens=False, **kw)]
 
 
 def _md_ansi(text: str) -> str:
@@ -1693,17 +1740,20 @@ def _md_ansi(text: str) -> str:
             depth = len(m.group(1))
             pad = "  " * max(0, depth - 1)
             cols = max(20, width - len(pad))
-            out.append("  " * max(0, depth - 2) + f"{colour}{rest}\033[0m")
+            out.append("  " * max(0, depth - 2)
+                       + f"{colour}{_md_inline(rest, colour)}\033[0m")
             continue
         m = _MD_BOLD_LINE_RE.match(line)
         if m:
             wrapped = _wrap(m.group(1), cols) or [""]
-            emit_all(f"\033[1m{wl}\033[0m" for wl in wrapped)
+            emit_all(f"{_ANSI_BOLD}{_md_inline(wl, _ANSI_BOLD)}{_ANSI_OFF}"
+                     for wl in wrapped)
             continue
         m = _MD_ITALIC_LINE_RE.match(line)
         if m:
             wrapped = _wrap(m.group(1), cols) or [""]
-            emit_all(f"\033[2m{wl}\033[0m" for wl in wrapped)
+            emit_all(f"{_ANSI_DIM}{_md_inline(wl, _ANSI_DIM)}{_ANSI_OFF}"
+                     for wl in wrapped)
             continue
         m = _MD_BULLET_RE.match(line)
         if m:
@@ -1721,11 +1771,28 @@ def _md_ansi(text: str) -> str:
                 emit_all(f"{wl[:len(prefix)]}\033[36m{wl[len(prefix):]}\033[0m"
                            for wl in wrapped)
                 continue
+            # A bullet ending in a code span goes out unwrapped. `_wrap` would
+            # split the span across lines, and `_md_inline` colours a line at a
+            # time, so each boundary left a bare backtick on screen and the
+            # command or message could no longer be copied in one selection.
+            # The terminal soft-wraps it instead — the same trade a bullet that
+            # is nothing but a code span already takes.
+            if _MD_TAIL_CODE_RE.search(content):
+                emit("- " + _md_inline(content))
+                continue
             # Any other bullet: two-space hanging indent so continuations align
             # under the text, not under the "- " marker.
             wrapped = _wrap(content, cols, initial_indent="- ",
                                      subsequent_indent="  ") or ["- "]
             emit_all(wl[:2] + _md_inline(wl[2:]) for wl in wrapped)
+            continue
+        # The same rule off a bullet: a label and the command or path it names,
+        # `One call whole, with its output: `chsum digest … --call <id>``. Held
+        # to a head that fits, so a paragraph that merely ends in a code span
+        # still wraps as the prose it is.
+        tail = _MD_TAIL_CODE_RE.search(line)
+        if tail and len(line[:tail.start()]) <= cols:
+            emit(_md_inline(line))
             continue
         wrapped = _wrap(line, cols) or [line]
         emit_all(_md_inline(wl) for wl in wrapped)
@@ -1906,13 +1973,17 @@ def render_agent_digest(meta: Meta, parent_ref: str, run: AgentRun) -> str:
         cmd, out = last_command_output(run.path)
         if out:
             parts.append("## Last command it ran, and what came back\n")
-            parts.append(f"`{_clip(cmd, 200, 'clipped')}`\n")
+            # `_clip_line`, not `_clip`: this prints as one code span, and
+            # `_clip`'s cut mark is a line of its own — a newline inside a span
+            # is a span the renderer sees as two, and neither half is one.
+            parts.append(_span(_clip_line(cmd, 200)) + "\n")
             parts.append(_quote(out) + "\n")
 
     parts.append("## Drill down\n")
     parts.append(f"Full sidecar: `{run.path}`\n")
-    parts.append(f"Its rows, addressable: `chsum digest {parent_ref}/{run.id} --messages`  ·  "
-                 "`--tools`  ·  `--commands`\n")
+    parts.append(f"Everything it said, whole: `chsum digest {parent_ref}/{run.id} --messages`\n")
+    parts.append(f"Its calls: `chsum digest {parent_ref}/{run.id} --tools`  ·  "
+                 "`--commands`  ·  one whole with `--call <id>`\n")
     return "\n".join(parts).rstrip() + "\n"
 
 
@@ -1920,16 +1991,21 @@ def render_agent_digest(meta: Meta, parent_ref: str, run: AgentRun) -> str:
 _EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 
 
-def _prompt_activity(path: pathlib.Path) -> dict[int, tuple[int, str]]:
+def _prompt_activity(path: pathlib.Path, only_agent: str = ""
+                     ) -> dict[tuple[pathlib.Path | None, int], tuple[int, str]]:
     """Per typed prompt, its turn number and one line naming how long the turn
-    ran and what happened in it, keyed by the prompt's row in the parent. One
-    `collect_rows` walk, so the digest stays deterministic and makes no model
+    ran and what happened in it, keyed by the file and row the prompt sits on.
+    One `collect_rows` walk, so the digest stays deterministic and makes no model
     call. Agents' rows count with the parent's, as every other total here does.
+
+    Keyed by file as well as row because `only_agent` moves the count into a
+    sidecar, whose line numbers do not order against the parent's — keyed by row
+    alone, turn 3 of an agent would answer to line 3 of the session.
 
     The number counts `starts_turn` rows, which is the unit `--messages` takes —
     not the digest's own position, which counts prompts and would name a window
     that lands somewhere else."""
-    rows = collect_rows(path, ("message", "tool", "command"))
+    rows = collect_rows(path, ("message", "tool", "command"), only_agent)
     starts = [i for i, r in enumerate(rows) if r.starts_turn]
     out: dict[int, tuple[int, str]] = {}
     for n, i in enumerate(starts):
@@ -1948,8 +2024,9 @@ def _prompt_activity(path: pathlib.Path) -> dict[int, tuple[int, str]]:
                             (cmds, "command"), (said, "reply")):
             if count:
                 bits.append(_plural(count, word))
-        out[rows[i].line] = (n + 1, " · ".join(bits))
-    TRACE.step("_prompt_activity", turns=len(starts), rows=len(rows))
+        out[(rows[i].source, rows[i].line)] = (n + 1, " · ".join(bits))
+    TRACE.step("_prompt_activity", turns=len(starts), rows=len(rows),
+               agent=only_agent or "(all)")
     return out
 
 
@@ -1993,7 +2070,7 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
             # reader opens this with `sed`.
             parts.append(_quote(_clip(m.text, prompt_clip, "sed the row below")) + "\n")
             where = f"`{meta.uuid[:8]}:{m.line}`" if m.line else f"message {m.n}"
-            turn, did = activity.get(m.line, (0, ""))
+            turn, did = activity.get((path, m.line), (0, ""))
             # The turn number `--messages` takes, so a window over this prompt is
             # one command away.
             meta_bits = ([f"turn {turn}"] if turn else []) + [where] + ([did] if did else [])
@@ -2287,7 +2364,10 @@ class _Row:
     label: str  # role for a message, tool name for a call
     line: int = 0  # 1-based row of the record holding it, in `source`
     source: pathlib.Path | None = None  # the file that row is in
-    starts_turn: bool = False  # a turn of yours opens here; agents' rows never do
+    # A turn opens here. Yours in the parent; an agent's own only where
+    # `collect_rows` was scoped to that agent, which makes the sidecar the
+    # conversation being numbered.
+    starts_turn: bool = False
 
 
 # What each flag selects. A Bash call is its own kind rather than a filter applied
@@ -2315,6 +2395,8 @@ def collect_rows(path: pathlib.Path, kinds: tuple[str, ...],
     for src, agent in mark_sources(path):
         if only_agent and agent != only_agent:
             continue
+        # Whether a turn has opened in this file yet — see `starts` below.
+        started = False
         TRACE.file(src, "rows")
         parsed: list[tuple[int, dict]] = []
         for lineno, raw in enumerate(src.read_text(errors="replace").splitlines(), start=1):
@@ -2365,9 +2447,19 @@ def collect_rows(path: pathlib.Path, kinds: tuple[str, ...],
             answered = _answered(rec) if role == "user" else ""
             if not text:
                 text = answered
-            starts = bool(not agent and role == "user"
+            # Agents' rows open no turn in the parent's numbering: the unit
+            # there is what you typed. Scoped to one agent, though, the sidecar
+            # is the conversation being read and its own prompts are what a
+            # window can name — otherwise `--messages N M` has nothing to
+            # count and an agent ref can only ever print the clipped list.
+            # Its opening prompt is turn 1 by construction, whatever
+            # `is_typed_prompt` makes of the text: a task quoting
+            # `<command-name>` or a system-reminder reads as harness noise to
+            # it, and dropping it would leave the run with no turn 1 at all.
+            starts = bool(role == "user" and (not agent or only_agent)
                           and not rec.get("isCompactSummary")
-                          and (answered or is_typed_prompt(text)))
+                          and (answered or is_typed_prompt(text)
+                               or (only_agent and not started)))
             returned = ""
             if role == "user" and text.lstrip().startswith("<task-notification>"):
                 aid = _agent_return(text, names, sidecars)
@@ -2378,6 +2470,7 @@ def collect_rows(path: pathlib.Path, kinds: tuple[str, ...],
                 text = _report_text(text)
                 starts = False
             if text:
+                started = started or starts
                 out.append(_Row(ts, agent, "message", "", text,
                                 returned or role, lineno, src, starts))
     # A parent's line numbers and a sidecar's don't order against each other;
@@ -2602,22 +2695,43 @@ def render_agents(meta: Meta, ref: str, reports: list[_AgentReport],
     return "\n".join(out)
 
 
-def _sources_block(rows: list[_Row], session: str) -> list[str]:
-    """Full path per source, a `sed` line, and the loop that reads a stretch. The
-    locator on a row is short enough to read across hundreds of rows; the path it
-    expands to has to be stated somewhere, or the row reaches nothing on its own."""
+def _sources_block(rows: list[_Row], session: str,
+                   whole: bool = False) -> list[str]:
+    """Which file the rows came from, and — where the view clipped them — the
+    `sed` line that opens one whole. The locator on a row is short enough to read
+    across hundreds of rows; the path it expands to has to be stated somewhere,
+    or the row reaches nothing on its own.
+
+    Paths print `~`-relative: absolute they run past the wrap width and fold
+    into the prose around them, and `~` pastes into a shell unchanged.
+
+    `whole` drops the `sed` line. It is there to recover text a row clipped, so
+    a view already printing every row whole leaves nothing for it to recover —
+    and an unexplained shell recipe under a document reads as an instruction to
+    run something rather than as the escape hatch it is."""
     if not rows:
         return []
-    seen: dict[str, pathlib.Path | None] = {}
+    seen: dict[str, str] = {}
     for r in rows:
-        seen.setdefault(_locator(r, session).rsplit(":", 1)[0], r.source)
+        seen.setdefault(_locator(r, session).rsplit(":", 1)[0],
+                        _relpath(str(r.source), ""))
+    out = ["## Sources\n"]
+    # One source needs no mapping: there is nothing for a locator to pick out,
+    # and the path alone is a bullet the renderer leaves unwrapped and copyable.
+    if len(seen) == 1:
+        out.append(f"- `{next(iter(seen.values()))}`")
+    else:
+        # Two spaces rather than a dash between the pair, the separator the row
+        # views already put between a locator and what sits beside it. The line
+        # runs long and soft-wraps rather than folding, so the path stays one
+        # selection to copy.
+        out += [f"- `{k}`  `{p}`" for k, p in seen.items()]
+    if whole:
+        return out + [""]
     first = rows[0]
-    some = " ".join(str(r.line) for r in rows[:3])
-    return (["## Sources\n"]
-            + [f"- `{k}` — `{p}`" for k, p in seen.items()]
-            + [f"\nOne record: `sed -n '{first.line}p' {first.source} | jq`",
-               "A stretch: `for l in " + some + "; do sed -n \"${l}p\" "
-               f"{first.source} | {_STRETCH_JQ}; done`\n"])
+    return out + ["\nA row's whole text — `sed` the line its locator names:\n",
+                  f"- `sed -n '{first.line}p' "
+                  f"{_relpath(str(first.source), '')} | {_STRETCH_JQ}`\n"]
 
 
 def find_row(path: pathlib.Path, spec: str) -> tuple[_Row, str]:
@@ -2719,13 +2833,17 @@ def _resolve_span(anchors: list[int], nums: list[int],
     return anchors[lo], stop, lo + 1, hi + 1
 
 
-def _turn_note(lo: int, hi: int, total: int, asked: list[int]) -> str:
+def _turn_note(lo: int, hi: int, total: int, asked: list[int],
+               owner: str = "your") -> str:
     """What the numbers resolved to, for a header: `-10 -1` alone says nothing
     about where in the conversation the window landed. One wording for the row
-    views and for `recap`, which resolve the pair through `_resolve_span`."""
+    views and for `recap`, which resolve the pair through `_resolve_span`.
+    `owner` names whose turns were counted — an agent ref numbers the sidecar's
+    own prompts, and calling those yours would misreport what the window means."""
     which = f"turn {lo}" if lo == hi else f"turns {lo}–{hi}"
     said = " ".join(str(v) for v in asked)
-    return f"{said} — your {which} of {total}" if said else f"your {which} of {total}"
+    return (f"{said} — {owner} {which} of {total}" if said
+            else f"{owner} {which} of {total}")
 
 
 def _span_rows(rows: list[_Row],
@@ -2837,10 +2955,34 @@ def _gap_note(skipped: dict[int, _Skipped], session: str, agent: str,
             + [f"  - `{who}:{r.line}` — {r.label}" for r in rows] + [""])
 
 
+def _row_block(r: _Row, session: str, whole: bool) -> list[str]:
+    """One row, as the lines it prints. Both shapes are built here rather than at
+    the two call sites they used to sit at: the head — the call id where there is
+    one, the locator, the time, the role or tool name — is the same row either
+    way, and spelled twice it drifted. Only what hangs off it differs, a
+    blockquote of the whole text or one clipped line."""
+    ident = f"`{_short_id(r.tool_id)}`  " if r.tool_id else ""
+    head = f"{ident}`{_locator(r, session)}`  {_hhmmss(r.when)}  {r.label}"
+    if not whole:
+        first = next(iter(r.text.splitlines()), "")
+        return [f"- {head}  {_span(_clip_line(first, 120))}"]
+    # Blockquoted, not fenced: text carrying a fence would close the block and
+    # forge document structure below it.
+    return [f"\n- {head}\n", _quote(r.text)]
+
+
 def render_rows(meta: Meta, ref: str, rows: list[_Row], what: str,
-                window: _Window | None = None) -> str:
+                window: _Window | None = None, whole: bool = False,
+                activity: dict[tuple[pathlib.Path | None, int],
+                               tuple[int, str]] | None = None) -> str:
     """One line per row, or every row whole where a turn window narrowed them —
     a reader who named a window asked for what a single clipped line cannot hold.
+    `whole` says the same of the messages view, which prints its rows whole
+    whatever the window: they are prose, and a conversation clipped to a line
+    per message is the one thing this view cannot be used for.
+    `activity` heads each turn with the counts the digest already prints under a
+    prompt — one wording for "what happened here", rather than a second one
+    invented for this view.
     A call's first line, not a flattened clip: a heredoc
     squashed onto one line is 120 chars of its own source, where `python3 - <<'PY'`
     identifies it at a glance. The whole text sits one `sed` away, which is what
@@ -2850,18 +2992,30 @@ def render_rows(meta: Meta, ref: str, rows: list[_Row], what: str,
     # part: a session whose agents ran nothing renders identically to one scoped away.
     scope = (f"Subagent `{agent_id}` only." if agent_id
              else "This conversation and its subagents.")
+    # Turns are the agent's own where the rows are scoped to it — `_turn_note`
+    # would otherwise call the task it was handed something you typed.
+    owner = "the agent's" if agent_id else "your"
     out = [f"# {what.capitalize()} — {_plural(len(rows), 'row')}, in order\n",
            f"*{meta.title}*\n",
            f"*{scope}*\n"]
     if window:
-        out.append(f"*{_turn_note(window.lo, window.hi, window.turns, window.nums)}.*\n")
+        out.append(f"*{_turn_note(window.lo, window.hi, window.turns, window.nums, owner)}.*\n")
     if not rows:
         out.append(f"*No {what} in this window.*\n" if window
                    else f"*No {what} recorded.*\n")
         return "\n".join(out)
-    out += _sources_block(rows, meta.uuid)
+    out += _sources_block(rows, meta.uuid, whole=bool(window) or whole)
     # Only inside a window: unwindowed, a whole session's gaps are hundreds of
     # lines and the view is a list rather than a stretch being read.
+    # Where each turn opens, per file. A view is headed by the turn a row sits
+    # in rather than by the row that opens one: `--tools` keeps no message rows
+    # at all, and hung off those it showed a list of calls with no boundaries in
+    # it. Reading the turn off the row's line also heads a window with the turn
+    # it opened inside, which is the one fact a window cannot state itself.
+    anchors: dict[pathlib.Path | None, list[int]] = {}
+    for src, line in sorted(activity or {}, key=lambda k: k[1]):
+        anchors.setdefault(src, []).append(line)
+    headed: tuple[pathlib.Path | None, int] | None = None
     kinds: dict[pathlib.Path, dict[int, _Skipped]] = {}
     seen: dict[pathlib.Path, int] = {}  # last printed row, per file
     prev: _Row | None = None
@@ -2886,18 +3040,19 @@ def render_rows(meta: Meta, ref: str, rows: list[_Row], what: str,
                 out += _gap_note(kinds[r.source], meta.uuid, r.agent,
                                  since, r.line - 1)
             seen[r.source] = r.line
+        # The same line the digest prints under a prompt, heading the turn it
+        # belongs to: a list of rows says what was said and nothing about what
+        # the turn then did, which is the thing a reader is scanning for.
+        # A file with no anchors — a sidecar, where the parent holds the turns —
+        # heads nothing and leaves the last head standing.
+        lines = anchors.get(r.source, ())
+        n = bisect.bisect_right(lines, r.line) if lines else 0
+        if n and (r.source, lines[n - 1]) != headed:
+            headed = (r.source, lines[n - 1])
+            turn, did = activity[headed]
+            out.append("\n*" + " · ".join([f"turn {turn}"] + ([did] if did else [])) + "*")
         prev = r
-        ident = f"`{_short_id(r.tool_id)}`  " if r.tool_id else ""
-        if window:
-            # Blockquoted, not fenced: text carrying a fence would close the
-            # block and forge document structure below it.
-            out.append(f"\n- {ident}`{_locator(r, meta.uuid)}`  "
-                       f"{_hhmmss(r.when)}  {r.label}\n")
-            out.append(_quote(r.text))
-            continue
-        first = next(iter(r.text.splitlines()), "")
-        out.append(f"- {ident}`{_locator(r, meta.uuid)}`  {_hhmmss(r.when)}  "
-                   f"{r.label}  `{_clip_line(first, 120)}`")
+        out += _row_block(r, meta.uuid, bool(window) or whole)
     # The window runs past its last printed row to where your next turn opens.
     if window and prev is not None and prev.source is not None \
             and prev.source == window.last_source \
@@ -3142,7 +3297,14 @@ def cmd_digest(args) -> int:
         if span:
             rows, window = _span_rows(rows, span)
             rows = [r for r in rows if r.kind in kinds]
-        _write_md(render_rows(extract_meta(path), ref, rows, view, window))
+        # Messages are prose and print whole, on every ref. Not a size, not a
+        # flag: the turn numbers already select the part of a conversation you
+        # want, so a second way to ask for less would only be a worse one — and
+        # a rule that reads the ref to decide made one command print two
+        # different documents. Calls stay a list — `--call <id>` opens one.
+        _write_md(render_rows(extract_meta(path), ref, rows, view, window,
+                              whole=view == "messages",
+                              activity=_prompt_activity(path, agent_id)))
         return 0
     meta, md = _digest_for(ref)
     # A no-argument command that silently writes a file is a surprise: the bare
@@ -5605,7 +5767,7 @@ def _failures_section(events: list[_Event], session: str = "") -> list[str]:
         if session and e.line:
             loc = f"{session[:8]}/{e.agent[:8]}" if e.agent else session[:8]
             head += f"  `{loc}:{e.line}`"
-        out.append(f"{head}  `{cmd}`" if cmd else head)
+        out.append(f"{head}  {_span(cmd)}" if cmd else head)
         # 600, above `_fail_excerpt`'s own 400-char bound: clipping twice cuts a
         # marked excerpt a second time and prints "[+1 chars]" at the seam.
         out.append(_quote(_clip(body, 600, _CATCHUP_HINT)) + "\n")
@@ -6519,6 +6681,16 @@ def cmd_recap(args) -> int:
     `digest` takes. Without them the window opens at the first turn the store
     holds no breakdown for, whichever conversation was named. `--full` is
     `--messages 1 -1`."""
+    # Ahead of every other check: a registered name with no prompt behind it
+    # would otherwise run the default's prompt and store the result as that
+    # type's reading.
+    chosen = getattr(args, "recap_type", _RECAP_TYPE_DEFAULT)
+    purpose, prompt = _RECAP_TYPES[chosen]
+    if prompt is None:
+        written = sorted(n for n, (_, t) in _RECAP_TYPES.items() if t is not None)
+        raise SystemExit(f"--type {chosen} returns {purpose}.\n"
+                         f"No prompt is written for it yet — "
+                         f"written: {', '.join(written)}")
     if args.messages == []:
         raise SystemExit("--messages needs one or two turn numbers "
                          "(1 your first, -1 your last)")
@@ -6852,6 +7024,36 @@ Reply with only the bullet list, nothing else.
 """
 
 
+# One reading of the same extract per name: `(what the reading returns, its
+# prompt)`. The default carries `_CHUNK_PROMPT`, so a run with no `--type` sends
+# what it sent before. A name whose prompt is None is registered and unwritten:
+# the parser accepts it and `cmd_recap` stops on it, printing what the reading
+# is for, so a run never reaches the model under a prompt that does not exist.
+_RECAP_TYPES: dict[str, tuple[str, str | None]] = {
+    "timeline": (
+        "what happened across the turn, oldest first, as bullets under the "
+        "turn that produced them",
+        _CHUNK_PROMPT,
+    ),
+    "evidence": (
+        "one entry per command, typed probe, change, verification or setup. A "
+        "probe carries the run of output that settled it; a chain of probes "
+        "converges on one found. A change carries the path it wrote, which the "
+        "mask keeps where the text does not survive. A verification carries "
+        "the verdict that came back. The grammar proves a write and the "
+        "checkpoint's tree proves a call wrote nothing, so an entry resting on "
+        "either prints as proven and the rest prints as judged; a turn whose "
+        "checkpoint holds no difference carries reads only",
+        None,
+    ),
+    "ambiguation": (
+        "one entry per turn you typed: the readings its wording carries, and "
+        "what the following turns settled about which one was meant",
+        None,
+    ),
+}
+_RECAP_TYPE_DEFAULT = "timeline"
+
 class HaikuSummariser(Summariser):
     """Shells out to `claude -p --model haiku`: no SDK, no key handling — the
     user's existing Claude Code auth signs the call. Run from chsum's own state
@@ -6947,8 +7149,9 @@ def main(argv=None) -> int:
     # The numbers sit on the flag as well as on `spec`: argparse fills one run
     # of positionals, so `<ref> --messages -1` leaves the `-1` with nowhere to go.
     win.add_argument("--messages", nargs="*", metavar="N",
-                     help="one or two turns of yours to narrow to; on `digest`, "
-                          "bare is every message in order, unfiltered")
+                     help="one or two turns to narrow to (1 the first, -1 the "
+                          "last); on `digest`, bare is every message in order "
+                          "and whole")
     sub = ap.add_subparsers(dest="cmd")
 
     p = sub.add_parser("sessions", parents=[dbg],
@@ -6986,6 +7189,12 @@ def main(argv=None) -> int:
     p.add_argument("--list", action="store_true",
                    help="this project's stored recap bullets, with the ids "
                         "`chsum note --delete` takes (--all: every project)")
+    p.add_argument("--type", dest="recap_type", metavar="NAME",
+                   choices=sorted(_RECAP_TYPES), default=_RECAP_TYPE_DEFAULT,
+                   help="which reading runs over the extract: "
+                        + "; ".join(f"{n} — {_RECAP_TYPES[n][0]}"
+                                    for n in sorted(_RECAP_TYPES))
+                        + f" (default: {_RECAP_TYPE_DEFAULT})")
     p.set_defaults(func=cmd_recap)
 
     p = sub.add_parser("digest", parents=[dbg, win],
