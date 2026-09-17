@@ -1,5 +1,9 @@
 __pycache__/
 *.pyc
+
+# Build artefacts: `python -m build` writes them, the release publishes from CI.
+dist/
+*.egg-info/
 .venv/
 .DS_Store
 .devharness/*

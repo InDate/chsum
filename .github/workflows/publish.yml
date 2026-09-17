@@ -32,9 +32,9 @@ jobs:
           [ "$TAG" = "$PKG" ]   || { echo "::error::pyproject.toml is $PKG, tag is $TAG"; exit 1; }
           [ "$TAG" = "$SKILL" ] || { echo "::error::SKILL.md is $SKILL, tag is $TAG"; exit 1; }
 
-      # chsum is stdlib-only and shells out to claude-history, so there is no
-      # meaningful unit suite. This checks the thing that actually breaks on a
-      # bad release: that the CLI still starts and its commands are wired up.
+      # The suite above covers the layers; this covers the wiring, which is the
+      # thing that actually breaks on a bad release: that the CLI still starts
+      # and every command it advertises is reachable.
       # The list comes off the parser's own usage line, so a command added or
       # removed in chsum.py needs no edit here; a hardcoded list drifts from
       # the code and fails the release on a command that no longer exists.
@@ -47,6 +47,12 @@ jobs:
             python3 chsum.py "$cmd" --help > /dev/null || { echo "::error::$cmd is broken"; exit 1; }
           done
           echo "CLI responds on every subcommand: $CMDS"
+
+      # Stdlib `unittest`, so the release needs no test dependency. Each git
+      # test configures the repository it builds, so the suite runs against a
+      # bare environment with no global git identity — verified with `env -i`.
+      - name: Tests
+        run: python3 -m unittest discover -s tests -t tests -v
 
       - name: Build
         run: |

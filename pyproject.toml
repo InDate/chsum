@@ -4,12 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "chsum"
-version = "2.2.1"
-description = "Work logs and reload-ready context from Claude Code conversations. Deterministic: no model, nothing invented."
+version = "3.0.0"
+description = "Work logs and reload-ready context from coding-agent conversations. Deterministic: no model, nothing invented."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
-authors = [{ name = "Joshua" }]
+# SPDX identifier plus the file, not the file's text: the `file` form folds the
+# whole licence into the `License:` metadata header, twenty lines of it.
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "InDate" }]
 keywords = ["claude", "claude-code", "transcripts", "context", "work-log"]
 
 # Deliberately empty, and worth keeping that way: chsum is stdlib-only, which is
@@ -22,7 +25,13 @@ dependencies = []
 chsum = "chsum:main"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["chsum.py"]
+only-include = ["chsum"]
 
+# Root-anchored, so `README.md` names the one beside this file rather than
+# every README in the tree. `tests` ships so an sdist can be checked the same
+# way CI checks the checkout.
 [tool.hatch.build.targets.sdist]
-include = ["chsum.py", "README.md", "LICENSE"]
+include = ["/chsum", "/chsum.py", "/tests", "/README.md", "/CONTRIBUTING.md",
+           "/LICENSE", "/skills"]
+# `.gitignore` ships whatever this says: hatchling adds it to every sdist as a
+# support file, beside `PKG-INFO` and `pyproject.toml`.

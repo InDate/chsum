@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """PostToolUse: the checkpoint commit, run out of the plugin's own directory.
 
-`chsum.py` sits beside this file in the plugin, so the import reaches the
-plugin's own copy and needs nothing on PATH. One installed tree runs both the
-hooks and the CLI.
+The `chsum` package sits beside this file in the plugin, so the import reaches
+the plugin's own copy and needs nothing on PATH. One installed tree runs both
+the hooks and the CLI.
 
 One JSON payload arrives on stdin. Exit 2 is the code that blocks a turn, so
 every path here exits 0.
