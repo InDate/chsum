@@ -441,13 +441,13 @@ itself follows. `chsum digest --list` names the view beside the session each
 file belongs to.
 
 ```sh
-chsum digest <ch_ref> --messages               # every message in order, whole
+chsum digest <ch_ref> --messages               # every message whole, each call a line between them
 chsum digest <ch_ref> --tools                  # every tool call in order
 chsum digest <ch_ref> --commands               # every Bash call in order
 chsum digest <ch_ref> --call <id>              # one tool call whole, with its output
 chsum digest <ch_ref> --agents                 # every subagent and what it reported back
 chsum digest <ch_ref>/<agent-id> --commands    # narrowed to that sidecar
-chsum digest <ch_ref>/<agent-id> --messages    # everything that agent said
+chsum digest <ch_ref>/<agent-id> --messages    # everything that agent said, and every call it made
 chsum digest <ch_ref> --messages --stdout      # print it rather than write it
 chsum digest <ch_ref> --messages > out.md      # or your own path
 ```
@@ -459,11 +459,18 @@ name and the first line of the call. A row runs long and lets the terminal
 soft-wrap it rather than folding at a space: a command broken across lines can
 no longer be copied in one selection.
 
-`--messages` prints its rows **whole**, on every ref. Messages are prose, and a
-conversation clipped to a line each is the one thing this view cannot be used
-for. There is no flag or size limit behind that: the turn numbers below already
-select the part of a conversation you want, and a second way to ask for less
-would only be a worse one.
+`--messages` prints its message rows **whole**, on every ref. Messages are
+prose, and a conversation clipped to a line each is the one thing this view
+cannot be used for. There is no flag or size limit behind that: the turn numbers
+below already select the part of a conversation you want, and a second way to
+ask for less would only be a worse one.
+
+Between them it prints every call, each the same single clipped line `--tools`
+gives it. A turn headed `2 tool calls · 8 commands` states how many ran and
+names none of them, which leaves the work between two replies unreadable; the
+calls sitting in the conversation's own order name each one. They stay clipped
+inside a turn window too, so a read of the conversation never runs through a
+heredoc's body — `--call <id>` opens one whole.
 
 Every view is broken by turn, each headed with the line the digest already
 prints under that prompt:
@@ -484,8 +491,9 @@ document and runs to thousands of characters, so it is clipped with the cut
 marked; the row it came from names where the whole text is.
 
 One or two numbers beside `--messages`, `--tools` or `--commands` narrow the view
-to a window of your turns and print those rows whole, so a stretch of
-conversation reads without leaving chsum:
+to a window of your turns. `--tools` and `--commands` print those rows whole, so
+a stretch of conversation reads without leaving chsum; `--messages` keeps the
+shape it has unwindowed, messages whole and calls a line each:
 
 ```sh
 chsum digest --last --messages -1              # your last turn, and everything after it
@@ -532,8 +540,9 @@ A row's whole text — `sed` the line its locator names:
 - `01CPKjYaSD`  `f1b9bbc6:26`  11:30:28  Bash  `ls && wc -l chsum.py`
 ```
 
-The `sed` line is an escape hatch for text a row clipped, so a view that prints
-every row whole — `--messages`, or any turn window — leaves it out. One source prints as the path alone: there is nothing for a locator to pick
+The `sed` line is an escape hatch for text a row clipped, so a row printed
+whole — a message under `--messages`, any row inside a turn window — leaves it
+out. One source prints as the path alone: there is nothing for a locator to pick
 out, and the bare path is a line the terminal leaves intact to copy.
 
 ## Upgrading to 3.0

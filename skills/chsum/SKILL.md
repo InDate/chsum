@@ -23,11 +23,11 @@ on as fact.
 | `chsum digest <ref>/<agent-id> --stdout` | One subagent's own digest |
 | `chsum digest <ref>` | Same, written to a file (`--stdout` to print) |
 | `chsum digest <ref> --commands` | Every Bash call in order, unfiltered, each with a `<session>:<line>` locator into the raw JSONL |
-| `chsum digest <ref> --messages` | Every message in order, each locating its own record |
+| `chsum digest <ref> --messages` | Every message whole and every call clipped to a line between them, each locating its own record |
 | `chsum digest <ref> --tools` | Every tool call in order, unfiltered |
 | `chsum digest <ref> --call <id>` | One tool call whole, with its captured output |
 | `chsum digest <ref> --agents` | Every subagent and each report it sent back, numbered where one returned more than once |
-| `chsum digest <ref> -3 -1` | A window of your turns, rows printed whole — `1` your first, `-1` your last, one number one turn, two a range; `--tools`/`--commands` take the same numbers |
+| `chsum digest <ref> -3 -1` | A window of your turns, messages whole and calls a line each — `1` your first, `-1` your last, one number one turn, two a range; `--tools`/`--commands` take the same numbers and print their rows whole |
 | `chsum recap <ref> --messages N M` | Reload a specific turn window from a past session; same numbering as `digest` |
 | `chsum recap --last` | Recap the most recent session that isn't this one, from the turn after the last recap; `--full` for the whole of it |
 | `chsum recap --invalidate` | Summarise this window again, replacing what's stored for it |

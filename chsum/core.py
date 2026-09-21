@@ -2207,7 +2207,8 @@ def render_agent_digest(meta: Meta, parent_ref: str, run: AgentRun) -> str:
 
     parts.append("## Drill down\n")
     parts.append(f"Full sidecar: `{run.path}`\n")
-    parts.append(f"Everything it said, whole: `chsum digest {parent_ref}/{run.id} --messages`\n")
+    parts.append(f"Everything it said, whole, with each call between: "
+                 f"`chsum digest {parent_ref}/{run.id} --messages`\n")
     parts.append(f"Its calls: `chsum digest {parent_ref}/{run.id} --tools`  ·  "
                  "`--commands`  ·  one whole with `--call <id>`\n")
     return "\n".join(parts).rstrip() + "\n"
@@ -2443,7 +2444,8 @@ def _drill_block(ref: str, path: pathlib.Path | None) -> list[str]:
     out += ["\nTo read one line of it, put the number in place of `<line>`",
             f"- `sed -n '<line>p' {path} | jq`",
             "\nTo read it in full, in order",
-            f"- everything said: `chsum digest {ref} --messages`",
+            f"- everything said, with each call between: "
+            f"`chsum digest {ref} --messages`",
             f"- every tool call: `chsum digest {ref} --tools`",
             f"- every shell command: `chsum digest {ref} --commands`\n"]
     return out
@@ -3020,8 +3022,11 @@ class _Row:
 
 # What each flag selects. A Bash call is its own kind rather than a filter applied
 # over `tool`, so both flags read the same rows without a second test per row.
+# The messages view carries the calls too, one clipped line each between the
+# messages: a turn headed `2 tool calls · 8 commands` states how many ran and
+# names none of them, which leaves the work between two replies unreadable.
 _ROW_KINDS = {
-    "messages": ("message",),
+    "messages": ("message", "tool", "command"),
     "tools": ("tool", "command"),
     "commands": ("command",),
 }
@@ -3648,9 +3653,12 @@ def render_rows(meta: Meta, ref: str, rows: list[_Row], what: str,
                                tuple[int, str]] | None = None) -> str:
     """One line per row, or every row whole where a turn window narrowed them —
     a reader who named a window asked for what a single clipped line cannot hold.
-    `whole` says the same of the messages view, which prints its rows whole
-    whatever the window: they are prose, and a conversation clipped to a line
-    per message is the one thing this view cannot be used for.
+    `whole` says the same of the messages view's message rows, which print
+    whole whatever the window: they are prose, and a conversation clipped to a
+    line per message is the one thing this view cannot be used for. The calls
+    that view carries between them stay one clipped line whatever the window,
+    which keeps a read of the conversation from running through a heredoc's
+    body; `--call <id>` opens one whole.
     `activity` heads each turn with the counts the digest already prints under a
     prompt — one wording for "what happened here", rather than a second one
     invented for this view.
@@ -3697,6 +3705,7 @@ def render_rows(meta: Meta, ref: str, rows: list[_Row], what: str,
     kinds: dict[pathlib.Path, dict[int, _Skipped]] = {}
     seen: dict[pathlib.Path, int] = {}  # last printed row, per file
     prev: _Row | None = None
+    prev_whole = False
     day = ""
     for r in rows:
         if r.when[:10] != day:
@@ -3730,7 +3739,14 @@ def render_rows(meta: Meta, ref: str, rows: list[_Row], what: str,
             turn, did = activity[headed]
             out.append("\n*" + " · ".join([f"turn {turn}"] + ([did] if did else [])) + "*")
         prev = r
-        out += _row_block(r, meta.uuid, bool(window) or whole, wrote)
+        row_whole = r.kind == "message" if whole else bool(window)
+        # A clipped row opens flush against the line above it, and the line
+        # above a call in the messages view is the closing line of a
+        # blockquote, which swallows the row. One blank line closes the quote.
+        if prev_whole and not row_whole:
+            out.append("")
+        prev_whole = row_whole
+        out += _row_block(r, meta.uuid, row_whole, wrote)
     # The window runs past its last printed row to where your next turn opens.
     if window and prev is not None and prev.source is not None \
             and prev.source == window.last_source \
@@ -7871,7 +7887,7 @@ class HaikuSummariser(Summariser):
 # Keyed by option string; the generic path prints the help string alone.
 _OPTION_FORMS = {
     "--messages": [
-        ("chsum digest <ref> --messages", "every message, whole, in order"),
+        ("chsum digest <ref> --messages", "every message whole, calls between"),
         ("chsum digest <ref> --messages 3", "turn 3 alone"),
         ("chsum digest <ref> --messages 3 7", "turns 3 to 7"),
         ("chsum digest <ref> --messages -1", "your last turn"),
@@ -7992,8 +8008,8 @@ def main(argv=None) -> int:
     # of positionals, so `<ref> --messages -1` leaves the `-1` with nowhere to go.
     win.add_argument("--messages", nargs="*", metavar="N",
                      help="one or two turns to narrow to (1 the first, -1 the "
-                          "last); on `digest`, bare is every message in order "
-                          "and whole")
+                          "last); on `digest`, bare is every message whole with "
+                          "each call clipped to a line between them")
     sub = ap.add_subparsers(dest="cmd")
 
     p = sub.add_parser("sessions", parents=[dbg],
