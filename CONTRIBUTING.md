@@ -75,12 +75,11 @@ context window, so a wrong or unmarked-truncated one is the failure mode.
 
 ## Releasing
 
-The version lives in **two** files — `pyproject.toml` and the
-`skills/chsum/SKILL.md` frontmatter. Both ship, and `publish.yml` refuses a tag
-that disagrees with either.
+The version lives in `pyproject.toml`, and `publish.yml` refuses a tag that
+disagrees with it.
 
 ```sh
-# bump both, commit, then
+# bump it, commit, then
 git tag v1.0.4 && git push origin v1.0.4
 ```
 

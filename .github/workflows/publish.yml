@@ -20,17 +20,14 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Three places carry the version and all three ship: the package, the
-      # skill's frontmatter, and the tag itself. A mismatch means someone
-      # installs one version and reads another's documentation.
-      - name: Versions agree with the tag
+      # The package version and the tag both ship. A mismatch means someone
+      # installs one version under the name of another.
+      - name: Version agrees with the tag
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           PKG=$(grep -m1 '^version = ' pyproject.toml | sed 's/.*"\(.*\)".*/\1/')
-          SKILL=$(grep -m1 '^version: ' skills/chsum/SKILL.md | awk '{print $2}')
-          echo "tag=$TAG pyproject=$PKG skill=$SKILL"
-          [ "$TAG" = "$PKG" ]   || { echo "::error::pyproject.toml is $PKG, tag is $TAG"; exit 1; }
-          [ "$TAG" = "$SKILL" ] || { echo "::error::SKILL.md is $SKILL, tag is $TAG"; exit 1; }
+          echo "tag=$TAG pyproject=$PKG"
+          [ "$TAG" = "$PKG" ] || { echo "::error::pyproject.toml is $PKG, tag is $TAG"; exit 1; }
 
       # The suite above covers the layers; this covers the wiring, which is the
       # thing that actually breaks on a bad release: that the CLI still starts
