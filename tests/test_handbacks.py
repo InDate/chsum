@@ -82,6 +82,53 @@ SIDECAR = [
 ]
 
 
+class Senders(unittest.TestCase):
+    """A message another sender put in an agent's conversation: labelled by its
+    sender, and opening the agent's next turn when the view is scoped to it."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="chsum-test-")
+        self.addCleanup(tmp.cleanup)
+        self.path = pathlib.Path(tmp.name) / "sess.jsonl"
+        self.path.write_text(json.dumps(_user("2026-09-25T04:00:00.000Z", "go",
+                                              origin={"kind": "human"})) + "\n")
+        side = self.path.parent / self.path.stem / "subagents" / f"agent-{AGENT}.jsonl"
+        side.parent.mkdir(parents=True)
+        recs = [
+            _user("2026-09-25T04:00:01.000Z", "Research the question."),
+            _user("2026-09-25T04:01:00.000Z",
+                  "Another Claude session sent a message while you were working:\n"
+                  "<agent-message from=\"caller\">\nWrap up now.\n</agent-message>",
+                  isMeta=True, origin={"kind": "peer", "from": "caller",
+                                       "name": "general-purpose", "body": "Wrap up now.\n"}),
+            _user("2026-09-25T04:02:00.000Z",
+                  "The coordinator sent a message while you were working: Change of "
+                  "direction.", isMeta=True, origin={"kind": "coordinator"}),
+            _user("2026-09-25T04:03:00.000Z",
+                  "[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated event.\n\n"
+                  "<task-notification>\n<task-id>nested01</task-id>\n"
+                  "<tool-use-id>toolu_01Nested</tool-use-id>\n<status>completed</status>\n"
+                  "<result>Nested report.</result>\n</task-notification>",
+                  isMeta=True, origin={"kind": "task-notification"}),
+        ]
+        recs.insert(1, {"type": "assistant", "timestamp": "2026-09-25T04:00:02.000Z",
+                        "message": {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": "toolu_01Nested", "name": "Agent",
+                             "input": {"description": "nested"}}]}})
+        side.write_text("".join(json.dumps(r) + "\n" for r in recs))
+
+    def test_each_sender_is_named_and_opens_the_agents_turn(self):
+        rows = [(r.label, r.text, r.starts_turn)
+                for r in core.collect_rows(self.path, core._ROW_KINDS["messages"], AGENT)
+                if r.kind == "message"]
+        self.assertEqual(rows, [
+            ("user", "Research the question.", True),
+            ("message from general-purpose", "Wrap up now.", True),
+            ("coordinator", "Change of direction.", True),
+            ("agent nested01 returned", "Nested report.", False),
+        ])
+
+
 class Handbacks(unittest.TestCase):
 
     def setUp(self) -> None:
@@ -110,7 +157,8 @@ class Handbacks(unittest.TestCase):
 
     def test_no_row_carries_harness_text(self):
         texts = "\n".join(r.text for r in self.rows())
-        for noise in ("system-reminder", "Another Claude session", "delivered to you"):
+        for noise in ("system-reminder", "Another Claude session", "delivered to you",
+                      "failed to produce a valid tool call"):
             self.assertNotIn(noise, texts)
 
     def test_scoped_to_the_agent_its_own_reports_stay(self):

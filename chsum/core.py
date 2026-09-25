@@ -716,6 +716,23 @@ def _hand_back(rec: dict) -> tuple[str, str] | None:
     return str(origin["from"]), report
 
 
+_COORDINATOR_LEAD = re.compile(r"^The coordinator sent a message[^:]*:\s*")
+
+
+def _sent_message(rec: dict, text: str) -> tuple[str, str] | None:
+    """(label, text) for a message another sender put in the conversation: a
+    peer session, by the name it sent under, or a coordinator. The harness's
+    lead-in is dropped, which leaves the message as its sender wrote it."""
+    origin = rec.get("origin")
+    kind = _origin(rec)
+    if kind == "peer" and isinstance(origin, dict) and origin.get("body"):
+        who = origin.get("name") or origin.get("from") or "peer"
+        return f"message from {who}", str(origin["body"]).strip()
+    if kind == "coordinator":
+        return "coordinator", _COORDINATOR_LEAD.sub("", text)
+    return None
+
+
 def is_typed_prompt(text: str) -> bool:
     """`is_real_prompt`, minus `!` runs — something you did, not something you
     said. Note paths stay on `is_real_prompt`, since notes are typed via `!`."""
@@ -3130,7 +3147,7 @@ def collect_rows(path: pathlib.Path, kinds: tuple[str, ...],
             body = rec.get("content")
             if (role == "queue-operation" and rec.get("operation") == "enqueue"
                     and isinstance(body, str)
-                    and body.lstrip().startswith("<task-notification>")
+                    and _is_notification(body)
                     and _points_to_handback(body)
                     and (aid := _agent_return(body, names, sidecars))):
                 stops.append((aid, ts, _stop_note(body)))
@@ -3195,7 +3212,7 @@ def collect_rows(path: pathlib.Path, kinds: tuple[str, ...],
                           and (answered or is_typed_prompt(text)
                                or (only_agent and not started)))
             returned = ""
-            if role == "user" and text.lstrip().startswith("<task-notification>"):
+            if role == "user" and _is_notification(text):
                 aid = _agent_return(text, names, sidecars)
                 if aid and _points_to_handback(text):
                     stops.append((aid, ts, _stop_note(text)))
@@ -3211,6 +3228,13 @@ def collect_rows(path: pathlib.Path, kinds: tuple[str, ...],
                 returned = f"agent {hand[0]} returned"
                 text = hand[1]
                 starts = False
+            elif role == "user" and (sent := _sent_message(rec, text)):
+                returned, text = sent
+                # Scoped to an agent, its caller's message is the agent's next
+                # prompt, as the task it was spawned with is its first.
+                starts = bool(only_agent)
+            elif role == "user" and text.startswith(_NOISE_PREFIXES):
+                continue
             if text:
                 started = started or starts
                 out.append(_Row(ts, agent, "message", "", text,
@@ -3283,6 +3307,17 @@ def _tool_names(parsed) -> dict[str, str]:
             if isinstance(part, dict) and part.get("type") == "tool_use":
                 names[str(part.get("id") or "")] = str(part.get("name") or "")
     return names
+
+
+# How a notification record opens: the bare tag, or the tag behind the harness's
+# `[SYSTEM NOTIFICATION - NOT USER INPUT]` preamble. Anchored at the start
+# either way, since a message quoting the tag mid-text is not a notification.
+_NOTIFICATION_LEADS = ("<task-notification>", "[SYSTEM NOTIFICATION")
+
+
+def _is_notification(text: str) -> bool:
+    return (text.lstrip().startswith(_NOTIFICATION_LEADS)
+            and "<task-notification>" in text)
 
 
 def _task_fields(text: str) -> dict[str, str]:
@@ -3393,7 +3428,7 @@ def _agent_reports(path: pathlib.Path) -> list[_AgentReport]:
             # notifications reads back as one otherwise — a 52,293-char paste
             # and an assistant message on the mechanism both matched a substring
             # test, and every one of them collapsed into a single nameless agent.
-            if not text.lstrip().startswith("<task-notification>"):
+            if not _is_notification(text):
                 continue
             if not _agent_return(text, names, sidecars):
                 continue

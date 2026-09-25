@@ -452,8 +452,12 @@ chsum digest <ch_ref> --messages --stdout      # print it rather than write it
 chsum digest <ch_ref> --messages > out.md      # or your own path
 ```
 
-All three print in timestamp order across the transcript and its sidecars, with
-nothing filtered, deduplicated or collapsed. `--tools` and `--commands` print one
+All three print in timestamp order across the transcript and its sidecars.
+Three kinds of record are removed or merged, each because it repeats a row
+already printed or carries only harness text: a record holding nothing but a
+`<system-reminder>`, the harness's retry after a malformed tool call, and the
+task notification that points at a report delivered as a peer message — its
+status and usage move onto that report's row. `--tools` and `--commands` print one
 line per row — the call id, a `<session>:<line>` locator, local time, the tool
 name and the first line of the call. A row runs long and lets the terminal
 soft-wrap it rather than folding at a space: a command broken across lines can
@@ -464,6 +468,21 @@ prose, and a conversation clipped to a line each is the one thing this view
 cannot be used for. There is no flag or size limit behind that: the turn numbers
 below already select the part of a conversation you want, and a second way to
 ask for less would only be a worse one.
+
+A message row is labelled by the sender its record names in `origin`, so a
+report or an instruction another sender wrote never reads as yours:
+
+```
+- `410bfb1a:1157`  19:09:15  agent a3d9a4a28f0836307 returned · completed · 54k tokens · 7 tools · 56s
+- `0d02851a:1026`  12:15:53  message from key-service-be
+- `9cb6adfc/a29d93fd:216`  16:32:20  coordinator
+```
+
+A subagent's report prints once, from the parent's peer message where the
+parent holds one and from the agent's own handback call where the report
+arrived as an attachment. Only what you typed opens a turn in the parent;
+scoped to an agent, its caller's and its coordinator's messages open the
+agent's turns.
 
 Between them it prints every call, each the same single clipped line `--tools`
 gives it. A turn headed `2 tool calls · 8 commands` states how many ran and
@@ -486,7 +505,8 @@ prints one tool call and its captured output whole, which is where the text a
 clipped call row actually lives.
 
 `--agents` lists every subagent the session ran and each report it sent back,
-numbered where an agent returned more than once. A report is the agent's own
+numbered where an agent returned more than once, each headed by the status and
+usage of the stop that sent it. A report is the agent's own
 document and runs to thousands of characters, so it is clipped with the cut
 marked; the row it came from names where the whole text is.
 
