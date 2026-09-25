@@ -667,6 +667,9 @@ _NOISE_MARKERS = (
 _NOISE_PREFIXES = (
     "## Context Usage",  # `/context` writes its report in as a user record
     "[Your previous response had no visible output",
+    "The previous response failed to produce a valid tool call",
+    "Another Claude session sent a message",
+    "The coordinator sent a message",
 )
 
 
@@ -677,6 +680,40 @@ def is_real_prompt(text: str) -> bool:
     if t.startswith(_NOISE_PREFIXES):
         return False
     return not any(m in t for m in _NOISE_MARKERS)
+
+
+def _origin(rec: dict) -> str:
+    """Who put a user record into the conversation: `origin.kind`, or
+    `turnOrigin`, the later spelling of the same field. "" on a tool result and
+    on records older than both."""
+    origin = rec.get("origin")
+    if isinstance(origin, dict) and origin.get("kind"):
+        return str(origin["kind"])
+    return str(rec.get("turnOrigin") or "")
+
+
+def _harness_sent(rec: dict) -> bool:
+    """A user record another sender wrote: a peer session, a coordinator, a task
+    notification. Records without the field fall through to the text rules."""
+    kind = _origin(rec)
+    return bool(kind) and kind != "human"
+
+
+_HANDBACK_LEAD = "The report follows:\n"
+
+
+def _hand_back(rec: dict) -> tuple[str, str] | None:
+    """(agent id, report) for a subagent's report delivered as a peer message.
+    The harness indents each report line by two spaces, which is removed here."""
+    origin = rec.get("origin")
+    if not (isinstance(origin, dict) and origin.get("kind") == "peer"
+            and origin.get("handback") and origin.get("from")):
+        return None
+    body = str(origin.get("body") or "")
+    _, lead, report = body.partition(_HANDBACK_LEAD)
+    report = report if lead else body
+    report = "\n".join(ln.removeprefix("  ") for ln in report.splitlines()).strip()
+    return str(origin["from"]), report
 
 
 def is_typed_prompt(text: str) -> bool:
@@ -1552,6 +1589,8 @@ def _is_typed_prompt(rec: dict, command_ids: frozenset[str] = frozenset()) -> bo
     (`_command_prompt_ids`) — without it a slash command's body still reads as typed."""
     if rec.get("isCompactSummary") or _tool_injected(rec, command_ids):
         return False  # Claude Code's own auto-summary, or a loaded body — not typed
+    if _harness_sent(rec):
+        return False
     content = (rec.get("message") or {}).get("content")
     if isinstance(content, str):
         texts = [content]
@@ -2440,7 +2479,8 @@ def _drill_block(ref: str, path: pathlib.Path | None) -> list[str]:
     sides = subagent_transcripts(path)
     if sides:
         out.append("\nThe subagents it ran, each in its own file")
-        out += [f"- `{sc.stem.removeprefix('agent-')}` — `{sc}`" for sc in sides]
+        parent = _split_agent_ref(ref)[0]
+        out += [f"- `{parent}/{sc.stem.removeprefix('agent-')}` — `{sc}`" for sc in sides]
     out += ["\nTo read one line of it, put the number in place of `<line>`",
             f"- `sed -n '<line>p' {path} | jq`",
             "\nTo read it in full, in order",
@@ -3032,6 +3072,18 @@ _ROW_KINDS = {
 }
 
 
+# The tool a subagent returns its report through.
+_HANDBACK_TOOL = "SubagentHandback"
+_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+
+
+def _harness_reminder(rec: dict, text: str) -> bool:
+    """A user record the harness wrote whole: `isMeta`, and nothing left once its
+    `<system-reminder>` blocks are removed. `isMeta` alone also marks an image
+    paste, which is typed text and stays a row."""
+    return bool(rec.get("isMeta")) and not _REMINDER_RE.sub("", text).strip()
+
+
 def _short_id(tool_id: str) -> str:
     """Display form of a `tool_use` id. `toolu_` is on every one of them, so the
     prefix carries no information and costs six columns on every row."""
@@ -3045,6 +3097,12 @@ def collect_rows(path: pathlib.Path, kinds: tuple[str, ...],
     sections do all three, and these views are what they point at. `only_agent`
     narrows to one sidecar, for an agent ref."""
     out: list[_Row] = []
+    # (agent, report) the parent holds as a peer message. The same report sits
+    # in the agent's own handback call, and printing both repeats it. Keyed by
+    # the report too: a return delivered as an attachment leaves no peer record,
+    # and its handback call is then the only copy in any row.
+    handed: set[tuple[str, str]] = set()
+    stops: list[tuple[str, str, str]] = []
     for src, agent in mark_sources(path):
         if only_agent and agent != only_agent:
             continue
@@ -3066,9 +3124,19 @@ def collect_rows(path: pathlib.Path, kinds: tuple[str, ...],
         sidecars = _sidecar_ids(path)
         for lineno, rec in parsed:
             role = rec.get("type")
+            ts = str(rec.get("timestamp") or "")
+            # A notification delivered as an attachment leaves its text only in
+            # the queue record, which is where most handback stops are found.
+            body = rec.get("content")
+            if (role == "queue-operation" and rec.get("operation") == "enqueue"
+                    and isinstance(body, str)
+                    and body.lstrip().startswith("<task-notification>")
+                    and _points_to_handback(body)
+                    and (aid := _agent_return(body, names, sidecars))):
+                stops.append((aid, ts, _stop_note(body)))
+                continue
             if role not in ("user", "assistant"):
                 continue
-            ts = str(rec.get("timestamp") or "")
             content = (rec.get("message") or {}).get("content")
             texts: list[str] = []
             if isinstance(content, str):
@@ -3081,6 +3149,15 @@ def collect_rows(path: pathlib.Path, kinds: tuple[str, ...],
                         texts.append(part.get("text", ""))
                     elif part.get("type") == "tool_use":
                         name = str(part.get("name") or "?")
+                        report = (part.get("input") or {}).get("message")
+                        # The handback call's `message` is the agent's report and
+                        # the only copy of it in any user or assistant record: the
+                        # parent receives it as an attachment, which no row reads.
+                        if (name == _HANDBACK_TOOL and "message" in kinds
+                                and isinstance(report, str) and report.strip()):
+                            out.append(_Row(ts, agent, "message", "", report.strip(),
+                                            f"agent {agent} returned", lineno, src))
+                            continue
                         cmd = (part.get("input") or {}).get("command")
                         bash = name == "Bash" and isinstance(cmd, str) and cmd.strip()
                         kind = "command" if bash else "tool"
@@ -3094,6 +3171,8 @@ def collect_rows(path: pathlib.Path, kinds: tuple[str, ...],
             if role == "user" and _tool_injected(rec, command_ids):
                 continue
             text = "\n".join(t for t in texts if t.strip()).strip()
+            if role == "user" and _harness_reminder(rec, text):
+                continue
             # An answer to the question tool carries its text in a structured
             # field and none in the body, so the view dropped it and a window
             # numbered by turns would skip the turn a menu choice settled.
@@ -3112,25 +3191,42 @@ def collect_rows(path: pathlib.Path, kinds: tuple[str, ...],
             # it, and dropping it would leave the run with no turn 1 at all.
             starts = bool(role == "user" and (not agent or only_agent)
                           and not rec.get("isCompactSummary")
+                          and not _harness_sent(rec)
                           and (answered or is_typed_prompt(text)
                                or (only_agent and not started)))
             returned = ""
             if role == "user" and text.lstrip().startswith("<task-notification>"):
                 aid = _agent_return(text, names, sidecars)
+                if aid and _points_to_handback(text):
+                    stops.append((aid, ts, _stop_note(text)))
+                    continue
                 got = _task_fields(text)
                 via = names.get(got["tool-use-id"], "")
                 returned = (f"agent {aid} returned" if aid
                             else f"{via or 'task'} {got['task-id'] or '?'} finished")
                 text = _report_text(text)
                 starts = False
+            if role == "user" and (hand := _hand_back(rec)):
+                handed.add(hand)
+                returned = f"agent {hand[0]} returned"
+                text = hand[1]
+                starts = False
             if text:
                 started = started or starts
                 out.append(_Row(ts, agent, "message", "", text,
                                 returned or role, lineno, src, starts,
                                 asked=tur if answered else None))
+    out = [r for r in out if not ((r.agent, r.text) in handed and r.kind == "message"
+                                  and r.label == f"agent {r.agent} returned")]
     # A parent's line numbers and a sidecar's don't order against each other;
     # only a clock does. Same reason `mark_sources`' readers sort by timestamp.
     out.sort(key=lambda r: r.when)
+    out = _fold_stops(
+        out, stops,
+        lambda r: (r.label.removeprefix("agent ").removesuffix(" returned")
+                   if r.kind == "message" and r.label.endswith(" returned") else ""),
+        lambda r: r.when,
+        lambda r, note: dataclasses.replace(r, label=f"{r.label} · {note}"))
     TRACE.step("collect_rows", kinds=",".join(kinds), rows=len(out),
                agent=only_agent or "(all)",
                span=f"{out[0].when}→{out[-1].when}" if out else "—")
@@ -3227,15 +3323,45 @@ class _AgentReport:
     status: str
     summary: str
     result: str
+    # The line is in the agent's own transcript, not the parent's: the report
+    # reached the parent only as an attachment, and its handback call is the
+    # one record holding it.
+    in_sidecar: bool = False
+
+
+def _handback_reports(path: pathlib.Path) -> list[_AgentReport]:
+    """Every report an agent returned through its handback call, read from its
+    own transcript."""
+    out: list[_AgentReport] = []
+    for side in subagent_transcripts(path):
+        agent = side.stem.removeprefix("agent-")
+        for lineno, raw in enumerate(side.read_text(errors="replace").splitlines(), 1):
+            try:
+                rec = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            content = (rec.get("message") or {}).get("content") if isinstance(rec, dict) else None
+            for part in content if isinstance(content, list) else []:
+                if not (isinstance(part, dict) and part.get("type") == "tool_use"
+                        and part.get("name") == _HANDBACK_TOOL):
+                    continue
+                report = (part.get("input") or {}).get("message")
+                if isinstance(report, str) and report.strip():
+                    out.append(_AgentReport(agent, str(rec.get("timestamp") or ""),
+                                            lineno, "", "", report.strip(),
+                                            in_sidecar=True))
+    return out
 
 
 def _agent_reports(path: pathlib.Path) -> list[_AgentReport]:
     """Every subagent return recorded in a parent transcript, in order. The
-    `<task-notification>` record is where the report lands: an async agent's
+    report lands in a `<task-notification>` record, or in a peer message where
+    the agent returned it through its handback call: an async agent's
     `tool_result` carries launch metadata, not the work."""
     out: list[_AgentReport] = []
     names: dict[str, str] = {}
     sidecars = _sidecar_ids(path)
+    stops: list[tuple[str, str, str]] = []
     for lineno, raw in enumerate(path.read_text(errors="replace").splitlines(), 1):
         try:
             rec = json.loads(raw)
@@ -3244,6 +3370,10 @@ def _agent_reports(path: pathlib.Path) -> list[_AgentReport]:
         if not isinstance(rec, dict):
             continue
         names.update(_tool_names([rec]))
+        if rec.get("type") == "user" and (hand := _hand_back(rec)):
+            out.append((True, _AgentReport(hand[0], str(rec.get("timestamp") or ""),
+                                           lineno, "", "", hand[1])))
+            continue
         content = (rec.get("message") or {}).get("content")
         texts = ([content] if isinstance(content, str)
                  else [p.get("text", "") for p in content
@@ -3268,19 +3398,73 @@ def _agent_reports(path: pathlib.Path) -> list[_AgentReport]:
             if not _agent_return(text, names, sidecars):
                 continue
             got = _task_fields(text)
+            if _points_to_handback(text):
+                stops.append((got["task-id"], str(rec.get("timestamp") or ""),
+                              _stop_note(text)))
+                continue
             out.append((rec.get("type") == "user",
                         _AgentReport(got["task-id"], str(rec.get("timestamp") or ""),
                                      lineno, got["status"], got["summary"],
                                      got["result"])))
+    # Undelivered, so a peer message holding the same report wins the key below.
+    out += [(False, r) for r in _handback_reports(path)]
     kept: dict[tuple, _AgentReport] = {}
     for delivered, rep in out:
         key = (rep.agent, rep.status, rep.result)
         if delivered or key not in kept:
             kept[key] = rep
-    reports = sorted(kept.values(), key=lambda r: r.line)
+    # By time: a sidecar's line numbers don't order against the parent's.
+    reports = sorted(kept.values(), key=lambda r: (r.when, r.line))
+    # A notification enqueued and then delivered is the same stop twice.
+    stops = list(dict.fromkeys(stops))
+    reports = _fold_stops(
+        reports, [s for s in stops if s[1]], lambda r: r.agent, lambda r: r.when,
+        lambda r, note: dataclasses.replace(r, status=note) if not r.status else r)
     TRACE.step("_agent_reports", reports=len(reports), records=len(out),
                agents=len({r.agent for r in reports}))
     return reports
+
+
+# The `<result>` of a notification sent after a handback call. The report sits
+# in the peer message before it, so this notification adds only the stop's
+# status and usage, which are moved onto that report's row.
+_HANDBACK_POINTER = "This agent's report was delivered to you as a message from"
+_USAGE_RE = {f: re.compile(rf"<{f}>(\d+)</{f}>")
+             for f in ("subagent_tokens", "tool_uses", "duration_ms")}
+
+
+def _stop_note(text: str) -> str:
+    """`completed · 54k tokens · 7 tools · 57s` out of a `<task-notification>`,
+    each part present only where the notification carries it."""
+    got = {f: int(m.group(1)) for f, r in _USAGE_RE.items() if (m := r.search(text))}
+    parts = [_task_fields(text)["status"]]
+    if "subagent_tokens" in got:
+        parts.append(f"{got['subagent_tokens'] / 1000:.0f}k tokens")
+    if "tool_uses" in got:
+        parts.append(_plural(got["tool_uses"], "tool"))
+    if "duration_ms" in got:
+        parts.append(_fmt_secs(got["duration_ms"] // 1000))
+    return " · ".join(p for p in parts if p)
+
+
+def _points_to_handback(text: str) -> bool:
+    return _task_fields(text)["result"].startswith(_HANDBACK_POINTER)
+
+
+def _fold_stops(rows: list, stops: list[tuple[str, str, str]], agent_of, when_of,
+                note) -> list:
+    """Each stop — (agent, time, note) of a notification that points at a
+    handback — written onto the latest report of that agent at or before its
+    time, through `note(row, text)`. A stop with no such report stays out:
+    the notification carried nothing but the pointer and its usage."""
+    rows = list(rows)
+    for agent, when, text in stops:
+        at = max((i for i, r in enumerate(rows)
+                  if agent_of(r) == agent and when_of(r) <= when), default=None,
+                 key=lambda i: when_of(rows[i]))
+        if at is not None:
+            rows[at] = note(rows[at], text)
+    return rows
 
 
 def _report_text(text: str) -> str:
@@ -3325,7 +3509,8 @@ def render_agents(meta: Meta, ref: str, reports: list[_AgentReport],
             out.append("*No report recorded.*\n")
             continue
         for i, rep in enumerate(runs, 1):
-            head = f"`{meta.uuid[:8]}:{rep.line}`  {_hhmmss(rep.when)}"
+            who = f"{meta.uuid[:8]}/{rep.agent[:8]}" if rep.in_sidecar else meta.uuid[:8]
+            head = f"`{who}:{rep.line}`  {_hhmmss(rep.when)}"
             if len(runs) > 1:
                 head = f"**Return {i} of {len(runs)}** — {head}"
             out.append(f"{head}  ·  {rep.status or 'status not recorded'}\n")
@@ -4829,6 +5014,8 @@ def _failed(body: str, is_error: bool) -> bool:
 def _typed_text(rec: dict) -> str:
     """Only the parts you typed. The harness rides `<system-reminder>` blocks in
     the same record as a prompt, and `_record_text` would quote them with it."""
+    if _harness_sent(rec):
+        return ""
     content = (rec.get("message") or {}).get("content")
     if isinstance(content, str):
         texts = [content]
