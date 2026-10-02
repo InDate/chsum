@@ -6865,24 +6865,54 @@ def _tint(text: str, code: str, colour: bool) -> str:
     return f"{code}{text}{_ANSI_OFF}" if colour and text else text
 
 
+def _under(path: str, only: str) -> bool:
+    """Whether a repo-relative path is `only` or sits inside it; `only` "" holds
+    every path."""
+    return not only or path == only or path.startswith(only.rstrip("/") + "/")
+
+
+def _repo_path(project: pathlib.Path, typed: str) -> str:
+    """A path typed from the current directory, as `git diff` names it: relative
+    to the repository's top level."""
+    try:
+        top = _git(["git", "rev-parse", "--show-toplevel"], project)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise SystemExit(f"git failed: {e}")
+    root = pathlib.Path(top.stdout.strip()).resolve()
+    try:
+        rel = (pathlib.Path.cwd() / typed).resolve().relative_to(root)
+    except ValueError:
+        raise SystemExit(f"{typed} is outside {root}, the repository this session wrote to")
+    return "" if str(rel) == "." else rel.as_posix()
+
+
+def _spans_text(hunks: list) -> str:
+    """A file's line ranges, the first `_STEP_RANGES` of them and a count of the
+    rest."""
+    spans = [_hunk_span(s, k) for s, k in hunks]
+    more = len(spans) - _STEP_RANGES
+    return ", ".join(spans[:_STEP_RANGES]) + (f", … {more} more" if more > 0 else "")
+
+
 def _step_rows(n: int, step: ChainEntry, side: set | None, project: pathlib.Path,
-               colour: bool = False) -> list[str]:
+               colour: bool = False, only: str = "") -> list[str]:
     """One row per file of the step on this list's side, the number on the
     first. A step of several files letters each row, and the letters hold
-    whichever of its files are on the other side; one file takes none."""
+    whichever of its files are on the other side; one file takes none. `only`
+    keeps the files under that path, and a step with none of them returns []."""
     files = _step_files(project, step)
     rows = []
     for letter, path, hunks in files:
-        if side is not None and letter not in side:
+        if side is not None and letter not in side or not _under(path, only):
             continue
-        spans = [_hunk_span(s, k) for s, k in hunks]
-        more = len(spans) - _STEP_RANGES
-        text = ", ".join(spans[:_STEP_RANGES]) + (f", … {more} more" if more > 0 else "")
+        text = _spans_text(hunks)
         number = _tint(f"{n:>3}", _ANSI_DIM, colour) if not rows else "   "
         mark = f"{letter:<2}" if len(files) > 1 else "  "
         rows.append(f"{number}  {_tint(mark, _ANSI_DIM, colour)} "
                     + _tint(path, _ANSI_BOLD, colour) + (f":{text}" if text else ""))
-    return rows or [_tint(f"{n:>3}", _ANSI_DIM, colour) + "     no file content"]
+    if rows or only:
+        return rows
+    return [_tint(f"{n:>3}", _ANSI_DIM, colour) + "     no file content"]
 
 
 _DIFF_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
@@ -6948,12 +6978,12 @@ def _diff_files(project: pathlib.Path, step: ChainEntry,
 
 
 def render_step_diff(project: pathlib.Path, step: ChainEntry, colour: bool = False,
-                     paths: list[str] | None = None) -> str:
+                     paths: list[str] | None = None, indent: int = 0) -> str:
     """The step's full diff in the layout of Claude Code's edit diff: per file an
     `Updated <path> (+a -r)` line, then each line under its own number, `...`
     between hunks. In colour, an added or removed line carries its background
-    to the terminal's width."""
-    cols = shutil.get_terminal_size((100, 24)).columns
+    to the terminal's width. `indent` spaces open every line."""
+    cols = shutil.get_terminal_size((100, 24)).columns - indent
     out = []
     for f in _diff_files(project, step, paths):
         counts = "" if f.binary else f" (+{f.added} -{f.removed})"
@@ -6974,39 +7004,72 @@ def render_step_diff(project: pathlib.Path, step: ChainEntry, colour: bool = Fal
                 else:
                     out.append(_tint(f"{n:>{width}}", _ANSI_DIM, colour)
                                + f" {sign} {text.expandtabs(4)}")
-    return "\n".join(out)
+    pad = " " * indent
+    return "\n".join(pad + line for line in out)
 
 
 def render_steps(action: str, listed: list[tuple[ChainEntry, set | None]],
                  first: ChainEntry | None, project: pathlib.Path, limit: int,
-                 colour: bool = False) -> str:
+                 colour: bool = False, only: str = "", reverse: bool = False) -> str:
     """The steps `chsum <action> <n>` takes, newest first, each file of a step on
-    a row of its own with the lines its diff covers."""
+    a row of its own with the lines its diff covers. `only` keeps the steps that
+    touched a path under it, numbered and lettered as the whole list numbers
+    them, so a number read here acts on the same step. `reverse` prints the
+    same steps oldest first, which puts the newest beside the prompt."""
     noun = "in place" if action == "undo" else "undone"
-    if not listed:
-        return (f"no steps {noun} in this session" +
+    where = f" touching {only}" if only else ""
+    matched = []
+    for n, (step, side) in enumerate(listed, 1):
+        rows = _step_rows(n, step, side, project, colour, only)
+        if rows:
+            matched.append((n, step, rows))
+    if not matched:
+        return (f"no steps {noun}{where} in this session" +
                 ("" if action == "undo" else " — `chsum undo` lists the steps to undo"))
-    shown = listed[:limit] if limit else listed
-    out = [_tint(f"{_plural(len(listed), 'step')} {noun}, newest first", _ANSI_BOLD, colour)]
-    for n, (step, side) in enumerate(shown, 1):
-        out += _step_rows(n, step, side, project, colour)
+    shown = matched[:limit] if limit else matched
+    order = "newest last" if reverse else "newest first"
+    out = [_tint(f"{_plural(len(matched), 'step')} {noun}{where}, {order}",
+                 _ANSI_BOLD, colour)]
+    blocks = []
+    for n, step, rows in shown:
         if first is not None and step.when == first.when:
             # The first checkpoint's parent is the commit checked out when the
             # session began, so its diff holds edits uncommitted at that point.
-            out.append(_tint(f"        measured against commit "
-                             f"{_base_of(project, first.sha)[:7]}: holds any edits "
-                             "uncommitted when the session began", _ANSI_DIM, colour))
-    if len(shown) < len(listed):
-        out.append(_tint(f"  … {len(listed) - len(shown)} older · `-n 0` lists them all",
-                         _ANSI_DIM, colour))
+            rows = rows + [_tint(f"        measured against commit "
+                                 f"{_base_of(project, first.sha)[:7]}: holds any edits "
+                                 "uncommitted when the session began", _ANSI_DIM, colour)]
+        blocks.append(rows)
+    older = ([_tint(f"  … {len(matched) - len(shown)} older · `-n 0` lists them all",
+                    _ANSI_DIM, colour)] if len(shown) < len(matched) else [])
+    if reverse:
+        out += older + [r for rows in reversed(blocks) for r in rows]
+    else:
+        out += [r for rows in blocks for r in rows] + older
+    out.append("\n" + _tint(_steps_hint(action, only), _ANSI_DIM, colour))
+    return "\n".join(out)
+
+
+def _steps_hint(action: str, only: str) -> str:
+    """The commands that act on what a list shows, one per line. A list kept to
+    a path shows only the rows of its steps under that path, so its hint names
+    the forms that touch those rows alone: a number, a range and the other
+    list each reach past them."""
     verb = "reverses" if action == "undo" else "re-applies"
     other = "redo" if action == "undo" else "undo"
-    out.append("\n" + _tint(f"`chsum {action} <n>` {verb} step n, `<n><letter>` one "
-                            f"file of it, `<n>-<m>` steps n to m, `--detail` shows "
-                            f"the change · `chsum {other}` lists the steps "
-                            f"{'undone' if action == 'undo' else 'in place'}",
-                            _ANSI_DIM, colour))
-    return "\n".join(out)
+    if only:
+        return "\n".join([
+            f"`chsum {action} <n><letter>` {verb} that row alone; a row with no "
+            f"letter is its whole step, `chsum {action} <n>`",
+            f"`chsum {action} {only} --detail` prints each step's diff of it",
+            f"`chsum {other} {only}` lists its steps "
+            f"{'undone' if action == 'undo' else 'in place'}"])
+    return "\n".join([
+        f"`chsum {action} <n>` {verb} step n · `<n><letter>` one file of it · "
+        f"`<n>-<m>` steps n to m",
+        f"`chsum {action} <n> --detail` prints the step's diff and changes nothing; "
+        f"`--detail` alone prints every step's",
+        f"`chsum {action} <path>` lists the steps that touched a file",
+        f"`chsum {other}` lists the steps {'undone' if action == 'undo' else 'in place'}"])
 
 
 _STEP_SPEC_RE = re.compile(r"^(\d+)(?:-(\d+)|([a-z]+))?$")
@@ -7031,10 +7094,187 @@ def _step_spec(spec: str, count: int, action: str) -> tuple[int, int, str]:
     return first, last, m.group(3) or ""
 
 
+@dataclass
+class _Change:
+    """One step's change to the files under a path, on one list's side."""
+    number: int  # the file's own count, 1 the newest on this list
+    step: ChainEntry
+    files: list[tuple[str, str, list]]  # (letter, path, hunks) under the path
+    lettered: bool  # the step changed more than one file
+
+
+def _changes_to(listed: list[tuple[ChainEntry, set | None]], only: str,
+                project: pathlib.Path) -> list[_Change]:
+    """The changes a list's steps made under `only`, numbered 1 the newest."""
+    out = []
+    for step, side in listed:
+        files = _step_files(project, step)
+        mine = [f for f in files if (side is None or f[0] in side) and _under(f[1], only)]
+        if mine:
+            out.append(_Change(len(out) + 1, step, mine, len(files) > 1))
+    return out
+
+
+def _change_rows(change: _Change, single: bool, colour: bool) -> list[str]:
+    """The change's number and local time, then its line ranges: those alone
+    where the path is one file, each file's path and ranges under a
+    directory."""
+    head = f"{change.number:>3}  {_hhmm(change.step.when)}  "
+    rows = []
+    for _, path, hunks in change.files:
+        text = _spans_text(hunks)
+        body = text if single else _tint(path, _ANSI_BOLD, colour) + (f":{text}" if text else "")
+        rows.append((_tint(head, _ANSI_DIM, colour) if not rows else " " * len(head)) + body)
+    return rows
+
+
+def render_changes(action: str, changes: list[_Change], only: str, limit: int,
+                   colour: bool = False, reverse: bool = False) -> str:
+    """A path's changes on one list, numbered as `chsum <action> <path> <n>`
+    takes them."""
+    noun = "in place" if action == "undo" else "undone"
+    if not changes:
+        return f"no changes to {only} {noun} in this session"
+    single = all(path == only for c in changes for _, path, _ in c.files)
+    shown = changes[:limit] if limit else changes
+    order = "newest last" if reverse else "newest first"
+    blocks = [_change_rows(c, single, colour) for c in shown]
+    older = ([_tint(f"  … {len(changes) - len(shown)} older · `-n 0` lists them all",
+                    _ANSI_DIM, colour)] if len(shown) < len(changes) else [])
+    out = [_tint(f"{_plural(len(changes), 'change')} to {only} {noun}, {order}",
+                 _ANSI_BOLD, colour)]
+    if reverse:
+        out += older + [r for rows in reversed(blocks) for r in rows]
+    else:
+        out += [r for rows in blocks for r in rows] + older
+    verb = "reverses" if action == "undo" else "re-applies"
+    other = "redo" if action == "undo" else "undo"
+    out.append("\n" + _tint("\n".join([
+        f"`chsum {action} {only} <n>` {verb} change n · `<n>-<m>` changes n to m",
+        f"`chsum {action} {only} --detail` prints each change in full",
+        f"`chsum {other} {only}` lists its changes "
+        f"{'undone' if action == 'undo' else 'in place'}"]), _ANSI_DIM, colour))
+    return "\n".join(out)
+
+
+def _file_line(letter: str, path: str, hunks: list, colour: bool) -> str:
+    """`[letter  ]path:ranges`, one file of an act as it prints once applied."""
+    text = _spans_text(hunks)
+    return ((_tint(f"{letter:<2}", _ANSI_DIM, colour) + " " if letter else "")
+            + _tint(path, _ANSI_BOLD, colour) + (f":{text}" if text else ""))
+
+
+def _path_by_ending(typed: str, resolved: str, entries: list[ChainEntry],
+                    project: pathlib.Path) -> str:
+    """The path a typed name stands for where it names no file this session
+    changed from the current directory: the one changed file whose path ends
+    with it, `SKILL.md` for `skills/chsum/SKILL.md`. Several such files stop
+    with each listed; none returns `resolved` as it was."""
+    tail = "/" + typed.strip().lstrip("./").rstrip("/")
+    touched = {path for e in entries if not e.action
+               for _, path, _ in _step_files(project, e)}
+    if resolved in touched or any(_under(t, resolved) for t in touched if resolved):
+        return resolved
+    hits = sorted(t for t in touched if ("/" + t).endswith(tail))
+    if len(hits) == 1:
+        print(f"{typed} → {hits[0]}", file=sys.stderr)
+        return hits[0]
+    if hits:
+        raise SystemExit(f"{typed} ends {len(hits)} paths this session changed; "
+                         "name one:\n" + "\n".join(f"  {h}" for h in hits))
+    return resolved
+
+
+@dataclass
+class _Act:
+    """What one undo or redo applies: per record, the letter its checkpoint
+    names ("" the whole step) and the paths applied under it."""
+    label: str
+    step: ChainEntry
+    records: list[tuple[str, list[str]]]
+    rows: list[str]  # printed once it is applied
+
+
+def _parse_target(values: list[str], project: pathlib.Path) -> tuple[str | None, str | None]:
+    """`(path, spec)` from what was typed: a step spec alone, or a path with a
+    spec after it. A spec has the shape `_STEP_SPEC_RE` matches."""
+    if len(values) > 2:
+        raise SystemExit("takes a path and a number at most: "
+                         "`chsum undo README.md 2`")
+    if len(values) == 1 and _STEP_SPEC_RE.match(values[0]):
+        return None, values[0]
+    if not values:
+        return None, None
+    return _repo_path(project, values[0]), (values[1] if len(values) == 2 else None)
+
+
+_DETAIL_INDENT = 4  # the diff under each heading sits in, so the headings stand out
+
+
+def _print_diffs(picked: list[tuple[str, ChainEntry, list[str]]], more: str,
+                 project: pathlib.Path, colour: bool, reverse: bool) -> None:
+    """Each `(heading, step, paths)` with its diff, newest first or last, and
+    the line `more` where older ones were left out."""
+    if more and reverse:
+        print(_tint(more, _ANSI_DIM, colour) + "\n")
+    for i, (label, step, paths) in enumerate(picked[::-1] if reverse else picked):
+        print(("\n" if i else "") + _tint(label, _ANSI_BOLD, colour))
+        print(render_step_diff(project, step, colour, paths, indent=_DETAIL_INDENT))
+    if more and not reverse:
+        print("\n" + _tint(more, _ANSI_DIM, colour))
+
+
+def _apply_acts(action: str, acts: list[_Act], project: pathlib.Path,
+                git_dir: pathlib.Path, session: str, colour: bool) -> int:
+    """Applies each act in order and records each of its records as a
+    checkpoint, stopping at the first that no longer applies. Returns the exit
+    code."""
+    done = "undid" if action == "undo" else "redid"
+    proceed, lock_fd = _hold_checkpoint_lock(git_dir)
+    if not proceed:
+        raise SystemExit("another checkpoint held the lock past "
+                         f"{int(checkpoints._LOCK_WAIT)}s; run it again")
+    stopped, unrecorded = "", 0
+    try:
+        # Edits made since the last checkpoint go on the chain as a step of their
+        # own first, so each checkpoint below holds one action's diff alone.
+        _write_checkpoint(project, git_dir, session)
+        for act in acts:
+            for part, paths in act.records:
+                applied, err = apply_step(project, act.step.sha,
+                                          reverse=action == "undo", paths=paths)
+                if not applied:
+                    sha = act.step.sha[:9]
+                    stopped = (f"{act.label} no longer applies: its lines have changed "
+                               f"since. Nothing of it was written; "
+                               f"`git diff {sha}^ {sha}` shows it.\n{err}")
+                    break
+                if not _write_checkpoint(project, git_dir, session, action=action,
+                                         step=act.step.when, part=part):
+                    unrecorded += 1
+            if stopped:
+                break
+            print(f"{_tint(done, _ANSI_WROTE, colour)} {act.label}")
+            for row in act.rows:
+                print(" " * (len(done) + 1) + row)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+    if unrecorded:
+        print(f"\n{_plural(unrecorded, 'change')} reached the files with no checkpoint "
+              "recording it, so the lists still show them where they were",
+              file=sys.stderr)
+    if stopped:
+        print(f"\n{stopped}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_undo(args) -> int:
     """Lists the steps of the running session, or with `N`, `N<letter>` or
     `N-M`, reverses them (`undo`) or re-applies them (`redo`) and records each
-    on the chain.
+    on the chain. A path first narrows both to the changes under it, numbered
+    1 the newest change there.
 
     A range runs in list order. For undo that is newest first, and for redo it
     is the most recently undone first: each order is the reverse of how the
@@ -7059,13 +7299,70 @@ def cmd_undo(args) -> int:
     placed, undone = _undo_stacks(entries, letters_of)
     colour = _colour_ok()
     listed = placed if action == "undo" else undone
-    if args.step is None:
+    only, spec = _parse_target(list(args.step or []), project)
+    other = "redo" if action == "undo" else "undo"
+    redo_verb = "re-applies" if action == "undo" else "reverses"
+
+    if only is not None:
+        changes = _changes_to(listed, only, project)
+        if not changes:
+            only = _path_by_ending(args.step[0], only, entries, project)
+            changes = _changes_to(listed, only, project)
+        if spec is None and not args.detail:
+            print(render_changes(action, changes, only, args.limit, colour, args.reverse))
+            return 0
+        if spec is None:
+            picked = changes[:args.limit] if args.limit else changes
+            if not picked:
+                print(render_changes(action, changes, only, args.limit, colour))
+                return 0
+            more = ("… older changes · `-n 0` shows them all"
+                    if len(picked) < len(changes) else "")
+        else:
+            first, last, part = _step_spec(spec, len(changes), action)
+            if part:
+                raise SystemExit(f"a path's changes are numbered without letters: "
+                                 f"`chsum {action} {only} {first}`")
+            picked, more = changes[first - 1:last], ""
+        if args.detail:
+            _print_diffs([(f"change {c.number} · {_hhmm(c.step.when)}", c.step,
+                           [p for _, p, _ in c.files]) for c in picked],
+                         more, project, colour, args.reverse)
+            return 0
+        acts = [_Act(f"change {c.number} to {only}", c.step,
+                     [(l if c.lettered else "", [p]) for l, p, _ in c.files],
+                     [_file_line("", p, h, colour) for _, p, h in c.files])
+                for c in picked]
+        rc = _apply_acts(action, acts, project, git_dir, path.stem, colour)
+        if rc == 0:
+            count = len(picked)
+            print(f"\n`chsum {other} {only} {'1' if count == 1 else f'1-{count}'}` "
+                  f"{redo_verb} {'it' if count == 1 else 'them'}")
+        return rc
+
+    if spec is None and not args.detail:
         print(render_steps(action, listed, entries[0] if entries else None,
-                           project, args.limit, colour))
+                           project, args.limit, colour, "", args.reverse))
         return 0
-    first, last, part = _step_spec(args.step, len(listed), action)
-    # Per step: the letters to act on, and the paths they letter.
-    work = []
+    if spec is None:
+        rows = [(n, step, side) for n, (step, side) in enumerate(listed, 1)]
+        picked_rows = rows[:args.limit] if args.limit else rows
+        if not picked_rows:
+            print(f"no steps {'in place' if action == 'undo' else 'undone'} in this session")
+            return 0
+        more = "… older steps · `-n 0` shows them all" if len(picked_rows) < len(rows) else ""
+        picked = []
+        for n, step, side in picked_rows:
+            files = _step_files(project, step)
+            mine = [(l, p) for l, p, _ in files if side is None or l in side]
+            label = "step " + (", ".join(f"{n}{l}" for l, _ in mine)
+                               if len(files) > 1 else str(n))
+            picked.append((label, step, [p for _, p in mine]))
+        _print_diffs(picked, more, project, colour, args.reverse)
+        return 0
+
+    first, last, part = _step_spec(spec, len(listed), action)
+    acts = []
     for n in range(first, last + 1):
         step, side = listed[n - 1]
         files = _step_files(project, step)
@@ -7075,55 +7372,20 @@ def cmd_undo(args) -> int:
                              + (", ".join(f"`{n}{l}`" for l in letters) if len(files) > 1
                                 else f"one file, so `{n}` alone names it"))
         chosen = [part] if part else letters
-        work.append((n, step, side if part == "" else {part},
-                     [p for l, p, _ in files if l in chosen]))
+        acts.append(_Act(f"step {n}{part}", step,
+                         [(part, [p for l, p, _ in files if l in chosen])],
+                         [_file_line(l if len(files) > 1 and not part else "", p, h, colour)
+                          for l, p, h in files if l in chosen]))
     if args.detail:
-        for i, (n, step, _side, paths) in enumerate(work):
-            print(("\n" if i else "") + _tint(f"step {n}{part}", _ANSI_BOLD, colour))
-            print(render_step_diff(project, step, colour, paths))
+        _print_diffs([(a.label, a.step, a.records[0][1]) for a in acts], "",
+                     project, colour, args.reverse)
         return 0
-    done = "undid" if action == "undo" else "redid"
-
-    proceed, lock_fd = _hold_checkpoint_lock(git_dir)
-    if not proceed:
-        raise SystemExit("another checkpoint held the lock past "
-                         f"{int(checkpoints._LOCK_WAIT)}s; run it again")
-    stopped, unrecorded = "", 0
-    try:
-        # Edits made since the last checkpoint go on the chain as a step of their
-        # own first, so each checkpoint below holds one step's diff alone.
-        _write_checkpoint(project, git_dir, path.stem)
-        for n, step, side, paths in work:
-            applied, err = apply_step(project, step.sha, reverse=action == "undo",
-                                      paths=paths)
-            if not applied:
-                stopped = (f"step {n}{part} no longer applies: its lines have changed "
-                           f"since. Nothing of it was written; "
-                           f"`git diff {step.sha[:9]}^ {step.sha[:9]}` shows it.\n{err}")
-                break
-            if not _write_checkpoint(project, git_dir, path.stem,
-                                     action=action, step=step.when, part=part):
-                unrecorded += 1
-            rows = _step_rows(n, step, side, project, colour)
-            print(f"{_tint(done, _ANSI_WROTE, colour)} {rows[0].lstrip()}")
-            for row in rows[1:]:
-                print(" " * (len(done) + 1) + row[2:])
-    finally:
-        if lock_fd is not None:
-            os.close(lock_fd)
-    if unrecorded:
-        print(f"\n{_plural(unrecorded, 'step')} changed the files with no checkpoint "
-              "recording it, so the lists still show them where they were",
-              file=sys.stderr)
-    if stopped:
-        print(f"\n{stopped}", file=sys.stderr)
-        return 1
-    other = "redo" if action == "undo" else "undo"
-    count = last - first + 1
-    print(f"\n`chsum {other} {'1' if count == 1 else f'1-{count}'}` "
-          f"{'re-applies' if action == 'undo' else 'reverses'} "
-          f"{'it' if count == 1 else 'them'}")
-    return 0
+    rc = _apply_acts(action, acts, project, git_dir, path.stem, colour)
+    if rc == 0:
+        count = last - first + 1
+        print(f"\n`chsum {other} {'1' if count == 1 else f'1-{count}'}` "
+              f"{redo_verb} {'it' if count == 1 else 'them'}")
+    return rc
 
 
 def cmd_hook(args) -> int:
@@ -8869,10 +9131,14 @@ def main(argv=None) -> int:
                         "step per tool call that changed the tree, read from the "
                         f"git checkpoints. With a number, {verb}s that step in the "
                         "working tree and records it on the checkpoint chain.")
-        p.add_argument("step", nargs="?", metavar="N|N-M",
-                       help=f"the step to {verb}, 1 the newest, or a range of them")
+        p.add_argument("step", nargs="*", metavar="[PATH] N|Na|N-M",
+                       help=f"the step to {verb}, 1 the newest; `Na` one file of "
+                            "it; `N-M` a range. A path first narrows to its own "
+                            "changes, numbered 1 the newest: `README.md 2`")
         p.add_argument("-n", "--limit", type=int, default=10, metavar="N",
                        help="how many to list, 0 for all (default: 10)")
+        p.add_argument("--reverse", action="store_true",
+                       help="print the steps listed oldest first, the newest last")
         p.add_argument("--detail", action="store_true",
                        help=f"print the full diff of the steps named, and {verb} "
                             "nothing")

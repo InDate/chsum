@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import pathlib
 import types
 import unittest
@@ -48,11 +49,13 @@ class UndoCase(RepoCase):
         self.checkpoint(SESSION, call)
 
     def run_cmd(self, action: str, step: str | None = None,
-                detail: bool = False) -> tuple[int, str]:
+                detail: bool = False, reverse: bool = False) -> tuple[int, str]:
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-            rc = core.cmd_undo(types.SimpleNamespace(action=action, step=step,
-                                                     limit=10, detail=detail))
+            rc = core.cmd_undo(types.SimpleNamespace(action=action,
+                                                     step=step.split() if step else [],
+                                                     limit=10, detail=detail,
+                                                     reverse=reverse))
         return rc, out.getvalue()
 
     def lines(self) -> list[str]:
@@ -235,6 +238,92 @@ class OneFileOfAStep(UndoCase):
         self.step("2", "two", "toolu_one")
         _, out = self.run_cmd("undo")
         self.assertIn("  1     f.txt:2", out)
+
+
+class OneFileSHistory(UndoCase):
+    """f.txt changed by three steps, the middle one also changing sub/g.txt.
+    The file view numbers f.txt's own changes: 1 is `c`, 2 `b`, 3 `a`."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write("sub/g.txt", "g\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "g")
+        self.step("2", "two", "toolu_a")
+        path = self.repo / "f.txt"
+        path.write_text(path.read_text().replace("4\n", "four\n"))
+        self.write("sub/g.txt", "G\n")
+        self.checkpoint(SESSION, "toolu_b")
+        self.step("6", "six", "toolu_c")
+        cwd = os.getcwd()
+        os.chdir(self.repo)
+        self.addCleanup(os.chdir, cwd)
+
+    def g(self) -> str:
+        return (self.repo / "sub/g.txt").read_text().strip()
+
+    def test_the_file_view_numbers_that_file_s_changes(self):
+        _, out = self.run_cmd("undo", "f.txt")
+        self.assertIn("3 changes to f.txt in place", out)
+        rows = [l.split()[0] for l in out.splitlines()[1:4]]
+        self.assertEqual(rows, ["1", "2", "3"])
+        self.assertIn(" 6", out.splitlines()[1])
+
+    def test_a_change_number_reverses_that_file_alone(self):
+        self.run_cmd("undo", "f.txt 2")
+        self.assertEqual(self.lines(), ["1", "two", "3", "4", "5", "six", "7", "8"])
+        self.assertEqual(self.g(), "G")
+
+    def test_redo_by_the_file_s_number_puts_it_back(self):
+        self.run_cmd("undo", "f.txt 2")
+        _, out = self.run_cmd("redo", "f.txt")
+        self.assertIn("1 change to f.txt undone", out)
+        self.run_cmd("redo", "f.txt 1")
+        self.assertEqual(self.lines(), ["1", "two", "3", "four", "5", "six", "7", "8"])
+
+    def test_a_range_of_a_file_s_changes(self):
+        self.run_cmd("undo", "f.txt 1-3")
+        self.assertEqual(self.lines(), ["1", "2", "3", "4", "5", "6", "7", "8"])
+        self.assertEqual(self.g(), "G")
+
+    def test_a_directory_takes_the_files_under_it(self):
+        _, out = self.run_cmd("undo", "sub")
+        self.assertIn("1 change to sub in place", out)
+        self.assertIn("sub/g.txt:1", out)
+
+    def test_a_name_finds_the_one_changed_path_ending_in_it(self):
+        os.chdir(self.repo / "sub")
+        _, out = self.run_cmd("undo", "g.txt")
+        self.assertIn("to sub/g.txt in place", out)
+
+    def test_a_letter_is_refused_in_the_file_view(self):
+        with self.assertRaises(SystemExit):
+            self.run_cmd("undo", "f.txt 1a")
+
+    def test_the_file_view_s_hint_names_no_whole_step_form(self):
+        _, out = self.run_cmd("undo", "f.txt")
+        hint = out.split("\n\n", 1)[1]
+        self.assertIn("chsum undo f.txt <n>", hint)
+        self.assertNotIn("<letter>", hint)
+
+    def test_detail_heads_each_change_and_indents_its_diff(self):
+        _, out = self.run_cmd("undo", "f.txt", detail=True)
+        lines = out.splitlines()
+        heads = [l for l in lines if l.startswith("change ")]
+        self.assertEqual([h.split(" · ")[0] for h in heads],
+                         ["change 1", "change 2", "change 3"])
+        self.assertIn("    ⎿ Updated f.txt", out)
+        self.assertNotIn("g.txt", out)
+
+    def test_reverse_puts_the_newest_last(self):
+        _, out = self.run_cmd("undo", "f.txt", detail=True, reverse=True)
+        heads = [l.split(" · ")[0] for l in out.splitlines() if l.startswith("change ")]
+        self.assertEqual(heads, ["change 3", "change 2", "change 1"])
+
+    def test_detail_alone_prints_every_step(self):
+        _, out = self.run_cmd("undo", detail=True)
+        heads = [l for l in out.splitlines() if l.startswith("step ")]
+        self.assertEqual(heads, ["step 1", "step 2a, 2b", "step 3"])
 
 
 class Refuses(UndoCase):
