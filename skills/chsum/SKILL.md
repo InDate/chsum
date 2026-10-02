@@ -17,6 +17,7 @@ one rule, below.
 | Command | For |
 |---|---|
 | `chsum` | This project's five most recent sessions, this one marked *in progress*. `-n 25`, `--since 7d`, `--all` |
+| `chsum here` | This session's `ch_` ref, its Claude Code session id and its title |
 | `chsum find "<query>"` | Find a session by content, and get its ref. `--lexical` for identifiers/filenames/errors |
 | `chsum digest --stdout` | This session's digest; its frontmatter carries this session's own `ch_` ref |
 | `chsum digest --messages --stdout` | Every message whole and every call clipped to a line between them, each locating its own record |
@@ -24,6 +25,8 @@ one rule, below.
 | `chsum digest --tools --stdout` | Every tool call in order, unfiltered |
 | `chsum digest --agents --stdout` | Every subagent this session ran and each report it sent back, numbered where one returned more than once |
 | `chsum digest --writes --stdout` | Every turn that changed the tree, each file with `+added −removed`, read from the git checkpoints |
+| `chsum digest --branches --stdout` | Every branch a rewind left in the session: where each diverges, its first and last prompt, and which one `claude --resume` continues |
+| `chsum digest <ref> --branches <n>` | Branch `n` copied into a session of its own; on a terminal it starts `claude --resume` there, piped it prints that command |
 | `chsum digest --call <id> --stdout` | One tool call whole, with its captured output |
 | `chsum digest -3 -1 --stdout` | A window of the user's turns, messages whole and calls a line each — `1` their first, `-1` their last, one number one turn, two a range; `--tools`/`--commands` take the same numbers and print their rows whole |
 | `chsum digest <parent-ref>/<agent-id> --stdout` | One subagent's own digest; `--messages` for everything it wrote and called |

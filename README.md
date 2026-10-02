@@ -41,6 +41,11 @@ from.
   → [`chsum digest`](#the-row-views)
 - **A subagent did the work and its report is buried.** — `--agents` prints each
   report; `<ref>/<agent-id>` addresses the agent's own digest. → [`chsum digest`](#the-row-views)
+- **You are inside a conversation and want its row in the listing.** — `! chsum
+  here` prints its `ch_` ref, its session id and its title.
+- **You rewound a conversation and want the path you left.** — `chsum digest
+  <ref> --branches` lists every branch; `--branches <n>` copies one into a session
+  of its own and resumes it there. → [`chsum digest`](#the-row-views)
 - **Something just worked and you want to find that moment later.** — `! chsum note
   "…"` files a note against the message you are on, or an earlier one by id or
   phrase. → [`chsum note`](#chsum-note)

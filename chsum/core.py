@@ -34,6 +34,7 @@ import textwrap
 import threading
 import time
 import urllib.parse
+import uuid as _uuid
 try:
     import fcntl
 except ImportError:  # Windows: the checkpoint runs unserialised, as it did before
@@ -859,6 +860,7 @@ class Meta:
     active: int = 0  # seconds of work, excluding idle gaps
     resumed: bool = False  # spans a long break, so `date` alone understates it
     agents: list[AgentRun] = field(default_factory=list)
+    branches: int = 1  # paths a rewind left, `_branches`' unit
     spawned: int = 0  # Agent tool calls seen in the parent, sidecar or not
     edited: list[str] = field(default_factory=list)
     read: list[str] = field(default_factory=list)
@@ -1326,6 +1328,8 @@ def _meta_from_transcript(path: pathlib.Path) -> Meta:
                 meta.turns += 1
             elif not rec.get("isCompactSummary") and _answered(rec):
                 meta.turns += 1  # a menu choice is a turn, as in `_your_turns`
+    if meta.source == sources.IN_PLACE:
+        meta.branches = max(1, len(_branches(path, recs)))
     # Yours wins over Claude Code's own later `ai-title` appends.
     named = load_names().get(meta.uuid, "")
     meta.renamed = bool(named)
@@ -1997,7 +2001,7 @@ def _md_ansi(text: str) -> str:
             # A quoted heading never reaches here (`_MD_QUOTE_RE` is checked
             # first and exclusively), so this can't be forged by transcript text.
             mine = rest.startswith(("You said", "Then you said", "You answered",
-                                    "What I asked for"))
+                                    "What I asked for", "Branch "))
             colour = "\033[1;33m" if rest == _MODEL_WRITTEN_HEADING else "\033[1m"
             depth = len(m.group(1))
             pad = "  " * max(0, depth - 1)
@@ -2320,6 +2324,25 @@ def _prompt_activity(path: pathlib.Path, only_agent: str = ""
     return out
 
 
+def _counts(prompts: int, files: int, agents: int) -> str:
+    """Prompts, files changed and subagents, joined the way every header line
+    states them; a zero subagent count is left out."""
+    out = [_plural(prompts, "prompt"), _plural(files, "file")]
+    if agents:
+        out.append(_plural(agents, "subagent"))
+    return " · ".join(out)
+
+
+def _meta_line(meta: Meta) -> str:
+    """Date, duration, counts, project and git branch on one italic line: the
+    digest's own header line, also printed under every view that names the
+    session whole."""
+    when = f"{meta.date} · {meta.duration}" if meta.duration else meta.date
+    counts = _counts(meta.prompts, len(meta.edited), meta.agent_count)
+    return (f"*{when} · {counts} · {meta.project_name}"
+            + (f" · `{meta.branch}`" if meta.branch else "") + "*\n")
+
+
 def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
                   path: pathlib.Path | None = None,
                   prompt_clip: int = 2000) -> str:
@@ -2334,12 +2357,7 @@ def render_digest(meta: Meta, ref: str, msgs: list[Message], *,
     # The ref and the counts sit here as well as in the frontmatter: a terminal
     # drops the frontmatter, and without them the document names no session.
     parts.append(f"`{ref}`\n")
-    when = f"{meta.date} · {meta.duration}" if meta.duration else meta.date
-    counts = [_plural(meta.prompts, "prompt"), _plural(len(meta.edited), "file")]
-    if meta.agent_count:
-        counts.append(_plural(meta.agent_count, "subagent"))
-    parts.append(f"*{when} · {' · '.join(counts)} · {meta.project_name}"
-                 + (f" · `{meta.branch}`" if meta.branch else "") + "*\n")
+    parts.append(_meta_line(meta))
 
     if meta.notes:
         # First, because someone chose these by hand — they outrank anything
@@ -4185,7 +4203,7 @@ def _print_table(heads: tuple[str, ...], rows: list[tuple[str, ...]],
 # one is never missing from the other.
 _VIEWS = {"": "digest", "messages": "messages view", "tools": "tools view",
           "commands": "commands view", "agents": "agents view",
-          "writes": "writes view",
+          "writes": "writes view", "branches": "branches view",
           "agent": "subagent digest", "call": "single call"}
 
 # A uuid holds hyphens of its own, so a suffix is matched at the end of the stem
@@ -4286,6 +4304,168 @@ def _deliver(args, md: str, uuid: str, suffix: str = "") -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Branches
+# ---------------------------------------------------------------------------
+# A rewind leaves the abandoned path in the transcript: the edited prompt is
+# written as a second child of the record the first one hangs off, and every
+# record after it names its own parent. Parallel tool calls also give a record
+# two children, so a branch is told apart by what was typed: each distinct
+# sequence of typed prompts from the root to a tip is one branch, and a
+# sequence that is a strict prefix of another is a dead end inside that branch.
+
+@dataclass
+class _Branch:
+    tip: dict  # the last record on the branch, by timestamp
+    chain: list[dict]  # root to tip, in parent order
+    prompts: list[dict]  # the typed prompts along `chain`
+    shared: int = 0  # leading prompts held in common with another branch
+
+
+def _branch_prompt(rec: dict, command_ids: frozenset[str]) -> bool:
+    return (rec.get("type") == "user" and not rec.get("toolUseResult")
+            and not rec.get("isCompactSummary")
+            and not _tool_injected(rec, command_ids)
+            and is_typed_prompt(_typed_text(rec)))
+
+
+def _branches(path: pathlib.Path, records: list[dict] | None = None) -> list[_Branch]:
+    """Every branch of one transcript, ordered by the time each one diverges.
+    A compaction boundary carries its parent as `logicalParentUuid`, which is
+    followed so a branch reaches back past it to the session's first record.
+    `records` takes a parse already held, which spares a second read."""
+    recs = [r for r in (records if records is not None else _records(path))
+            if r.get("uuid")]
+    by_id = {r["uuid"]: r for r in recs}
+    up = {r["uuid"]: r.get("parentUuid") or r.get("logicalParentUuid") for r in recs}
+    command_ids = _command_prompt_ids(recs)
+    parents = set(up.values())
+    best: dict[tuple[str, ...], _Branch] = {}
+    for leaf in (u for u in by_id if u not in parents):
+        chain, at, seen = [], leaf, set()
+        while at in by_id and at not in seen:
+            seen.add(at)
+            chain.append(by_id[at])
+            at = up[at]
+        chain.reverse()
+        prompts = [r for r in chain if _branch_prompt(r, command_ids)]
+        key = tuple(r["uuid"] for r in prompts)
+        tip = chain[-1]
+        held = best.get(key)
+        if held is None or str(tip.get("timestamp") or "") > str(held.tip.get("timestamp") or ""):
+            best[key] = _Branch(tip, chain, prompts)
+    keys = [k for k in best
+            if not any(len(o) > len(k) and o[:len(k)] == k for o in best)]
+    out = [best[k] for k in keys]
+    for b in out:
+        mine = [r["uuid"] for r in b.prompts]
+        for o in out:
+            if o is b:
+                continue
+            n = 0
+            for x, y in zip(mine, (r["uuid"] for r in o.prompts)):
+                if x != y:
+                    break
+                n += 1
+            b.shared = max(b.shared, n)
+
+    def diverges(b: _Branch) -> str:
+        at = b.prompts[b.shared] if b.shared < len(b.prompts) else b.tip
+        return str(at.get("timestamp") or "")
+    out.sort(key=diverges)
+    TRACE.step("_branches", records=len(recs), branches=len(out))
+    return out
+
+
+def _branch_count(n: int) -> str:
+    return f"{n} branch" + ("" if n == 1 else "es")
+
+
+def _resumed_branch(branches: list[_Branch]) -> int:
+    """Index of the branch `claude --resume` continues: the one whose tip was
+    written last."""
+    return max(range(len(branches)),
+               key=lambda i: str(branches[i].tip.get("timestamp") or ""))
+
+
+def _branch_line(b: _Branch) -> str:
+    """Clock span, active duration and counts over the records a branch holds
+    past the point it diverges, in the shape `_meta_line` gives a session."""
+    own = b.prompts[b.shared:]
+    first = b.chain.index(own[0]) if own else len(b.chain) - 1
+    stamps, edited, read, cmds = [], [], [], []
+    agents = calls = 0
+    for rec in b.chain[first:]:
+        if rec.get("timestamp"):
+            stamps.append(str(rec["timestamp"]))
+        if rec.get("type") == "assistant":
+            agents += _collect_tools(rec, edited, read, cmds)
+            calls += len(_tool_lines(rec))
+    start, end = _hhmm(stamps[0]), _hhmm(stamps[-1])
+    bits = [start if start == end else f"{start}–{end}"]
+    secs = active_seconds(sorted(stamps))
+    if secs:
+        bits.append(_fmt_secs(secs))
+    bits.append(_counts(len(own), len(set(edited)), agents))
+    if calls:
+        bits.append(_plural(calls, "tool call"))
+    return " · ".join(bits)
+
+
+def render_branches(meta: Meta, ref: str, branches: list[_Branch]) -> str:
+    """Each branch grouped under the prompt the group leaves the conversation
+    after: its stats line, then its first and last prompt quoted. The `Branch`
+    heading colours the quotes beneath it as typed, as `You said` does."""
+    out = [f"# Branches — {_branch_count(len(branches))}, by where each diverges\n",
+           f"*{meta.title}*\n", _meta_line(meta)]
+    if len(branches) < 2:
+        out.append("*No rewinds: the conversation runs as one branch.*\n")
+        return "\n".join(out)
+    live = _resumed_branch(branches)
+    forks = len({b.shared for b in branches})
+    out.append(f"*{_plural(forks, 'rewind point')}; `claude --resume` opens "
+               f"branch {live + 1}.*\n")
+    out.append(f"*Continue a branch: `chsum digest {ref} --branches <n>` copies it "
+               "into a session of its own and resumes it.*\n")
+    shared = None
+    for i, b in enumerate(branches):
+        own = b.prompts[b.shared:]
+        if b.shared != shared:
+            shared = b.shared
+            out.append(f"## After prompt {shared}\n" if shared else "## From the start\n")
+        out.append(f"### Branch {i + 1}" + (" · resumed by default" if i == live else "") + "\n")
+        out.append(f"*{_branch_line(b)}*\n")
+        if own:
+            out.append(_quote(_clip_line(_typed_text(own[0]), 240)) + "\n")
+        if len(own) > 2:
+            out.append(f"*{_plural(len(own) - 2, 'prompt')} between*\n")
+        if len(own) > 1:
+            out.append(_quote(_clip_line(_typed_text(own[-1]), 240)) + "\n")
+    return "\n".join(out)
+
+
+def _branch_session(path: pathlib.Path, branch: _Branch, number: int,
+                    title: str) -> tuple[pathlib.Path, bool]:
+    """The branch's chain written as a session of its own, beside the source,
+    in the shape a `/branch` copy takes: every row kept, `sessionId` rewritten.
+    The id derives from the source and the tip, so asking again returns the
+    file already written, along with any turns taken in it since. Returns the
+    file and whether this call wrote it."""
+    sid = str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"chsum-branch/{path.stem}/{branch.tip['uuid']}"))
+    dest = path.parent / f"{sid}.jsonl"
+    if dest.exists():
+        return dest, False
+    with dest.open("w", encoding="utf-8") as fh:
+        for rec in branch.chain:
+            row = dict(rec)
+            for key in ("sessionId", "session_id"):
+                if key in row:
+                    row[key] = sid
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    append_ai_title(dest, f"{title} · branch {number}")
+    return dest, True
+
+
 def cmd_digest(args) -> int:
     if args.list:
         if args.spec or args.file or args.last:
@@ -4298,6 +4478,7 @@ def cmd_digest(args) -> int:
     picked += ["--agents"] if args.agents is not None else []
     picked += ["--writes"] if getattr(args, "writes", False) else []
     picked += ["--call"] if args.call else []
+    picked += ["--branches"] if args.branches is not None else []
     if len(picked) > 1:
         raise SystemExit(f"one view at a time: {' '.join(picked)}")
     if args.call and _split_spec(list(args.spec))[1]:
@@ -4309,6 +4490,11 @@ def cmd_digest(args) -> int:
     # reached for; a flag beside them picks a different one.
     if span and not view:
         view = "messages"
+    if args.branches is not None:
+        if span:
+            raise SystemExit("--branches covers the whole conversation and takes "
+                             "no turn numbers")
+        return _digest_branches(args, path, ref)
     if getattr(args, "writes", False):
         meta = extract_meta(path)
         return _deliver(args, render_writes(meta, ref, path),
@@ -4351,6 +4537,37 @@ def cmd_digest(args) -> int:
     meta, md = _digest_for(ref)
     _, agent_id = _split_agent_ref(ref)
     return _deliver(args, md, meta.uuid, _view_suffix("agent", agent_id) if agent_id else "")
+
+
+def _digest_branches(args, path: pathlib.Path, ref: str) -> int:
+    """The branch list, or with a number, that branch copied out and resumed."""
+    if sources.source_of(path, CHSUM_DIR) != sources.IN_PLACE:
+        raise SystemExit("--branches reads Claude Code's parent links, which "
+                         "this transcript's format does not carry")
+    meta = extract_meta(path)
+    branches = _branches(path)
+    if not args.branches:
+        return _deliver(args, render_branches(meta, ref, branches),
+                        meta.uuid, _view_suffix("branches"))
+    n = args.branches
+    if not 1 <= n <= len(branches):
+        raise SystemExit(f"{ref} has {_branch_count(len(branches))}: "
+                         f"--branches takes 1 to {len(branches)}")
+    dest, wrote = _branch_session(path, branches[n - 1], n, meta.title)
+    cwd = str(branches[n - 1].tip.get("cwd") or "")
+    resume = f"claude --resume {dest.stem}"
+    print(f"{'wrote' if wrote else 'already written:'} branch {n} as {dest}",
+          file=sys.stderr)
+    # A terminal on both ends runs the resume in place; piped or captured, the
+    # command goes to stdout for the caller to run.
+    claude = shutil.which("claude")
+    if sys.stdin.isatty() and sys.stdout.isatty() and claude:
+        if cwd and pathlib.Path(cwd).is_dir():
+            os.chdir(cwd)
+        sys.stdout.flush()
+        os.execv(claude, ["claude", "--resume", dest.stem])
+    print(f"cd {shlex.quote(cwd)} && {resume}" if cwd else resume)
+    return 0
 
 
 def live_transcript() -> pathlib.Path:
@@ -4849,6 +5066,18 @@ def _name_target(args) -> pathlib.Path:
             raise SystemExit(f"no such transcript: {path}")
         return path
     return path_for_ref(args.ref) if args.ref else live_transcript()
+
+
+def cmd_here(args) -> int:
+    """This conversation's ref, its Claude Code session id and its title: the
+    ref matches the row in `chsum`'s listing, and the id matches what `/status`
+    and `claude --resume` show, so either one finds this conversation."""
+    path = live_transcript()
+    meta = extract_meta(path)
+    print(ch_ref_for_path(path))
+    print(f"  session  {path.stem}")
+    print(f"  title    {meta.title or '(untitled)'}")
+    return 0
 
 
 def cmd_name(args) -> int:
@@ -7070,8 +7299,18 @@ def _recap_cell(m: Meta) -> str:
 # The columns every session list prints, in one order: `chsum` and the typed
 # picker. Duration alone doesn't say which session was real
 # work, and `recap` says whether a bare `recap` has anything left to cover.
-SESSION_HEADS = ("when", "dur", "prompts", "files", "agents", "notes", "digest",
-                 "recap", "")
+SESSION_HEADS = ("when", "dur", "prompts", "files", "agents", "branches", "notes",
+                 "digest", "recap", "")
+
+
+def _session_cells(m: Meta, out: pathlib.Path = DIGEST_DIR) -> tuple[str, ...]:
+    """The cells between `when` and the title, in `SESSION_HEADS` order, for
+    both lists that print them."""
+    return (m.duration or "-", str(m.prompts), str(len(m.edited)),
+            str(m.agent_count) if m.agent_count else "-",
+            str(m.branches) if m.branches > 1 else "-",
+            f"⚑{len(m.notes)}" if m.notes else "-", _digest_cell(m, out),
+            _recap_cell(m))
 
 
 def _session_row(p: pathlib.Path, when=_local_when) -> tuple[str, ...]:
@@ -7083,10 +7322,7 @@ def _session_row(p: pathlib.Path, when=_local_when) -> tuple[str, ...]:
     except OSError:
         mtime = 0.0
     title = ("✎ " if m.renamed else "") + (m.title or "(untitled)")
-    return (when(last_activity(p), mtime), m.duration or "-", str(m.prompts),
-            str(len(m.edited)), str(m.agent_count) if m.agent_count else "-",
-            f"⚑{len(m.notes)}" if m.notes else "-", _digest_cell(m),
-            _recap_cell(m), title)
+    return (when(last_activity(p), mtime), *_session_cells(m), title)
 
 
 def _pick_transcript(live_only: bool = True) -> pathlib.Path:
@@ -7803,13 +8039,7 @@ def cmd_sessions(args) -> int:
             delegated.append(f"…and {m.agent_count - len(delegated)} more")
         by_day[(m.ended or m.started or "")[:10] or "undated"].append((
             ch_ref_for_path(m.path),
-            m.duration or "-",
-            str(m.prompts),
-            str(len(m.edited)),
-            str(m.agent_count) if m.agent_count else "-",
-            f"⚑{len(m.notes)}" if m.notes else "-",
-            _digest_cell(m, args.out),
-            _recap_cell(m),
+            *_session_cells(m, args.out),
             *((sources.label_of(m.source),) if mixed else ()),
             *((m.project_name or "-",) if args.all else ()),
             # Marked, because provenance differs: one is Claude Code's reading of
@@ -8244,6 +8474,10 @@ def main(argv=None) -> int:
                    help="one tool's sessions (default: every tool's)")
     p.set_defaults(func=cmd_sessions)
 
+    p = sub.add_parser("here", parents=[dbg],
+                       help="this conversation's ref, session id and title")
+    p.set_defaults(func=cmd_here)
+
     p = sub.add_parser(
         "where", parents=[dbg],
         help="a locator like `01a0acf9:31` to the command that prints that row",
@@ -8343,6 +8577,11 @@ def main(argv=None) -> int:
                    help="every subagent and each report it sent back")
     p.add_argument("--call", metavar="ID",
                    help="one tool call whole, with its output")
+    p.add_argument("--branches", nargs="?", type=int, const=0, default=None,
+                   metavar="N",
+                   help="every branch a rewind left in the conversation; "
+                        "with N, branch N copied into a session of its own "
+                        "and resumed there (piped: the command that resumes it)")
     p.add_argument("--list", action="store_true",
                    help="this project's digest files, newest first (--all: every project)")
     p.set_defaults(func=cmd_digest)

@@ -22,7 +22,7 @@ class ViewFilenames(unittest.TestCase):
 
     CASES = [("", ""), ("messages", ""), ("tools", ""), ("commands", ""),
              ("agents", ""), ("call", "call_KABn4"), ("agent", "a9f0f78b"),
-             ("writes", "")]
+             ("writes", ""), ("branches", "")]
 
     def test_every_view_round_trips(self):
         uuid = "01a0acf9-4ee4-7290-a500-2dd0d1a5c046"
