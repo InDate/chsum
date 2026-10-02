@@ -1,14 +1,12 @@
-# Naming a session
+# Naming
 
-Rename a session with `chsum name "<title>"`. The title is argv, quoted
-verbatim, and lands in chsum's store plus one `ai-title` record in the
-transcript, so it shows in every chsum view (flagged `✎`) and in `/resume`.
+`chsum name "<title>"` stores the title verbatim in chsum and appends an
+`ai-title` record, so it shows in chsum (marked `✎`) and in `/resume`.
 
-- `chsum name <ch_ref> "<title>"` — rename a past session rather than this one.
-- `chsum name --list` — this project's renamed sessions; `--all` every project.
-- `chsum name --clear` — back to Claude Code's own title.
-- `chsum name --no-resume` — rename in chsum only, leaving the transcript and
-  `/resume` untouched.
+- `chsum name <ch_ref> "<title>"` — a past session
+- `--list` — this project's renamed sessions; `--all` every project
+- `--clear` — back to Claude Code's title
+- `--no-resume` — chsum only, transcript untouched
 
-Claude Code re-titles the running session as the conversation grows, so
-`/resume` may drift back to its own title even though chsum keeps the user's.
+Claude Code re-titles a running session as it grows, so `/resume` can show its
+own title again; chsum keeps the user's.

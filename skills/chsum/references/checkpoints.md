@@ -1,65 +1,45 @@
 # Git checkpoints
 
-The chain behind `chsum digest --writes` and the `±` marks: its shape, how a row
-reaches the commit and the diff, retention, and the per-project opt-in.
-
 ## The chain
 
-A checkpoint commits per tool call that changed the tree, chained under
-`refs/chsum/<session-uuid>`. `commit-tree` builds the object and `update-ref`
-publishes it, so `HEAD`, the index and the working tree are never written: a
-checkpoint never becomes a branch tip, the user's commit hooks never fire, and
-`git log` and `git status` show none of it. A ref is a gc root, so a chain
-outlives a `git gc`, the reflog expiring, and the removal of the worktree it was
-written in.
+One commit per tool call that changed the tree, chained under
+`refs/chsum/<session-uuid>`; a subagent chains under its parent's uuid.
+`commit-tree` and `update-ref` write it, so `HEAD`, the index, the working tree
+and commit hooks are untouched, and `git log` and `git status` show nothing. The
+ref survives `gc`, reflog expiry and worktree removal.
 
-A subagent's calls chain under the parent session's uuid — one chain per
-session, sidecars included.
+A session and its agents share one tree and one ref, so a change lands in the
+checkpoint of whichever call's hook commits next. Counts hold; attribution can
+be off by a neighbouring call.
 
-## Tracing one change into git
+## A row to its diff
 
-Every row in `--messages`, `--tools` and `--commands` opens with the call id
-(`01B4FF2EPx`), and each checkpoint commit closes its subject with that id as
-`toolu_<id>`. That is the bridge from a row to the diff:
+Rows in `--messages`, `--tools` and `--commands` open with a call id; the
+checkpoint that call wrote ends its subject with `toolu_<id>`.
 
 ```sh
 git log --format='%H %s' $(git for-each-ref --format='%(refname)' refs/chsum/) | grep <call-id>
-git show <sha>                     # what that call changed — its parent is the checkpoint before it
-git diff <first-sha>^ <last-sha>   # a span: a turn's first and last write, or an agent's
+git show <sha>                     # that call's change
+git diff <first-sha>^ <last-sha>   # a span: a turn, or an agent's work
 ```
 
-`git for-each-ref refs/chsum/` alone lists the chains with the session uuid each
-one carries, matching the uuid in a digest's frontmatter and the short form in
-every row locator. A call that changed nothing committed no checkpoint and has
-no sha to find.
+A call that changed nothing has no checkpoint.
 
 ## Undo and redo
 
-`chsum undo <n>` applies a step's diff reversed and `chsum redo <n>` applies it
-again, each through `git apply`, which writes every file of the step or none.
-Each writes a checkpoint of its own whose subject ends `undo <step-stamp>` or
-`redo <step-stamp>` in place of a call id, with `/<letter>` where it acted on
-one file of the step, so the chain alone holds which steps and files are
-undone: both lists are replayed from it. A step's files are lettered in the
-order `git diff` lists them, which is the same on every read. The step is named by its stamp,
-which `--migrate` carries over where a sha changes.
+`chsum undo` applies a step's diff reversed through `git apply`, which writes
+every file of the step or none, then commits a checkpoint whose subject ends
+`undo <step-stamp>`, or `undo <step-stamp>/<letter>` for one file. `chsum redo`
+does the same forward. Both lists are rebuilt from these subjects.
 
 ## Retention
 
-`chsum checkpoints` lists the chains a repo holds, with a count and a date each.
-`--prune 7d` drops chains whose last checkpoint is older than that, leaving the
-transcripts untouched and the commits unreachable for the next `gc`. `--migrate`
-rebuilds pre-chain checkpoints out of `HEAD`'s reflog, which makes them survive
-a gc; a SessionStart hook raises this where a project holds reflog-only ones.
+`chsum checkpoints` lists the chains. `--prune 7d` drops chains older than that,
+leaving transcripts alone. `--migrate` moves pre-chain checkpoints out of the
+reflog onto chains, so `gc` keeps them.
 
 ## The opt-in
 
-The PostToolUse hook (`chsum hook post-tool-use`) ships installed and inert:
-nothing is committed until a project opts in. Where `.git/chsum-checkpoint` is
-absent, a SessionStart hook injects the ask, carrying the mechanism and the
-wording — follow that message when it arrives, ask the user once, and write
-`enabled` or `declined` into the gate file based on their answer.
-
-To change a decision already made, edit `.git/chsum-checkpoint` directly — write
-`enabled` or `declined` to flip it, or delete the file to get the ask again next
-session.
+The hook records nothing until `.git/chsum-checkpoint` reads `enabled`. Where
+the file is absent, a SessionStart message carries the ask: ask the user once
+and write `enabled` or `declined`. Edit or delete the file to change the answer.
