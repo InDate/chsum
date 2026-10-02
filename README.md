@@ -1,27 +1,65 @@
 # Chat Summary (chsum)
 
-A new coding-agent session starts with none of the last one. chsum picks up
-where you left off, with deterministic digests of earlier sessions: copied and
-computed from the transcript, never summarised by a model.
+Pick up from where you left off with deterministic summaries of previous
+sessions. Replay the last 10 messages, or a range of specific messages between
+you and the agent, or get a digest of everything you typed with the tools used
+and files changed. This rehydrates context surgically.
 
-- **Replay part of a conversation.** Your last ten turns with the agent, or any
-  range of them, word for word: `chsum digest --last --messages -10 -1`.
-- **Digest a whole session.** Everything you typed, with the tools used and the
-  files changed: `chsum digest --last`.
+```sh
+chsum digest --last                       # everything you typed, tools used, files changed
+chsum digest --last --messages -10 -1     # the last 10 messages
+chsum digest --last --messages 3 10       # a range of them
+```
 
-Context comes back in the pieces you choose, not as a compacted summary. One
-way to work with it: turn off auto-compact, use the whole context window, and
-start the next session with `chsum digest --last`.
+I've turned off auto-compact and use all my context tokens, knowing I can start
+the next session with one command: `chsum digest --last`.
 
 chsum also:
 
-- **Undoes a change from this session**, one file at a time if needed, whether
-  an Edit or a `sed -i` made it. Needs checkpointing on.
-- **Finds the path a rewind left.** `chsum digest --branches` lists the earlier
-  paths, and `--branches <n>` resumes one as its own session.
-- **Shows what a subagent is doing** before its report arrives.
+- **Undo a change inside a session**, one change at a time, no matter the tool
+  used to change the file. To use it: when chsum is first loaded into a
+  git-enabled repo, the agent asks if you want checkpointing enabled. See the
+  [implementation details](#checkpoints-and-undo) below.
+- **Load back an abandoned path.** Started a session, then rewound to a
+  specific spot to continue along another path? chsum makes it easy to load
+  back the other, "abandoned" path with `chsum digest --branches`. See the
+  [implementation details](#branches) on how this works.
+- **See what a subagent is doing** before its report arrives. A session
+  launches an agent and cannot get its details without overloading its own
+  context. chsum works around that by sharing condensed updates of the files
+  being edited, with just the short prose an agent normally outputs between
+  them. The session can easily see whether the agent has sidetracked, and give
+  clear nudges to correct it, or stop it. See the
+  [implementation details](#subagents) for how this works.
+- **Mark a moment to get back to.** Something interesting happened during a
+  session and you want to get back to it easily? Use `chsum mark "<reason>"`
+  inside the conversation, and the previous reply is included in the digests.
+  See the [implementation details](#marks) for how this works.
 
 It reads Claude Code and Codex CLI sessions alike.
+
+Run `chsum` to list this project's sessions:
+
+```
+Sessions — chsum
+5 sessions · 1 with no activity
+
+Fri 02 Oct 2026                        dur    prompts  files  agents  branches  notes  digest  recap
+  ch_92e5397d588f409d6ca4b843317d4f97  2h37m  57       8      -       3         -      -       -
+    ↳ Commit staged changes
+  ch_34fa3ce4453202d47be9c173100427ef  1h00m  11       1      -       2         -      -       -
+    ↳ Fitness landscape digest --branches feature
+
+Fri 25 Sep 2026
+  ch_c4e516f02a4084eb9e1daf3bc2b1ab85  1h10m  19       3      -       2         -      -       -
+    ↳ Chsum digest output formatting
+  ch_f111160d4a5e2b477d689babcba77d35  1m     1        0      -       -         -      -       -
+    ↳ Bench screenshots during recording
+  ch_3f91d2af6f621b4b61790a280fafb5e3  1s     0        0      -       -         -      -       -
+    ↳ (untitled)
+
+Read one: `chsum digest <ref> --stdout`   Most recent real session: `chsum digest --last --stdout`
+```
 
 ## What to run
 
@@ -112,12 +150,12 @@ name a run, both ends included. The header states what they resolved to:
 The project's sessions, newest activity first:
 
 ```
-Thu 06 Aug 2026                        dur    prompts  files  agents  notes  digest   recap
-  ch_c120431a267b202aebf0b38f6c3c1b69  5h38m  78       14     -       ⚑2     current  3/12 · 2h ago
+Thu 06 Aug 2026                        dur    prompts  files  agents  branches  notes  digest   recap
+  ch_c120431a267b202aebf0b38f6c3c1b69  5h38m  78       14     -       -         ⚑2     current  3/12 · 2h ago
     ↳ Plan the import pipeline from the sample files
 
 Wed 05 Aug 2026
-  ch_da4e99d42e5efab11ebdedc22fb65145  3h03m  30       12     2       -      stale    -
+  ch_da4e99d42e5efab11ebdedc22fb65145  3h03m  30       12     2       2         -      stale    -
     ↳ Set up the dev server
       a43c4ff4401ca693e  Quieten the test suite
       a81d77b6cba4a46b3  Fix the retry backoff
@@ -133,6 +171,8 @@ chsum --all           # every project, with a project column
 - **Dead ends are listed**, since "that went nowhere" is often the answer. The
   header counts them: one prompt, no files, no agents.
 - **Subagents are named**, with the id `chsum digest <ref>/<id>` takes.
+- **`branches`** counts the paths a rewind left; `chsum digest <ref> --branches`
+  lists them.
 - **`digest`** is `current`, `stale` (the transcript has grown since) or `-`.
 - **`recap`** is turns recapped over turns there are, and when.
 - **`✎`** marks a title you gave with `chsum name`.
@@ -519,24 +559,6 @@ reproduce
 --- end chsum debug ---
 ```
 
-## Notes on correctness
-
-Measured, not assumed:
-
-- **Duration excludes idle time.** Gaps over 30 minutes count as walked away;
-  wall-clock time put one session at 92 hours.
-- **Most "user" records are not you.** Tool results, interrupts and harness
-  text are filtered out; `prompts` counts what you typed, and a `!` run is not a
-  prompt.
-- **An API error is not a reply.** "Prompt is too long" is reported as how the
-  session stopped.
-- **An agent's last message is not its conclusion**, so it is labelled *Last
-  thing it said*.
-- **Agent counts take the larger** of the calls in the parent and the sidecars
-  on disk; either can undercount.
-- **Scratch paths** (`/tmp`, scratchpads, plan files) are left out of files
-  changed.
-
 ## Prose, and where it's allowed
 
 `recap`'s timeline is the one model-written output, through `claude -p --model
@@ -544,7 +566,9 @@ haiku` with your existing Claude Code login. Any summariser gets the extracted
 material only, and its output sits beneath the verbatim record so each sentence
 can be checked against it.
 
-## How it works
+## Implementation details
+
+### Transcripts and digests
 
 Claude Code writes every session to disk as a transcript, one record per line:
 each message, each tool call and its result, and a link from each record to the
@@ -560,11 +584,15 @@ themselves. Nothing is generated along the way, so every line in the output
 points back to a line in a transcript, and the locators printed beside each row
 are those line numbers.
 
+### Branches
+
 A rewind leaves the earlier path in place: the edited prompt is written as a
 second record hanging off the same parent. Following the parent links from
 each record that nothing points back to traces every path through the
 conversation, and paths that share their typed prompts up to a point are
 grouped where they part. That grouping is the branch list.
+
+### Checkpoints and undo
 
 Checkpoints come from a hook that runs after each tool call. Where the working
 tree differs from the last checkpoint, the hook records the tree as a git
@@ -579,6 +607,26 @@ rebuilt from the chain alone. Git applies a change to every file or to none,
 so a change whose lines were edited since is refused and the files stay as
 they were.
 
-Notes, session names and recap bullets live in chsum's own data directory,
-filed by the turn they belong to. The one write chsum makes to a transcript
-is the title record a rename appends.
+### Subagents
+
+A subagent writes its own transcript beside its parent's as it works, one record
+at a time, so its progress is on disk before its report exists. chsum reads that
+file directly. Each message the agent writes prints whole, and each tool call it
+makes prints as a single line naming the tool and the file or command, so the
+output grows with what the agent said rather than with the size of its edits
+and command output. The parent session reads that progress when it runs the
+command, and nothing reaches its context between runs.
+
+### Marks
+
+A mark is stored in chsum's own data directory, not in the transcript. When
+`chsum mark` runs, it finds the newest message before the command in the
+running session's transcript and records the reason beside that message's
+location and its first line, filed under the turn it belongs to. A digest reads
+these records for its session and prints each one under **Notable**, ahead of
+everything else, with the message it points at quoted beneath it.
+
+### Names
+
+Session names and recap bullets live in the same data directory. The one write
+chsum makes to a transcript is the title record a rename appends.
