@@ -46,6 +46,11 @@ from.
 - **You rewound a conversation and want the path you left.** — `chsum digest
   <ref> --branches` lists every branch; `--branches <n>` copies one into a session
   of its own and resumes it there. → [`chsum digest`](#the-row-views)
+- **A tool call changed a file and you want that change gone.** — `! chsum undo`
+  lists this session's steps, one per tool call that changed the tree, newest
+  first; `chsum undo <n>` reverses step n, `<n>-<m>` a range, and `--detail`
+  prints a step's diff first. `chsum redo` lists what was undone and re-applies
+  it the same way. → [`chsum undo`](#chsum-undo-and-chsum-redo)
 - **Something just worked and you want to find that moment later.** — `! chsum note
   "…"` files a note against the message you are on, or an earlier one by id or
   phrase. → [`chsum note`](#chsum-note)
@@ -676,6 +681,59 @@ git reflog --format='%gs' | grep chsum-checkpoint | head -1 |
 
 A bare id works too — `chsum where toolu_01V7rDx5Le` searches this project, then
 every project. Naming the session beside it reads that one file directly.
+
+## `chsum undo` and `chsum redo`
+
+A step is one tool call's change to the tree: the checkpoint the hook wrote for
+it. `chsum undo` lists this session's steps still in place, newest first, each
+as the files it changed and the lines it wrote there:
+
+```
+$ chsum undo
+14 steps in place, newest first
+  1  chsum/core.py:6843, 6911
+  2  chsum/checkpoints.py:623-626, 634
+  3  skills/chsum/SKILL.md:33-34 · README.md:49-52
+  …
+```
+
+The line numbers are the file's as that step left it. A step holding only
+removals reads `removed after <line>`.
+
+```sh
+chsum undo 1            # reverse the newest step; run it again for the one before
+chsum undo 1-3          # the three newest, newest first
+chsum undo 2 --detail   # the step's full diff, each line under its number; nothing changes
+chsum redo              # the steps undone, most recently undone first
+chsum redo 1-2          # re-apply the two most recently undone
+```
+
+A range runs in list order, which for both commands is the reverse of how the
+steps came to be. Steps over the same lines apply in that order and no other.
+
+**Each undo and redo is a checkpoint on the chain.** Its subject carries the
+action and the stamp of the step it names, `… @ <time> undo <step-stamp>`, and
+both lists are replayed from the chain alone. Run with `!`, the command writes
+that checkpoint itself, since no hook fires for it. Run as a tool call, the
+hook that follows finds the tree equal to the tip and writes nothing more.
+
+**A step that no longer applies changes nothing.** `git apply` writes every file
+of a step or none. The diff carries one line of context, so a later edit on a
+line next to the step's blocks it, and one two lines away does not. A range
+stops at the first step that fails, keeps the steps before it, and exits 1.
+
+**Edits since the last checkpoint become a step first.** An edit of your own,
+made outside a tool call, lands on the chain as its own step before the undo
+applies, so the undo's checkpoint holds the undo's diff alone. The step number
+typed names the step as listed before that edit was recorded.
+
+**The oldest step is measured against the commit the session started from.** Its
+diff therefore holds any edits uncommitted at that point, and the list says so
+beside it.
+
+Both commands need checkpointing on (`chsum checkpoints --enable`), and act on
+the running session only: a past session's chain ends where it stopped, and
+recording against it would file every change since as one step of that session.
 
 ## `chsum find`
 

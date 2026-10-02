@@ -45,7 +45,8 @@ from datetime import datetime, timezone
 
 from . import checkpoints, sources
 from .checkpoints import (  # the git layer: one commit per call that wrote
-    GATE_NAME, LOCK_NAME, STATE_NAME, _base_of, _chain_shas, _checkpoint_diff_files,
+    GATE_NAME, LOCK_NAME, STATE_NAME, ChainEntry, _base_of, _chain_shas,
+    _checkpoint_diff_files, apply_step, chain_entries, checkpoint_hunks,
     _checkpoint_numstat, _checkpoint_refs, _checkpoint_shas, _commit_subject,
     _enabled, _git, _git_dir, _head_sha, _hold_checkpoint_lock, _migrate_chain,
     _ref_tip, _self_heal, _tree_of, _write_checkpoint, checkpoint_ref)
@@ -4012,11 +4013,15 @@ def render_writes(meta: Meta, ref: str, path: pathlib.Path) -> str:
     the turn changed."""
     project = meta.project
     marks = _checkpoint_shas(pathlib.Path(project), path.stem) if project else []
-    turns = _turn_of_call(path)
-    # Checkpoints grouped by the turn whose call committed them, in order.
+    turns, opened_at = _turns_of(path)
+    stamps = [when for when, _, _ in opened_at]
+    # Checkpoints grouped by the turn whose call committed them, in order. One
+    # with no call in the transcript — an undo or redo, which `chsum` wrote
+    # rather than a tool call — goes to the turn open when it was written.
     by_turn: dict[int, list] = defaultdict(list)
     for i, (when, sha, call) in enumerate(marks):
-        number, opened = turns.get(call, (0, None))
+        at = bisect.bisect_right(stamps, when) - 1
+        number, opened = turns.get(call) or (opened_at[at][1:] if at >= 0 else (0, None))
         by_turn[number].append((when, sha, call, opened,
                                 marks[i - 1][1] if i else f"{sha}^"))
 
@@ -6793,6 +6798,271 @@ def cmd_checkpoints(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Undo and redo
+# ---------------------------------------------------------------------------
+# A step is one checkpoint the hook wrote: one tool call's change to the tree.
+# `chsum undo` applies a step's diff reversed and `chsum redo` applies it again,
+# and each writes a checkpoint of its own whose subject names the step. The
+# chain is therefore the whole record, and both lists are replayed from it.
+
+def _undo_stacks(entries: list[ChainEntry]) -> tuple[list[ChainEntry], list[ChainEntry]]:
+    """`(in place, undone)`, newest first each. Replayed in chain order: an undo
+    checkpoint puts the step it names on top of the undone stack, and a redo
+    takes it back off. The checkpoints the two commands wrote are steps of
+    neither list."""
+    steps = {e.when: e for e in entries if not e.action}
+    undone: dict[str, ChainEntry] = {}
+    for e in entries:
+        if e.action and e.step in steps:
+            undone.pop(e.step, None)
+            if e.action == "undo":
+                undone[e.step] = steps[e.step]
+    placed = [e for e in reversed(list(steps.values())) if e.when not in undone]
+    return placed, list(reversed(undone.values()))
+
+
+_STEP_RANGES = 8  # line ranges printed per file before the rest are counted
+
+
+def _hunk_span(start: int, lines: int) -> str:
+    if lines == 0:
+        return f"removed after {start}"
+    return str(start) if lines == 1 else f"{start}-{start + lines - 1}"
+
+
+def _tint(text: str, code: str, colour: bool) -> str:
+    return f"{code}{text}{_ANSI_OFF}" if colour and text else text
+
+
+def _step_line(n: int, step: ChainEntry, project: pathlib.Path,
+               colour: bool = False) -> str:
+    """Each file the step changed with the lines it wrote, on one line, read off
+    the step's own diff: the numbers are the file's as that step left it."""
+    files = []
+    for path, hunks in checkpoint_hunks(project, f"{step.sha}^", step.sha):
+        spans = [_hunk_span(s, k) for s, k in hunks]
+        more = len(spans) - _STEP_RANGES
+        text = ", ".join(spans[:_STEP_RANGES]) + (f", … {more} more" if more > 0 else "")
+        files.append(_tint(path, _ANSI_BOLD, colour) + (f":{text}" if text else ""))
+    return (_tint(f"{n:>3}", _ANSI_DIM, colour) + "  "
+            + (" · ".join(files) or "no file content"))
+
+
+_DIFF_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+# Backgrounds for a whole added or removed line, in the shades Claude Code's own
+# edit diff uses; the foreground stays the terminal's.
+_ANSI_ADDED_BG = "\033[48;5;22m"
+_ANSI_REMOVED_BG = "\033[48;5;52m"
+
+
+@dataclass
+class _DiffFile:
+    path: str
+    verb: str = "Updated"  # Created / Deleted for a file the step added or removed
+    added: int = 0
+    removed: int = 0
+    binary: bool = False
+    hunks: list[list[tuple[str, int, str]]] = field(default_factory=list)  # (sign, line, text)
+
+
+def _diff_files(project: pathlib.Path, step: ChainEntry) -> list[_DiffFile]:
+    """The step's `git diff` per file, each line numbered as the file holds it:
+    a removed line by its number before the step, every other line by its
+    number after."""
+    try:
+        proc = subprocess.run(["git", "diff", "--no-color", f"{step.sha}^", step.sha],
+                              cwd=project, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise SystemExit(f"git diff failed: {e}")
+    if proc.returncode != 0:
+        raise SystemExit(f"git diff failed: {proc.stderr.strip()}")
+    files: list[_DiffFile] = []
+    old = new = 0
+    for line in proc.stdout.splitlines():
+        if line.startswith("diff --git "):
+            files.append(_DiffFile(line.rsplit(" b/", 1)[-1]))
+        elif not files:
+            continue
+        elif line.startswith("new file mode"):
+            files[-1].verb = "Created"
+        elif line.startswith("deleted file mode"):
+            files[-1].verb = "Deleted"
+        elif line.startswith(("--- ", "+++ ")):
+            continue
+        elif line.startswith("Binary files "):
+            files[-1].binary = True
+        elif m := _DIFF_HUNK_RE.match(line):
+            old, new = int(m.group(1)), int(m.group(2))
+            files[-1].hunks.append([])
+        elif files[-1].hunks and line[:1] == "-":
+            files[-1].hunks[-1].append(("-", old, line[1:]))
+            files[-1].removed += 1
+            old += 1
+        elif files[-1].hunks and line[:1] == "+":
+            files[-1].hunks[-1].append(("+", new, line[1:]))
+            files[-1].added += 1
+            new += 1
+        elif files[-1].hunks and line[:1] == " ":
+            files[-1].hunks[-1].append((" ", new, line[1:]))
+            old, new = old + 1, new + 1
+    return files
+
+
+def render_step_diff(project: pathlib.Path, step: ChainEntry, colour: bool = False) -> str:
+    """The step's full diff in the layout of Claude Code's edit diff: per file an
+    `Updated <path> (+a -r)` line, then each line under its own number, `...`
+    between hunks. In colour, an added or removed line carries its background
+    to the terminal's width."""
+    cols = shutil.get_terminal_size((100, 24)).columns
+    out = []
+    for f in _diff_files(project, step):
+        counts = "" if f.binary else f" (+{f.added} -{f.removed})"
+        out.append(_tint("⎿ ", _ANSI_DIM, colour) + f"{f.verb} "
+                   + _tint(f.path, _ANSI_BOLD, colour) + _tint(counts, _ANSI_DIM, colour))
+        if f.binary:
+            out.append(_tint("  binary file: no lines to show", _ANSI_DIM, colour))
+            continue
+        width = len(str(max((n for h in f.hunks for _, n, _ in h), default=0)))
+        for i, hunk in enumerate(f.hunks):
+            if i:
+                out.append(_tint("...", _ANSI_DIM, colour))
+            for sign, n, text in hunk:
+                row = f"{n:>{width}} {sign} {text.expandtabs(4)}"
+                bg = {"+": _ANSI_ADDED_BG, "-": _ANSI_REMOVED_BG}.get(sign, "")
+                if colour and bg:
+                    out.append(f"{bg}{row.ljust(cols)}{_ANSI_OFF}")
+                else:
+                    out.append(_tint(f"{n:>{width}}", _ANSI_DIM, colour)
+                               + f" {sign} {text.expandtabs(4)}")
+    return "\n".join(out)
+
+
+def render_steps(action: str, listed: list[ChainEntry], first: ChainEntry | None,
+                 project: pathlib.Path, limit: int, colour: bool = False) -> str:
+    """The steps `chsum <action> <n>` takes, newest first, each with the files
+    and lines its diff covers."""
+    noun = "in place" if action == "undo" else "undone"
+    if not listed:
+        return (f"no steps {noun} in this session" +
+                ("" if action == "undo" else " — `chsum undo` lists the steps to undo"))
+    shown = listed[:limit] if limit else listed
+    out = [_tint(f"{_plural(len(listed), 'step')} {noun}, newest first", _ANSI_BOLD, colour)]
+    for n, step in enumerate(shown, 1):
+        out.append(_step_line(n, step, project, colour))
+        if first is not None and step.when == first.when:
+            # The first checkpoint's parent is the commit checked out when the
+            # session began, so its diff holds edits uncommitted at that point.
+            out.append(_tint(f"       measured against commit "
+                             f"{_base_of(project, first.sha)[:7]}: holds any edits "
+                             "uncommitted when the session began", _ANSI_DIM, colour))
+    if len(shown) < len(listed):
+        out.append(_tint(f"  … {len(listed) - len(shown)} older · `-n 0` lists them all",
+                         _ANSI_DIM, colour))
+    verb = "reverses" if action == "undo" else "re-applies"
+    other = "redo" if action == "undo" else "undo"
+    out.append("\n" + _tint(f"`chsum {action} <n>` {verb} step n, `chsum {action} "
+                            f"<n>-<m>` steps n to m, `--detail` shows the change · "
+                            f"`chsum {other}` lists the steps "
+                            f"{'undone' if action == 'undo' else 'in place'}",
+                            _ANSI_DIM, colour))
+    return "\n".join(out)
+
+
+def _step_span(spec: str, count: int, action: str) -> tuple[int, int]:
+    """`N` or `N-M` to the first and last step it names, 1-based."""
+    low, sep, high = spec.partition("-")
+    if not (low.isdigit() and (high.isdigit() if sep else True)):
+        raise SystemExit(f"`chsum {action}` takes a step `N` or a range `N-M`, not {spec!r}")
+    first, last = int(low), int(high) if sep else int(low)
+    if first > last:
+        first, last = last, first
+    if count == 0:
+        raise SystemExit(f"no steps {'in place' if action == 'undo' else 'undone'} "
+                         "in this session")
+    if first < 1 or last > count:
+        raise SystemExit(f"`chsum {action}` takes steps 1 to {count} here; "
+                         f"`chsum {action}` alone lists them")
+    return first, last
+
+
+def cmd_undo(args) -> int:
+    """Lists the steps of the running session, or with `N` or `N-M`, reverses
+    them (`undo`) or re-applies them (`redo`) and records each on the chain.
+
+    A range runs in list order. For undo that is newest first, and for redo it
+    is the most recently undone first: each order is the reverse of how the
+    steps came to be, which is the order in which steps over the same lines
+    apply."""
+    action = args.action
+    path = live_transcript()
+    meta = extract_meta(path)
+    if not meta.project:
+        raise SystemExit("this session records no working directory")
+    project = pathlib.Path(meta.project)
+    git_dir = _git_dir(project)
+    if git_dir is None:
+        raise SystemExit(f"{project} is not in a git repository, so it holds no checkpoints")
+    if not _enabled(git_dir):
+        raise SystemExit("checkpointing is off here, so this session recorded no "
+                         "steps: `chsum checkpoints --enable`")
+    entries = chain_entries(project, path.stem)
+    placed, undone = _undo_stacks(entries)
+    colour = _colour_ok()
+    listed = placed if action == "undo" else undone
+    if args.step is None:
+        print(render_steps(action, listed, entries[0] if entries else None,
+                           project, args.limit, colour))
+        return 0
+    first, last = _step_span(args.step, len(listed), action)
+    if args.detail:
+        for n in range(first, last + 1):
+            step = listed[n - 1]
+            print(("\n" if n > first else "") + _tint(f"step {n}", _ANSI_BOLD, colour))
+            print(render_step_diff(project, step, colour))
+        return 0
+    done = "undid" if action == "undo" else "redid"
+
+    proceed, lock_fd = _hold_checkpoint_lock(git_dir)
+    if not proceed:
+        raise SystemExit("another checkpoint held the lock past "
+                         f"{int(checkpoints._LOCK_WAIT)}s; run it again")
+    stopped, unrecorded = "", 0
+    try:
+        # Edits made since the last checkpoint go on the chain as a step of their
+        # own first, so each checkpoint below holds one step's diff alone.
+        _write_checkpoint(project, git_dir, path.stem)
+        for n in range(first, last + 1):
+            step = listed[n - 1]
+            applied, err = apply_step(project, step.sha, reverse=action == "undo")
+            if not applied:
+                stopped = (f"step {n} no longer applies: its lines have changed "
+                           f"since. Nothing of it was written; "
+                           f"`git diff {step.sha[:9]}^ {step.sha[:9]}` shows it.\n{err}")
+                break
+            if not _write_checkpoint(project, git_dir, path.stem,
+                                     action=action, step=step.when):
+                unrecorded += 1
+            print(f"{_tint(done, _ANSI_WROTE, colour)} "
+                  f"{_step_line(n, step, project, colour).lstrip()}")
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+    if unrecorded:
+        print(f"\n{_plural(unrecorded, 'step')} changed the files with no checkpoint "
+              "recording it, so the lists still show them where they were",
+              file=sys.stderr)
+    if stopped:
+        print(f"\n{stopped}", file=sys.stderr)
+        return 1
+    other = "redo" if action == "undo" else "undo"
+    count = last - first + 1
+    print(f"\n`chsum {other} {'1' if count == 1 else f'1-{count}'}` "
+          f"{'re-applies' if action == 'undo' else 'reverses'} "
+          f"{'it' if count == 1 else 'them'}")
+    return 0
+
+
 def cmd_hook(args) -> int:
     payload = _read_payload()
     if args.event == "post-tool-use":
@@ -6809,17 +7079,20 @@ _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
 
-def _turn_of_call(path: pathlib.Path) -> dict:
-    """`call id → (turn number, the row that opened the turn)`. The turn is what
-    groups a session's writes: a prompt is answered by the calls beneath it, and
-    the files they wrote are that turn's."""
-    out, turn, opened = {}, 0, None
+def _turns_of(path: pathlib.Path) -> tuple[dict, list]:
+    """`(call id → (turn number, the row that opened the turn), [(when, turn
+    number, row)] per turn in order)`. The turn is what groups a session's
+    writes: a prompt is answered by the calls beneath it, and the files they
+    wrote are that turn's. The second places a write by its time where no call
+    in the transcript made it."""
+    out, starts, turn, opened = {}, [], 0, None
     for r in collect_rows(path, ("message", "tool", "command")):
         if r.starts_turn:
             turn, opened = turn + 1, r
+            starts.append((r.when, turn, r))
         elif r.tool_id:
             out[r.tool_id] = (turn, opened)
-    return out
+    return out, starts
 
 
 
@@ -8523,6 +8796,24 @@ def main(argv=None) -> int:
                         "nothing")
     p.add_argument("--repo", default="", help="the repository (default: the cwd)")
     p.set_defaults(func=cmd_checkpoints)
+
+    for action, verb, listed in (("undo", "reverse", "in place"),
+                                 ("redo", "re-apply", "undone")):
+        p = sub.add_parser(
+            action, parents=[dbg],
+            help=f"this session's steps {listed}, or {verb} one by number",
+            description=f"Lists this session's steps {listed}, newest first: one "
+                        "step per tool call that changed the tree, read from the "
+                        f"git checkpoints. With a number, {verb}s that step in the "
+                        "working tree and records it on the checkpoint chain.")
+        p.add_argument("step", nargs="?", metavar="N|N-M",
+                       help=f"the step to {verb}, 1 the newest, or a range of them")
+        p.add_argument("-n", "--limit", type=int, default=10, metavar="N",
+                       help="how many to list, 0 for all (default: 10)")
+        p.add_argument("--detail", action="store_true",
+                       help=f"print the full diff of the steps named, and {verb} "
+                            "nothing")
+        p.set_defaults(func=cmd_undo, action=action)
 
     p = sub.add_parser("find", parents=[dbg], help="search conversations")
     p.add_argument("query", nargs="?")

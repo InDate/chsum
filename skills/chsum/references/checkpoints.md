@@ -33,6 +33,15 @@ one carries, matching the uuid in a digest's frontmatter and the short form in
 every row locator. A call that changed nothing committed no checkpoint and has
 no sha to find.
 
+## Undo and redo
+
+`chsum undo <n>` applies a step's diff reversed and `chsum redo <n>` applies it
+again, each through `git apply`, which writes every file of the step or none.
+Each writes a checkpoint of its own whose subject ends `undo <step-stamp>` or
+`redo <step-stamp>` in place of a call id, so the chain alone holds which steps
+are undone: both lists are replayed from it. The step is named by its stamp,
+which `--migrate` carries over where a sha changes.
+
 ## Retention
 
 `chsum checkpoints` lists the chains a repo holds, with a count and a date each.

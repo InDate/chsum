@@ -26,6 +26,7 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 GATE_NAME = "chsum-checkpoint"  # "enabled" / "declined" / absent (never asked)
@@ -40,13 +41,35 @@ _LOCK_WAIT = 20.0
 _LOCK_POLL = 0.05
 _CHECKPOINT_PREFIX = "chsum-checkpoint: "
 _HOOK_GIT_TIMEOUT = 30  # seconds per git call — this must never be what hangs a turn
-_CHECKPOINT_RE = re.compile("^" + re.escape(_CHECKPOINT_PREFIX)
-                            + r"(\S+) @ (\S+)(?: (\S+))?$")
+# The subject's tail is the call that wrote the change, or, for a checkpoint
+# `chsum undo` or `chsum redo` wrote, that action and the stamp of the step it
+# reversed or re-applied. `_checkpoint_message` builds what this parses.
+_CHECKPOINT_RE = re.compile(
+    "^" + re.escape(_CHECKPOINT_PREFIX) + r"(?P<session>\S+) @ (?P<when>\S+)"
+    r"(?: (?P<action>undo|redo) (?P<step>\S+)| (?P<call>\S+))?$")
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 # `core` installs its tracer here at import. Left None, every call below runs
 # untraced rather than reaching back into a module that imports this one.
 TRACER = None
+
+
+def _checkpoint_message(session_id: str, when: str, call: str = "",
+                        action: str = "", step: str = "") -> str:
+    tail = f" {action} {step}" if action else f" {call}" if call else ""
+    return f"{_CHECKPOINT_PREFIX}{session_id} @ {when}{tail}"
+
+
+@dataclass
+class ChainEntry:
+    """One checkpoint on a session's chain. `action` is "undo" or "redo" on a
+    checkpoint those commands wrote, with `step` the stamp of the checkpoint
+    they reversed or re-applied; both are "" on one the hook wrote."""
+    when: str
+    sha: str
+    call: str = ""
+    action: str = ""
+    step: str = ""
 
 
 def set_tracer(tracer) -> None:
@@ -175,10 +198,12 @@ def _tree_of(cwd: pathlib.Path, commit: str) -> str:
 
 
 def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str,
-                      ref: str = "") -> None:
+                      ref: str = "", action: str = "", step: str = "") -> str:
     """One checkpoint per tool call that changed the tree, chained under this
     session's ref. `ref` is the `tool_use` id of the call that caused it, "" where
-    the payload carries none.
+    the payload carries none. `action` and `step` are set by `chsum undo` and
+    `chsum redo`: the action, and the stamp of the checkpoint it reversed or
+    re-applied. Returns the checkpoint written, "" where none was.
 
     `HEAD` is never written. The commit object is built by `commit-tree` from a
     tree and a parent, and only `update-ref` publishes it, so no step of this
@@ -191,20 +216,25 @@ def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str,
     here rather than in the hook, so a project that has since declined still
     takes every early return cleanly."""
     if not _enabled(git_dir):
-        return
+        return ""
     try:
         status = _git(["git", "status", "--porcelain"], cwd)
     except (OSError, subprocess.SubprocessError):
-        return
-    if status.returncode != 0 or not status.stdout.strip():
-        return  # the tree matches HEAD — nothing to checkpoint
+        return ""
+    if status.returncode != 0:
+        return ""
+    # A clean tree matches HEAD, which leaves a tool call nothing to record. An
+    # undo that restores HEAD's tree still commits: its subject is the only
+    # record of which step it reversed.
+    if not status.stdout.strip() and not action:
+        return ""
 
     try:
         index = _git(["git", "rev-parse", "--git-path", _INDEX_NAME], cwd)
     except (OSError, subprocess.SubprocessError):
-        return
+        return ""
     if index.returncode != 0:
-        return
+        return ""
     # Absolute, so the environment holds one path whatever `cwd` git resolves to.
     index_path = pathlib.Path(index.stdout.strip())
     if not index_path.is_absolute():
@@ -214,16 +244,16 @@ def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str,
     try:
         staged = _git(["git", "add", "-A"], cwd, env=env)
         if staged.returncode != 0:
-            return
+            return ""
         tree = _git(["git", "write-tree"], cwd, env=env)
     except (OSError, subprocess.SubprocessError):
-        return
+        return ""
     finally:
         # The throwaway index is rebuilt from scratch on the next call, so a
         # stale one costs nothing; leaving it does not touch the user's.
         pass
     if tree.returncode != 0:
-        return
+        return ""
     tree_sha = tree.stdout.strip()
 
     session_ref = checkpoint_ref(session_id)
@@ -232,30 +262,28 @@ def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str,
     # the working tree differs from `HEAD` for the whole session, so the status
     # check above passes on every call and a `Read` would otherwise chain a copy.
     if tip and _tree_of(cwd, tip) == tree_sha:
-        return
+        return ""
     parent = tip or _head_sha(cwd)
     if not parent:
-        return  # no commits yet — nothing to parent the first checkpoint on
+        return ""  # no commits yet — nothing to parent the first checkpoint on
 
     now = datetime.now(timezone.utc)
     # Millisecond precision, matching Claude Code's transcript timestamps: every
     # timestamp comparison here is a string compare, which sorts a whole-second
     # stamp after a same-second one carrying ".mmm".
     ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
-    message = f"{_CHECKPOINT_PREFIX}{session_id} @ {ts}"
-    if ref:
-        # The `tool_use` id of the call that wrote this. chsum addresses every
-        # action as `<session>:<line>`, and `_transcript_row` turns this id into
-        # that address at read time — the transcript record holding the call is
-        # flushed after the hook fires, so the row does not exist yet here.
-        message += f" {ref}"
+    # `ref` is the `tool_use` id of the call that wrote this. chsum addresses
+    # every action as `<session>:<line>`, and `_transcript_row` turns this id into
+    # that address at read time — the transcript record holding the call is
+    # flushed after the hook fires, so the row does not exist yet here.
+    message = _checkpoint_message(session_id, ts, ref, action, step)
 
     try:
         made = _git(["git", "commit-tree", tree_sha, "-p", parent, "-m", message], cwd)
     except (OSError, subprocess.SubprocessError):
-        return
+        return ""
     if made.returncode != 0:
-        return
+        return ""
     commit = made.stdout.strip()
 
     # Compare-and-swap on the tip: parallel subagents share one worktree, and two
@@ -267,18 +295,18 @@ def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str,
             done = _git(["git", "update-ref", session_ref, commit,
                          tip or _EMPTY_SHA], cwd)
         except (OSError, subprocess.SubprocessError):
-            return
+            return ""
         if done.returncode == 0:
-            return
+            return commit
         tip = _ref_tip(cwd, session_ref)
         if not tip or _tree_of(cwd, tip) == tree_sha:
-            return  # the winner wrote this same tree; nothing left to record
+            return ""  # the winner wrote this same tree; nothing left to record
         try:
             again = _git(["git", "commit-tree", tree_sha, "-p", tip, "-m", message], cwd)
         except (OSError, subprocess.SubprocessError):
-            return
+            return ""
         if again.returncode != 0:
-            return
+            return ""
         commit = again.stdout.strip()
 
 
@@ -312,7 +340,7 @@ def reflog_sessions(project_dir: pathlib.Path) -> dict[str, int]:
             continue
         m = _CHECKPOINT_RE.match(subject)
         if m:
-            found[m.group(1)] = found.get(m.group(1), 0) + 1
+            found[m["session"]] = found.get(m["session"], 0) + 1
     return found
 
 
@@ -408,12 +436,11 @@ def _migrate_chain(project_dir: pathlib.Path, uuid: str,
     return written, skipped, ""
 
 
-def _chain_shas(project_dir: pathlib.Path,
-                session_uuid: str) -> list[tuple[str, str, str]]:
-    """The session's checkpoints off its own ref, oldest first, in the shape
-    `_checkpoint_shas` returns. `[]` where the session wrote no chain, which is
-    every session recorded before the ref existed — those are read from the
-    reflog instead.
+def chain_entries(project_dir: pathlib.Path,
+                  session_uuid: str) -> list[ChainEntry]:
+    """The session's checkpoints off its own ref, oldest first. `[]` where the
+    session wrote no chain, which is every session recorded before the ref
+    existed — those are read from the reflog instead.
 
     The stamp is parsed from the commit message rather than taken from `%cI`:
     chsum's own millisecond timestamp is what sorts against transcript rows, and
@@ -426,16 +453,24 @@ def _chain_shas(project_dir: pathlib.Path,
         return []
     if proc.returncode != 0:
         return []
-    out: list[tuple[str, str, str]] = []
+    out: list[ChainEntry] = []
     for line in proc.stdout.splitlines():
         sha, _, subject = line.partition(" ")
         m = _CHECKPOINT_RE.match(subject)
-        if m and m.group(1) == session_uuid:
-            out.append((m.group(2), sha, m.group(3) or ""))
+        if m and m["session"] == session_uuid:
+            out.append(ChainEntry(m["when"], sha, m["call"] or "",
+                                  m["action"] or "", m["step"] or ""))
     out.reverse()
-    TRACER and TRACER.step("_chain_shas", repo=str(project_dir), session=session_uuid[:8],
+    TRACER and TRACER.step("chain_entries", repo=str(project_dir), session=session_uuid[:8],
                checkpoints=len(out))
     return out
+
+
+def _chain_shas(project_dir: pathlib.Path,
+                session_uuid: str) -> list[tuple[str, str, str]]:
+    """The session's checkpoints off its own ref, oldest first, in the shape
+    `_checkpoint_shas` returns."""
+    return [(e.when, e.sha, e.call) for e in chain_entries(project_dir, session_uuid)]
 
 
 def _checkpoint_shas(project_dir: pathlib.Path | None,
@@ -477,8 +512,8 @@ def _checkpoint_shas(project_dir: pathlib.Path | None,
         if not sep:
             continue
         m = _CHECKPOINT_RE.match(subject)
-        if m and m.group(1) == session_uuid:
-            out.append((m.group(2), sha, m.group(3) or ""))
+        if m and m["session"] == session_uuid:
+            out.append((m["when"], sha, m["call"] or ""))
     out.reverse()
     # Both sources, merged: a session running across the change from reflog to
     # chain holds some of each, and preferring one would drop the other half of
@@ -524,17 +559,15 @@ def _checkpoint_numstat(project_dir: pathlib.Path | None, prev_ref: str,
     return out
 
 
-def _checkpoint_diff_files(project_dir: pathlib.Path | None, prev_ref: str, cur_ref: str) -> list[str]:
-    """Same bullet shape `_files_touched` produces — `- \\`path\\`:ranges` — but
-    sourced from a real `git diff` between two checkpoint commits instead of
-    the transcript, so it sees every change regardless of how it was made (a
-    raw `sed -i`, not just Edit/Write/MultiEdit) and is never stale (no line
-    numbers frozen at the moment of an earlier edit in the same turn). Parses
-    `--- a/`/`+++ b/` for the path and `@@ -a,b +c,d @@` hunks for the new-side
-    range (`c` to `c+d-1`); `d == 0` is a pure deletion at the new side, which
-    would invent a range that doesn't exist, so a file left with no real range
-    prints `(deleted)` instead. Never raises: not a repo, bad refs, or an
-    unparseable diff all degrade to `[]`."""
+def checkpoint_hunks(project_dir: pathlib.Path | None, prev_ref: str,
+                     cur_ref: str) -> list[tuple[str, list[tuple[int, int]]]]:
+    """`(path, [(start, lines)])` per file changed between two checkpoints, in
+    diff order, read from a real `git diff -U0`: it sees every change however it
+    was made (a raw `sed -i`, not just Edit/Write/MultiEdit) and holds no line
+    numbers frozen at an earlier edit. `start` and `lines` are the new side of
+    each `@@ -a,b +c,d @@` hunk; `lines == 0` is a pure deletion, with `start`
+    the line it follows. Never raises: not a repo, bad refs, or an unparseable
+    diff all return `[]`."""
     if not project_dir:
         return []
     started = time.monotonic()
@@ -548,9 +581,7 @@ def _checkpoint_diff_files(project_dir: pathlib.Path | None, prev_ref: str, cur_
                proc.returncode, time.monotonic() - started, f"{len(proc.stdout)} chars")
     if proc.returncode != 0:
         return []
-    by_path: dict[str, list[str]] = {}
-    order: list[str] = []
-    pure_deletion: set[str] = set()
+    out: list[tuple[str, list[tuple[int, int]]]] = []
     path = None
     pending_a = None
     for line in proc.stdout.splitlines():
@@ -560,28 +591,53 @@ def _checkpoint_diff_files(project_dir: pathlib.Path | None, prev_ref: str, cur_
         elif line.startswith("+++ "):
             b = line[4:]
             path = pending_a if b == "/dev/null" else b[2:]  # strip "b/"
-            if path and path not in by_path:
-                by_path[path] = []
-                order.append(path)
+            if path:
+                out.append((path, []))
         elif line.startswith("@@ ") and path:
             m = _HUNK_RE.match(line)
-            if not m:
-                continue
-            new_start = int(m.group(1))
-            new_lines = int(m.group(2)) if m.group(2) is not None else 1
-            if new_lines == 0:
-                pure_deletion.add(path)
-                continue
-            rng = f"{new_start}-{new_start + new_lines - 1}"
-            if rng not in by_path[path]:
-                by_path[path].append(rng)
-    out = []
-    for p in order:
-        ranges = by_path[p]
-        if ranges:
-            out.append(f"- `{p}`:{', '.join(ranges)}")
-        elif p in pure_deletion:
-            out.append(f"- `{p}` (deleted)")
-        else:
-            out.append(f"- `{p}`")
+            if m:
+                out[-1][1].append((int(m.group(1)),
+                                   int(m.group(2)) if m.group(2) is not None else 1))
     return out
+
+
+def _checkpoint_diff_files(project_dir: pathlib.Path | None, prev_ref: str, cur_ref: str) -> list[str]:
+    """`- \`path\`:ranges` per file `checkpoint_hunks` reads, the shape
+    `_files_touched` produces from the transcript. A pure deletion has no range
+    on the new side, so a file whose every hunk is one prints `(deleted)`."""
+    out = []
+    for path, hunks in checkpoint_hunks(project_dir, prev_ref, cur_ref):
+        ranges = list(dict.fromkeys(f"{s}-{s + n - 1}" for s, n in hunks if n))
+        if ranges:
+            out.append(f"- `{path}`:{', '.join(ranges)}")
+        elif hunks:
+            out.append(f"- `{path}` (deleted)")
+        else:
+            out.append(f"- `{path}`")
+    return out
+
+
+def apply_step(cwd: pathlib.Path, sha: str, reverse: bool) -> tuple[bool, str]:
+    """Applies one checkpoint's diff against its parent to the working tree,
+    reversed for an undo. `git apply` writes every file or none, so a hunk whose
+    lines have changed since leaves the tree as it was. The diff carries one line
+    of context where git's default is three: `git apply` requires every context
+    line to match, so at three a later edit anywhere within three lines of the
+    step blocks it. Runs from the top level:
+    from a subdirectory, `git apply` skips the paths outside it. Returns
+    `(applied, git's stderr)`."""
+    try:
+        top = _git(["git", "rev-parse", "--show-toplevel"], cwd)
+        if top.returncode != 0:
+            return False, top.stderr.strip()
+        root = pathlib.Path(top.stdout.strip())
+        diff = subprocess.run(["git", "diff", "--binary", "-U1", f"{sha}^", sha],
+                              cwd=root, capture_output=True, timeout=_HOOK_GIT_TIMEOUT)
+        if diff.returncode != 0:
+            return False, diff.stderr.decode(errors="replace").strip()
+        done = subprocess.run(["git", "apply", *(["-R"] if reverse else []), "-"],
+                              input=diff.stdout, cwd=root, capture_output=True,
+                              timeout=_HOOK_GIT_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+    return done.returncode == 0, done.stderr.decode(errors="replace").strip()

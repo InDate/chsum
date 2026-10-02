@@ -30,6 +30,8 @@ one rule, below.
 | `chsum digest --call <id> --stdout` | One tool call whole, with its captured output |
 | `chsum digest -3 -1 --stdout` | A window of the user's turns, messages whole and calls a line each — `1` their first, `-1` their last, one number one turn, two a range; `--tools`/`--commands` take the same numbers and print their rows whole |
 | `chsum digest <parent-ref>/<agent-id> --stdout` | One subagent's own digest; `--messages` for everything it wrote and called |
+| `chsum undo` | This session's steps in place, newest first: one per tool call that changed the tree, each file with the lines it wrote. `chsum undo <n>` reverses step n, `<n>-<m>` a range; `--detail` prints the diff and changes nothing |
+| `chsum redo` | The steps undone, most recently undone first. `chsum redo <n>` re-applies step n, `<n>-<m>` a range |
 | `chsum note "<text>"` | Note this moment, for the digest and claude-history |
 | `chsum name "<title>"` | Rename this session |
 | `chsum recap` | This session since the last recap — the user's second terminal, not a command to run on your own turn (see **Catching up**) |
