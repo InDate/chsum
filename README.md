@@ -48,8 +48,8 @@ from.
   of its own and resumes it there. → [`chsum digest`](#the-row-views)
 - **A tool call changed a file and you want that change gone.** — `! chsum undo`
   lists this session's steps, one per tool call that changed the tree, newest
-  first; `chsum undo <n>` reverses step n, `<n>-<m>` a range, and `--detail`
-  prints a step's diff first. `chsum redo` lists what was undone and re-applies
+  first; `chsum undo <n>` reverses step n, `<n>b` one file of it, `<n>-<m>` a
+  range, and `--detail` prints a step's diff first. `chsum redo` lists what was undone and re-applies
   it the same way. → [`chsum undo`](#chsum-undo-and-chsum-redo)
 - **Something just worked and you want to find that moment later.** — `! chsum note
   "…"` files a note against the message you are on, or an earlier one by id or
@@ -686,23 +686,27 @@ every project. Naming the session beside it reads that one file directly.
 
 A step is one tool call's change to the tree: the checkpoint the hook wrote for
 it. `chsum undo` lists this session's steps still in place, newest first, each
-as the files it changed and the lines it wrote there:
+file a step changed on a row of its own with the lines it wrote there:
 
 ```
 $ chsum undo
-14 steps in place, newest first
-  1  chsum/core.py:6843, 6911
-  2  chsum/checkpoints.py:623-626, 634
-  3  skills/chsum/SKILL.md:33-34 · README.md:49-52
+28 steps in place, newest first
+  1     chsum/core.py:7109-7110
+  2  a  chsum/core.py:7076
+     b  tests/test_undo.py:63-66
+  3     chsum/checkpoints.py:65
   …
 ```
 
 The line numbers are the file's as that step left it. A step holding only
-removals reads `removed after <line>`.
+removals reads `removed after <line>`. A step of several files letters each
+one, and `2b` names that file alone: undone, it leaves the undo list and joins
+the redo list under the same letter, and the step's other letters hold.
 
 ```sh
 chsum undo 1            # reverse the newest step; run it again for the one before
 chsum undo 1-3          # the three newest, newest first
+chsum undo 2b          # one file of step 2
 chsum undo 2 --detail   # the step's full diff, each line under its number; nothing changes
 chsum redo              # the steps undone, most recently undone first
 chsum redo 1-2          # re-apply the two most recently undone
@@ -710,9 +714,17 @@ chsum redo 1-2          # re-apply the two most recently undone
 
 A range runs in list order, which for both commands is the reverse of how the
 steps came to be. Steps over the same lines apply in that order and no other.
+A whole step acts on its files on that list's side, so `chsum undo 2` after
+`chsum undo 2b` reverses `2a` and leaves `2b` as it is.
+
+**Run through Claude, an undo shows its diff in place.** Claude Code draws the
+change any Bash call makes to a file, so asking Claude to undo step 3 prints
+the reversal under the call, and asking for `chsum redo 1` puts it back.
+`--detail` is for the runs you make yourself.
 
 **Each undo and redo is a checkpoint on the chain.** Its subject carries the
-action and the stamp of the step it names, `… @ <time> undo <step-stamp>`, and
+action and the stamp of the step it names, `… @ <time> undo <step-stamp>`, with
+`/<letter>` where it acted on one file, and
 both lists are replayed from the chain alone. Run with `!`, the command writes
 that checkpoint itself, since no hook fires for it. Run as a tool call, the
 hook that follows finds the tree equal to the tip and writes nothing more.

@@ -60,22 +60,30 @@ class UndoCase(RepoCase):
 
     def stacks(self) -> tuple[list[str], list[str]]:
         """The calls in place and undone, newest first each."""
-        placed, undone = core._undo_stacks(checkpoints.chain_entries(self.repo, SESSION))
-        return [e.call for e in placed], [e.call for e in undone]
+        placed, undone = core._undo_stacks(
+            checkpoints.chain_entries(self.repo, SESSION),
+            lambda step: [l for l, _, _ in core._step_files(self.repo, step)])
+        return [e.call for e, _ in placed], [e.call for e, _ in undone]
 
 
 class Subjects(unittest.TestCase):
     def test_every_shape_the_builder_writes_parses_back(self):
         when, stamp = "2026-10-02T12:00:01.000Z", "2026-10-02T12:00:00.000Z"
         for kw in ({}, {"call": "toolu_1"},
-                   {"action": "undo", "step": stamp}, {"action": "redo", "step": stamp}):
+                   {"action": "undo", "step": stamp}, {"action": "redo", "step": stamp},
+                   {"action": "undo", "step": stamp, "part": "b"},
+                   {"action": "redo", "step": stamp, "part": "aa"}):
             subject = checkpoints._checkpoint_message("sess", when, **kw)
             m = checkpoints._CHECKPOINT_RE.match(subject)
             self.assertIsNotNone(m, subject)
             self.assertEqual((m["session"], m["when"], m["call"] or "",
-                              m["action"] or "", m["step"] or ""),
-                             ("sess", when, kw.get("call", ""),
-                              kw.get("action", ""), kw.get("step", "")))
+                              m["action"] or "", m["step"] or "", m["part"] or ""),
+                             ("sess", when, kw.get("call", ""), kw.get("action", ""),
+                              kw.get("step", ""), kw.get("part", "")))
+
+    def test_letters_run_a_to_z_then_two_letters(self):
+        self.assertEqual([core._letter(i) for i in (0, 1, 25, 26, 27)],
+                         ["a", "b", "z", "aa", "ab"])
 
 
 class UndoesAndRedoes(UndoCase):
@@ -156,6 +164,77 @@ class UndoesAndRedoes(UndoCase):
         # A removed line by its number before the step, an added one by after.
         self.assertIn("6 - 6", out)
         self.assertIn("6 + six", out)
+
+
+class OneFileOfAStep(UndoCase):
+    """A step that changed x, y and z: its files are `a`, `b` and `c`."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        for name in "xyz":
+            self.write(f"{name}.txt", "1\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "three files")
+        for name in "xyz":
+            self.write(f"{name}.txt", "changed\n")
+        self.checkpoint(SESSION, "toolu_xyz")
+
+    def files(self) -> str:
+        return " ".join((self.repo / f"{n}.txt").read_text().strip() for n in "xyz")
+
+    def sides(self) -> tuple[list, list]:
+        """The letters each list holds for the step, `None` for all of it."""
+        placed, undone = core._undo_stacks(
+            checkpoints.chain_entries(self.repo, SESSION),
+            lambda step: [l for l, _, _ in core._step_files(self.repo, step)])
+        return ([sorted(s) if s is not None else None for _, s in placed],
+                [sorted(s) for _, s in undone])
+
+    def test_one_letter_undoes_that_file_alone(self):
+        self.run_cmd("undo", "1b")
+        self.assertEqual(self.files(), "changed 1 changed")
+        self.assertEqual(self.sides(), ([["a", "c"]], [["b"]]))
+        tip = checkpoints.chain_entries(self.repo, SESSION)[-1]
+        self.assertEqual((tip.action, tip.part), ("undo", "b"))
+
+    def test_letters_hold_after_one_file_is_undone(self):
+        self.run_cmd("undo", "1b")
+        _, out = self.run_cmd("undo")
+        self.assertIn("a  x.txt", out)
+        self.assertIn("c  z.txt", out)
+        self.assertNotIn("y.txt", out)
+
+    def test_the_whole_step_takes_the_files_still_in_place(self):
+        self.run_cmd("undo", "1b")
+        self.run_cmd("undo", "1")
+        self.assertEqual(self.files(), "1 1 1")
+        self.assertEqual(self.sides(), ([], [["a", "b", "c"]]))
+
+    def test_redo_of_one_letter_then_the_rest(self):
+        self.run_cmd("undo", "1")
+        self.run_cmd("redo", "1b")
+        self.assertEqual(self.files(), "1 changed 1")
+        self.assertEqual(self.sides(), ([["b"]], [["a", "c"]]))
+        self.run_cmd("redo", "1")
+        self.assertEqual(self.files(), "changed changed changed")
+        self.assertEqual(self.sides(), ([None], []))
+
+    def test_a_letter_on_the_other_side_is_refused(self):
+        self.run_cmd("undo", "1b")
+        with self.assertRaises(SystemExit):
+            self.run_cmd("undo", "1b")
+        self.assertEqual(self.files(), "changed 1 changed")
+
+    def test_detail_with_a_letter_shows_that_file_alone(self):
+        _, out = self.run_cmd("undo", "1c", detail=True)
+        self.assertIn("Updated z.txt", out)
+        self.assertNotIn("x.txt", out)
+        self.assertEqual(self.files(), "changed changed changed")
+
+    def test_a_step_of_one_file_takes_no_letter(self):
+        self.step("2", "two", "toolu_one")
+        _, out = self.run_cmd("undo")
+        self.assertIn("  1     f.txt:2", out)
 
 
 class Refuses(UndoCase):

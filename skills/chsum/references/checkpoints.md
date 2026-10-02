@@ -38,8 +38,10 @@ no sha to find.
 `chsum undo <n>` applies a step's diff reversed and `chsum redo <n>` applies it
 again, each through `git apply`, which writes every file of the step or none.
 Each writes a checkpoint of its own whose subject ends `undo <step-stamp>` or
-`redo <step-stamp>` in place of a call id, so the chain alone holds which steps
-are undone: both lists are replayed from it. The step is named by its stamp,
+`redo <step-stamp>` in place of a call id, with `/<letter>` where it acted on
+one file of the step, so the chain alone holds which steps and files are
+undone: both lists are replayed from it. A step's files are lettered in the
+order `git diff` lists them, which is the same on every read. The step is named by its stamp,
 which `--migrate` carries over where a sha changes.
 
 ## Retention

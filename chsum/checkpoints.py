@@ -43,10 +43,11 @@ _CHECKPOINT_PREFIX = "chsum-checkpoint: "
 _HOOK_GIT_TIMEOUT = 30  # seconds per git call — this must never be what hangs a turn
 # The subject's tail is the call that wrote the change, or, for a checkpoint
 # `chsum undo` or `chsum redo` wrote, that action and the stamp of the step it
-# reversed or re-applied. `_checkpoint_message` builds what this parses.
+# reversed or re-applied, with `/<letter>` where it acted on one file of the
+# step. `_checkpoint_message` builds what this parses.
 _CHECKPOINT_RE = re.compile(
     "^" + re.escape(_CHECKPOINT_PREFIX) + r"(?P<session>\S+) @ (?P<when>\S+)"
-    r"(?: (?P<action>undo|redo) (?P<step>\S+)| (?P<call>\S+))?$")
+    r"(?: (?P<action>undo|redo) (?P<step>[^\s/]+)(?:/(?P<part>[a-z]+))?| (?P<call>\S+))?$")
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 # `core` installs its tracer here at import. Left None, every call below runs
@@ -55,21 +56,24 @@ TRACER = None
 
 
 def _checkpoint_message(session_id: str, when: str, call: str = "",
-                        action: str = "", step: str = "") -> str:
-    tail = f" {action} {step}" if action else f" {call}" if call else ""
+                        action: str = "", step: str = "", part: str = "") -> str:
+    tail = (f" {action} {step}" + (f"/{part}" if part else "") if action
+            else f" {call}" if call else "")
     return f"{_CHECKPOINT_PREFIX}{session_id} @ {when}{tail}"
 
 
-@dataclass
+@dataclass(frozen=True)
 class ChainEntry:
     """One checkpoint on a session's chain. `action` is "undo" or "redo" on a
     checkpoint those commands wrote, with `step` the stamp of the checkpoint
-    they reversed or re-applied; both are "" on one the hook wrote."""
+    they reversed or re-applied; both are "" on one the hook wrote. `part` is
+    the letter of the one file of that step it acted on, "" for the whole step."""
     when: str
     sha: str
     call: str = ""
     action: str = ""
     step: str = ""
+    part: str = ""
 
 
 def set_tracer(tracer) -> None:
@@ -198,12 +202,14 @@ def _tree_of(cwd: pathlib.Path, commit: str) -> str:
 
 
 def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str,
-                      ref: str = "", action: str = "", step: str = "") -> str:
+                      ref: str = "", action: str = "", step: str = "",
+                      part: str = "") -> str:
     """One checkpoint per tool call that changed the tree, chained under this
     session's ref. `ref` is the `tool_use` id of the call that caused it, "" where
     the payload carries none. `action` and `step` are set by `chsum undo` and
     `chsum redo`: the action, and the stamp of the checkpoint it reversed or
-    re-applied. Returns the checkpoint written, "" where none was.
+    re-applied, with `part` the letter of the one file it acted on. Returns the
+    checkpoint written, "" where none was.
 
     `HEAD` is never written. The commit object is built by `commit-tree` from a
     tree and a parent, and only `update-ref` publishes it, so no step of this
@@ -276,7 +282,7 @@ def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str,
     # every action as `<session>:<line>`, and `_transcript_row` turns this id into
     # that address at read time — the transcript record holding the call is
     # flushed after the hook fires, so the row does not exist yet here.
-    message = _checkpoint_message(session_id, ts, ref, action, step)
+    message = _checkpoint_message(session_id, ts, ref, action, step, part)
 
     try:
         made = _git(["git", "commit-tree", tree_sha, "-p", parent, "-m", message], cwd)
@@ -459,7 +465,7 @@ def chain_entries(project_dir: pathlib.Path,
         m = _CHECKPOINT_RE.match(subject)
         if m and m["session"] == session_uuid:
             out.append(ChainEntry(m["when"], sha, m["call"] or "",
-                                  m["action"] or "", m["step"] or ""))
+                                  m["action"] or "", m["step"] or "", m["part"] or ""))
     out.reverse()
     TRACER and TRACER.step("chain_entries", repo=str(project_dir), session=session_uuid[:8],
                checkpoints=len(out))
@@ -617,9 +623,10 @@ def _checkpoint_diff_files(project_dir: pathlib.Path | None, prev_ref: str, cur_
     return out
 
 
-def apply_step(cwd: pathlib.Path, sha: str, reverse: bool) -> tuple[bool, str]:
+def apply_step(cwd: pathlib.Path, sha: str, reverse: bool,
+               paths: list[str] | None = None) -> tuple[bool, str]:
     """Applies one checkpoint's diff against its parent to the working tree,
-    reversed for an undo. `git apply` writes every file or none, so a hunk whose
+    reversed for an undo, limited to `paths` where they are given. `git apply` writes every file or none, so a hunk whose
     lines have changed since leaves the tree as it was. The diff carries one line
     of context where git's default is three: `git apply` requires every context
     line to match, so at three a later edit anywhere within three lines of the
@@ -631,7 +638,8 @@ def apply_step(cwd: pathlib.Path, sha: str, reverse: bool) -> tuple[bool, str]:
         if top.returncode != 0:
             return False, top.stderr.strip()
         root = pathlib.Path(top.stdout.strip())
-        diff = subprocess.run(["git", "diff", "--binary", "-U1", f"{sha}^", sha],
+        diff = subprocess.run(["git", "diff", "--binary", "-U1", f"{sha}^", sha,
+                               *(["--", *paths] if paths else [])],
                               cwd=root, capture_output=True, timeout=_HOOK_GIT_TIMEOUT)
         if diff.returncode != 0:
             return False, diff.stderr.decode(errors="replace").strip()
