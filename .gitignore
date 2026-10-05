@@ -13,3 +13,6 @@ dist/
 bench/out/
 meta/*.mov
 meta/*.mp4
+
+# Landscapes: read by a local landscape page, kept out of the repo.
+*.landscape
