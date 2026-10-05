@@ -1,6 +1,6 @@
 ---
 name: chsum
-description: Verbatim recovery of past coding-agent sessions (Claude Code and Codex CLI) with the `chsum` CLI — sessions listed, one digested whole, a subagent's work while it runs, what a session changed on disk, and undoing those changes. Use when the user names earlier work you don't have in context ("what did we do yesterday", "pick up where we left off", "which session touched this file"), asks what an agent is doing, asks to reload a past session, or asks to undo a change made this session. For searching or quoting *inside* conversations, use the claude-history CLI directly.
+description: Verbatim recovery of past coding-agent sessions (Claude Code and Codex CLI) with the `chsum` CLI — sessions listed, one digested whole, a subagent's work while it runs, what a session changed on disk, and undoing those changes. Use when the user names earlier work you don't have in context ("what did we do yesterday", "pick up where we left off", "which session touched this file"), asks what an agent is doing, asks to reload a past session, or asks to undo a change made this session; and before reusing an agent or launching a new one, where the prompt cache sets the cost of each. For searching or quoting *inside* conversations, use the claude-history CLI directly.
 ---
 
 # chsum
@@ -28,6 +28,8 @@ prints only its path.
 | `chsum digest --call <id>` | One tool call and its output, whole |
 | `chsum digest -3 -1` | A window of turns: `1` the first, `-1` the last |
 | `chsum undo` / `chsum redo` | Take back a change made this session, or put it back |
+| `chsum cache` | This session's prompt cache and each agent's: warm or expired, and what reuse costs |
+| `chsum warm` | Pings an idle session's cache before it expires, until interrupted. `--for 3h` caps it |
 | `chsum note "<text>"` | Mark this moment for the digest |
 | `chsum name "<title>"` | Rename this session |
 | `chsum recap` | The user's second-terminal view of this session; not for your own turn |
@@ -47,6 +49,29 @@ Find the ref by what the user gave you:
   this one.
 
 All three scope to this project; `--all` widens them.
+
+## Reusing an agent or starting one
+
+An agent's cache expires five minutes after its last request; past that, reuse
+rewrites its whole history, while a new agent writes only its task. An agent
+with no tool calls rewrites on every resume. So reuse pays while warm, or when
+its context is needed. `chsum cache` gives the figures.
+
+A wait over five minutes expires an agent's cache mid-task. Route by job:
+- One long command, short result: main session, background task. Its 1h
+  cache covers the wait, and the report turn happens either way.
+- Multi-step work with a long step: agent with `cacheTtl: 1h`. Costs ~0.75×
+  its prefix once, against ~1.25× per lapsed gap.
+- Long work to return to: a worker session. 1h cache, resumable, takes
+  `chsum warm`; results come back by message.
+
+A worker run as its own session (`claude -p`, or a session reached by
+session-to-session messaging) holds the main conversation's 1h lifetime and
+takes `chsum warm`, since it has a session id. An agent stays warm only by a
+parent message inside five minutes, and each such message costs a parent turn
+reading the parent's whole prefix, more than the rewrite it saves.
+
+`chsum warm` spends usage limits on each ping, so it runs only on request.
 
 ## A subagent's work
 

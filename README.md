@@ -22,7 +22,9 @@ chsum also:
   [implementation details](#checkpoints-and-undo) below.
 - **Load back an abandoned path.** Started a session, then rewound to a
   specific spot to continue along another path? chsum makes it easy to load
-  back the other, "abandoned" path with `chsum digest --branches`. See the
+  back the other, "abandoned" path with `chsum digest --branches`. It checks
+  first that the branch's prompt cache is still live, and refuses with the
+  reason when a resume would pay to rewrite it. See the
   [implementation details](#branches) on how this works.
 - **See what a subagent is doing** before its report arrives. A session
   launches an agent and cannot get its details without overloading its own
@@ -31,6 +33,11 @@ chsum also:
   them. The session can easily see whether the agent has sidetracked, and give
   clear nudges to correct it, or stop it. See the
   [implementation details](#subagents) for how this works.
+- **Spend less on the prompt cache.** A cold cache rewrites a session's whole
+  history on the next message. `chsum cache` shows which of your session and
+  its agents are warm and what reusing each costs, `chsum warm` keeps an idle
+  session warm, and the plugin's hooks stop a message to a cold session or
+  agent until you confirm. See [`chsum cache`](#chsum-cache-and-chsum-warm).
 - **Mark a moment to get back to.** Something interesting happened during a
   session and you want to get back to it easily? Use `chsum mark "<reason>"`
   inside the conversation, and the previous reply is included in the digests.
@@ -76,6 +83,8 @@ Read one: `chsum digest <ref> --stdout`   Most recent real session: `chsum diges
 | The raw record behind `01a0acf9:31` | `chsum where 01a0acf9:31` |
 | This session's ref | `chsum here` |
 | The path a rewind left behind | `chsum digest <ref> --branches` |
+| Whether reusing an agent or session costs a cache rewrite | `chsum cache` |
+| A session's cache kept warm while you're away | `chsum warm <ref>` |
 | A change Claude made, taken back | `chsum undo` |
 | The moment that mattered, findable later | `chsum note "…"` |
 | A session titled for what it became | `chsum name "…"` |
@@ -459,6 +468,35 @@ goes through chsum.
 
 <img src="https://raw.githubusercontent.com/InDate/chsum/main/meta/chsum_notes_in_claude-history.webp" alt="chsum notes shown at their rows in claude-history's viewer" width="800" />
 
+## `chsum cache` and `chsum warm`
+
+Each message re-sends a session's whole history; the prompt cache bills the
+part already sent at a tenth of the input rate while it lives, and a lapsed
+cache rewrites all of it at up to twice the rate. On a subscription the main
+session's cache lives an hour from its last request and an agent's five
+minutes.
+
+```
+chsum cache [ref]          # this session and each agent: warm or expired, time left, reuse cost
+chsum warm [ref]           # ping an idle session before expiry, until Ctrl-C; --for 3h caps it
+```
+
+- **Reusing an agent** reads its history from cache only while it is warm and
+  only if it made a tool call; otherwise it rewrites the lot, and a new agent
+  costs less.
+- **Where to run a long job.** A wait over five minutes expires an agent's
+  cache mid-task. One long command with a short result runs best from the main
+  session as a background task; multi-step work with a long step suits an
+  agent with a one-hour cache (`cacheTtl: 1h`); long work you return to suits
+  its own session, which keeps the hour, takes messages and takes `chsum warm`.
+- **`chsum warm`** resumes the session without saving a turn, so the transcript
+  stays as it was. Each ping draws on your usage limits. Agents fall outside it.
+
+The plugin's hooks put the same figures where the choice is made: a message
+that would resume a cold agent, or wake an idle session with a cold cache,
+asks you first with the tokens it rewrites, and your own first prompt to a
+cold session is held once with its cost; send it again to proceed.
+
 ## `chsum hook`
 
 What the plugin's hooks run; not a command you type. It writes git checkpoints:
@@ -466,8 +504,10 @@ one commit per tool call that changed the tree, which `recap`, `--writes`,
 `where --git` and `undo` read.
 
 ```
-chsum hook post-tool-use    # after each tool call: checkpoint the tree
-chsum hook session-start    # at session start: raise the opt-in, once
+chsum hook post-tool-use      # after each tool call: checkpoint the tree
+chsum hook session-start      # at session start: raise the opt-in, once
+chsum hook pre-tool-use       # before Agent and SendMessage: the cache cost
+chsum hook user-prompt-submit # before your prompt: hold one to a cold cache
 ```
 
 - **Opt-in per project.** Nothing is recorded until `.git/chsum-checkpoint`
@@ -592,6 +632,13 @@ each record that nothing points back to traces every path through the
 conversation, and paths that share their typed prompts up to a point are
 grouped where they part. That grouping is the branch list.
 
+Before `--branches <n>` resumes a branch, it reads the branch's last request
+from the transcript: its time, its model and the lifetime of the cache it
+wrote. It refuses when that cache has expired, when Claude Code has been
+upgraded since, or when a settings or `.mcp.json` file changed, since each of
+those makes the resume rewrite the whole branch. It resumes on the branch's
+own model, and `--force` resumes past a refusal.
+
 ### Checkpoints and undo
 
 Checkpoints come from a hook that runs after each tool call. Where the working
@@ -616,6 +663,17 @@ makes prints as a single line naming the tool and the file or command, so the
 output grows with what the agent said rather than with the size of its edits
 and command output. The parent session reads that progress when it runs the
 command, and nothing reaches its context between runs.
+
+### The prompt cache
+
+Every response in a transcript records the cache it read and wrote, split into
+one-hour and five-minute writes, so a session's or an agent's cache expiry is
+computed from the transcript with no request sent. Measured on a subscription:
+the main session's cache outlived a five-minute gap; an agent's did not, and
+`subagentPromptCacheTtl: "1h"` held it; a resumed agent read its cache only if
+it had made a tool call; a message to another idle session read that
+session's cache. Other running sessions are found by their messaging name in
+Claude Code's registry, `~/.claude/sessions/<pid>.json`.
 
 ### Marks
 
