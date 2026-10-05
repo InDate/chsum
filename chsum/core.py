@@ -4456,8 +4456,8 @@ def _branch_session(path: pathlib.Path, branch: _Branch, number: int,
     The id derives from the source and the tip, so asking again returns the
     file already written, along with any turns taken in it since. Returns the
     file and whether this call wrote it."""
-    sid = str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"chsum-branch/{path.stem}/{branch.tip['uuid']}"))
-    dest = path.parent / f"{sid}.jsonl"
+    dest = _branch_dest(path, branch)
+    sid = dest.stem
     if dest.exists():
         return dest, False
     with dest.open("w", encoding="utf-8") as fh:
@@ -4469,6 +4469,105 @@ def _branch_session(path: pathlib.Path, branch: _Branch, number: int,
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     append_ai_title(dest, f"{title} · branch {number}")
     return dest, True
+
+
+def _branch_dest(path: pathlib.Path, branch: _Branch) -> pathlib.Path:
+    sid = str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"chsum-branch/{path.stem}/{branch.tip['uuid']}"))
+    return path.parent / f"{sid}.jsonl"
+
+
+# Seconds a cache entry lasts, keyed by the `usage.cache_creation` field its
+# write is billed under. A read restarts the clock and keeps the kind written.
+_CACHE_LIFETIME = {"ephemeral_1h_input_tokens": 3600, "ephemeral_5m_input_tokens": 300}
+
+
+def _cache_basis(records: list[dict]) -> tuple[dict | None, int | None]:
+    """The last request among `records`, and the lifetime of the entries it
+    left: the kind of the newest write, since every later request only read
+    them. A request writing both kinds ends on the 5-minute one, which is the
+    entry a resume's lookup lands on, so the shorter lifetime holds."""
+    requests = sorted((r for r in records if r.get("type") == "assistant"
+                       and isinstance((r.get("message") or {}).get("usage"), dict)),
+                      key=lambda r: str(r.get("timestamp") or ""))
+    lifetime = None
+    for r in reversed(requests):
+        split = r["message"]["usage"].get("cache_creation") or {}
+        written = [_CACHE_LIFETIME[k] for k in _CACHE_LIFETIME if split.get(k)]
+        if written:
+            lifetime = min(written)
+            break
+    return (requests[-1] if requests else None), lifetime
+
+
+def _tool_inputs(cwd: str) -> list[pathlib.Path]:
+    """Files that set the tool list a resume sends. The tool list opens the
+    request, so a change there misses every cached entry. CLAUDE.md, the skill
+    listing, the date and hook output sit in the transcript as attachments and
+    are replayed as recorded, so an edit to them leaves the prefix whole.
+    Plugins and user-scope MCP servers stand outside this list, so a list with
+    no newer file bounds the known causes only."""
+    out = [pathlib.Path.home() / ".claude" / "settings.json"]
+    if cwd:
+        here = pathlib.Path(cwd)
+        for d in (here, *here.parents):
+            out += [d / ".mcp.json", d / ".claude" / "settings.json",
+                    d / ".claude" / "settings.local.json"]
+    return list(dict.fromkeys(out))
+
+
+def _claude_version() -> str:
+    exe = shutil.which("claude")
+    if not exe:
+        return ""
+    try:
+        proc = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return (proc.stdout.split() or [""])[0]
+
+
+def _cache_refusals(records: list[dict], now: float, running_version: str,
+                    inputs: list[pathlib.Path]) -> list[str]:
+    """Why a resume of `records` reads none of its cached prefix, one line per
+    cause found. Empty when every recorded condition holds, which bounds the
+    causes a transcript records: the tool list and system prompt a resume
+    sends are stored nowhere, and only the first request after the resume
+    measures them."""
+    last, lifetime = _cache_basis(records)
+    if last is None:
+        return ["no request on the branch recorded cache usage, so no entry is "
+                "known to hold its prefix"]
+    reasons = []
+    when = _parse_ts(str(last.get("timestamp") or ""))
+    if lifetime is None:
+        reasons.append("no request on the branch recorded a cache write, so the "
+                       "lifetime of its entries is unknown")
+    elif when and now - when.timestamp() > lifetime:
+        reasons.append(f"the last request ran {_fmt_secs(int(now - when.timestamp()))} "
+                       f"ago and its entries last {_fmt_secs(lifetime)}: they have "
+                       f"expired, and the resume writes the whole branch again")
+    recorded = next((str(r["version"]) for r in reversed(records) if r.get("version")), "")
+    if not running_version:
+        reasons.append("claude is not on PATH, so the running version has nothing "
+                       "to compare against")
+    elif recorded and recorded != running_version:
+        reasons.append(f"the branch ran under Claude Code {recorded} and "
+                       f"{running_version} is installed: a resume rebuilds the tool "
+                       f"definitions from the installed version, a new version "
+                       f"typically changes them, and the tool list opens the "
+                       f"request, so a change there misses every entry")
+    for f in inputs:
+        try:
+            changed = f.stat().st_mtime
+        except OSError:
+            continue
+        if when and changed > when.timestamp():
+            reasons.append(f"{f} changed {_fmt_secs(int(changed - when.timestamp()))} "
+                           f"after the last request: its permissions and MCP "
+                           f"servers set the tool list, which opens the request, "
+                           f"so a changed list misses every "
+                           f"cached entry")
+    return reasons
 
 
 def cmd_digest(args) -> int:
@@ -4558,9 +4657,28 @@ def _digest_branches(args, path: pathlib.Path, ref: str) -> int:
     if not 1 <= n <= len(branches):
         raise SystemExit(f"{ref} has {_branch_count(len(branches))}: "
                          f"--branches takes 1 to {len(branches)}")
-    dest, wrote = _branch_session(path, branches[n - 1], n, meta.title)
-    cwd = str(branches[n - 1].tip.get("cwd") or "")
-    resume = f"claude --resume {dest.stem}"
+    branch = branches[n - 1]
+    cwd = str(branch.tip.get("cwd") or "")
+    # A copy resumed before carries the turns taken in it since, and its last
+    # request is the one that left the live entries.
+    held = _branch_dest(path, branch)
+    records = list(_records(held)) if held.exists() else branch.chain
+    refusals = _cache_refusals(records, time.time(), _claude_version(),
+                               _tool_inputs(cwd))
+    if refusals and not getattr(args, "force", False):
+        raise SystemExit(f"branch {n} would resume with no cached prefix:\n"
+                         + "\n".join(f"  - {r}" for r in refusals)
+                         + f"\n`chsum digest {ref} --branches {n} --force` resumes "
+                           f"it and pays the full cache write")
+    for r in refusals:
+        print(f"forced past: {r}", file=sys.stderr)
+    dest, wrote = _branch_session(path, branch, n, meta.title)
+    # The resume runs on the model that wrote the entries: caches are filed
+    # per model, so the session default reads nothing when it differs.
+    last, _ = _cache_basis(records)
+    model = str(((last or {}).get("message") or {}).get("model") or "")
+    flags = ["--resume", dest.stem] + (["--model", model] if model else [])
+    resume = shlex.join(["claude", *flags])
     print(f"{'wrote' if wrote else 'already written:'} branch {n} as {dest}",
           file=sys.stderr)
     # A terminal on both ends runs the resume in place; piped or captured, the
@@ -4570,7 +4688,7 @@ def _digest_branches(args, path: pathlib.Path, ref: str) -> int:
         if cwd and pathlib.Path(cwd).is_dir():
             os.chdir(cwd)
         sys.stdout.flush()
-        os.execv(claude, ["claude", "--resume", dest.stem])
+        os.execv(claude, ["claude", *flags])
     print(f"cd {shlex.quote(cwd)} && {resume}" if cwd else resume)
     return 0
 
@@ -5083,6 +5201,349 @@ def cmd_here(args) -> int:
     print(f"  session  {path.stem}")
     print(f"  title    {meta.title or '(untitled)'}")
     return 0
+
+
+def _cache_row(records: list[dict], now: float) -> dict | None:
+    """One conversation's cache state from its own requests: the lifetime of
+    the entries its newest write left, their age, and the tokens its last
+    request sent, which is the prefix a continuation sends again. `shared` is
+    what its first request read, the part it holds in common with other
+    conversations on the same model and directory."""
+    last, lifetime = _cache_basis(records)
+    if last is None:
+        return None
+    usage = last["message"]["usage"]
+    when = _parse_ts(str(last.get("timestamp") or ""))
+    first = next(r for r in records if r.get("type") == "assistant"
+                 and isinstance((r.get("message") or {}).get("usage"), dict))
+    return {
+        "model": str(last["message"].get("model") or ""),
+        "age": int(now - when.timestamp()) if when else None,
+        "lifetime": lifetime,
+        "prefix": sum(int(usage.get(k) or 0) for k in
+                      ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")),
+        "shared": int(first["message"]["usage"].get("cache_read_input_tokens") or 0),
+        "tool_calls": any(isinstance(c, dict) and c.get("type") == "tool_use"
+                          for r in records if r.get("type") == "assistant"
+                          for c in ((r.get("message") or {}).get("content") or [])
+                          if isinstance((r.get("message") or {}).get("content"), list)),
+    }
+
+
+def _agent_rows(path: pathlib.Path, now: float) -> list[tuple[pathlib.Path, dict]]:
+    """`_cache_row` for each agent a session ran. The first agent of a session
+    reads nothing on its first request and writes the shared prefix for those
+    after it, so each row's `shared` is the largest first read among agents on
+    its model."""
+    agents = []
+    for side in subagent_transcripts(path):
+        row = _cache_row(list(_records(side)), now)
+        if row is not None:
+            agents.append((side, row))
+    shared: dict[str, int] = {}
+    for _, row in agents:
+        shared[row["model"]] = max(shared.get(row["model"], 0), row["shared"])
+    for _, row in agents:
+        row["shared"] = shared[row["model"]]
+    return agents
+
+
+def _cache_state(row: dict) -> str:
+    if row["lifetime"] is None or row["age"] is None:
+        return "lifetime unknown: no cache write recorded"
+    left = row["lifetime"] - row["age"]
+    span = _fmt_secs(row["lifetime"])
+    if left > 0:
+        return f"warm, {_fmt_secs(left)} left of {span}"
+    return f"expired {_fmt_secs(-left)} ago ({span} entries)"
+
+
+def cmd_cache(args) -> int:
+    """The prompt-cache state of a conversation and of each agent it ran, read
+    from the transcripts: whether the entries each one left are still live,
+    and the tokens a continuation sends. A warm conversation continues at the
+    cache-read rate; an expired one writes its whole prefix again."""
+    path = path_for_ref(args.ref) if args.ref else live_transcript()
+    now = time.time()
+    main = _cache_row(list(_records(path)), now)
+    print(f"{ch_ref_for_path(path)}  cache state, read from the transcripts\n")
+    if main is None:
+        print("main   no request recorded cache usage")
+    else:
+        print(f"main   {main['model']}  {_cache_state(main)}  "
+              f"last request {_fmt_secs(main['age'] or 0)} ago  "
+              f"prefix {main['prefix']:,} tokens")
+    agents = _agent_rows(path, now)
+    if not agents:
+        print("\nNo agents recorded cache usage.")
+        return 0
+    agents.sort(key=lambda a: a[1]["age"] if a[1]["age"] is not None else 1 << 62)
+    print(f"\nagents, most recent first ({len(agents)})")
+    for side, row in agents[:args.limit or None]:
+        rewrite = max(row["prefix"] - row["shared"], 0)
+        warm = row["lifetime"] is not None and row["age"] is not None \
+            and row["age"] < row["lifetime"]
+        if not row["tool_calls"]:
+            cost = f"no tool calls: a resume rewrites ~{rewrite:,}"
+        elif warm:
+            cost = "a resume reads its history from cache"
+        else:
+            cost = f"a resume rewrites ~{rewrite:,}"
+        print(f"  {side.stem.removeprefix('agent-')}  "
+              f"{_agent_description(str(side)) or '(no description)'}")
+        print(f"      {row['model']}  {_cache_state(row)}  "
+              f"prefix {row['prefix']:,}  {cost}")
+    print("\nA resume (SendMessage to a finished agent) read the agent's history "
+          "from cache when the agent had made a tool call and its entries were "
+          "live, and restarted their clock. An agent that answered in one "
+          "request rewrote its history on every resume, warm or expired. A new "
+          "agent writes its task on top of the prefix all agents share. A "
+          "message to a running agent rides in its next request and leaves the "
+          "cache as it is.")
+    return 0
+
+
+def _warm_ping(sid: str, cwd: str, model: str, lifetime: int) -> dict:
+    """One request over the session's recorded prefix from a separate process.
+    `--no-session-persistence` leaves the transcript untouched, and the read
+    restarts the clock of every entry it hits. The ping requests the lifetime
+    the session's own writes carry: a request asking for the other lifetime
+    read 10,470 of a 28,028-token prefix whose entries were still live.
+    Returns the request's usage, or an `error` key naming why it produced none."""
+    exe = shutil.which("claude")
+    if not exe:
+        return {"error": "claude is not on PATH"}
+    cmd = [exe, "-p", "--resume", sid, "--no-session-persistence",
+           "--output-format", "json"] + (["--model", model] if model else []) + ["Reply with one word: ok."]
+    env = dict(os.environ)
+    if lifetime == _CACHE_LIFETIME["ephemeral_5m_input_tokens"]:
+        env["FORCE_PROMPT_CACHING_5M"] = "1"
+    else:
+        env.pop("FORCE_PROMPT_CACHING_5M", None)
+        env["CLAUDE_CODE_PROMPT_CACHE_TTL"] = "1h"
+    try:
+        proc = subprocess.run(cmd, cwd=cwd or None, stdin=subprocess.DEVNULL, env=env,
+                              capture_output=True, text=True, timeout=300)
+        return json.loads(proc.stdout).get("usage") or {"error": "no usage in the reply"}
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def cmd_warm(args) -> int:
+    """Holds a conversation's prompt cache live while it sits idle. Every
+    minute it reads the transcript's last request; once the conversation has
+    been idle for its entries' lifetime less a margin, it sends one ping over
+    the recorded prefix. Real turns move the last request forward, which
+    delays the next ping. It runs until interrupted or --for, and stops at the
+    first ping whose read
+    misses or whose write reaches a tenth of its read, since either marks a
+    prefix that changed and a ping that only pays for a rewrite."""
+    path = path_for_ref(args.ref) if args.ref else live_transcript()
+    stop_at = float("inf")
+    if args.duration:
+        m = re.fullmatch(r"(\d+)\s*([mh])", args.duration.strip())
+        if not m:
+            raise SystemExit(f"--for expects forms like 90m, 3h (got {args.duration!r})")
+        stop_at = time.time() + int(m.group(1)) * {"m": 60, "h": 3600}[m.group(2)]
+    cwd = _transcript_cwd(path)
+    last_ping = 0.0
+
+    def say(text: str) -> None:
+        print(f"{datetime.now(timezone.utc):%H:%M:%S}  {text}", flush=True)
+
+    until = ("until interrupted" if stop_at == float("inf") else
+             f"until {datetime.fromtimestamp(stop_at, timezone.utc):%H:%M:%S} UTC")
+    say(f"holding {ch_ref_for_path(path)} warm {until}")
+    while time.time() < stop_at:
+        records = list(_records(path))
+        last, lifetime = _cache_basis(records)
+        if last is None or lifetime is None:
+            say("no cache write recorded yet; checking again in 60s")
+            time.sleep(60)
+            continue
+        when = _parse_ts(str(last.get("timestamp") or ""))
+        active = max(when.timestamp() if when else 0.0, last_ping)
+        margin = min(300, lifetime // 5)
+        due = active + lifetime - margin
+        now = time.time()
+        if now - active > lifetime:
+            say(f"the entries expired {_fmt_secs(int(now - active - lifetime))} ago; "
+                f"a ping would rewrite the whole prefix, so stopping")
+            return 1
+        if now < due:
+            time.sleep(min(60, max(due - now, 1)))
+            continue
+        model = str((last.get("message") or {}).get("model") or "")
+        usage = _warm_ping(path.stem, cwd, model, lifetime)
+        last_ping = time.time()
+        if "error" in usage:
+            say(f"ping failed: {usage['error']}; stopping")
+            return 1
+        read = int(usage.get("cache_read_input_tokens") or 0)
+        wrote = int(usage.get("cache_creation_input_tokens") or 0)
+        say(f"ping read {read:,} and wrote {wrote:,}")
+        if read == 0 or wrote * 10 >= read:
+            say("the ping missed most of the prefix: it changed since the last "
+                "request, so further pings pay for a rewrite; stopping")
+            return 1
+    say("--for reached; stopping")
+    return 0
+
+
+def _agent_finished(records: list[dict]) -> bool:
+    """An agent whose last request ended its turn has finished, so a message
+    to it resumes it in a new run; one whose last request asked for a tool is
+    still running, and a message rides in its next request."""
+    stops = [str((r.get("message") or {}).get("stop_reason") or "")
+             for r in records if r.get("type") == "assistant"]
+    stops = [s for s in stops if s]
+    return bool(stops) and stops[-1] != "tool_use"
+
+
+def _agent_by_target(path: pathlib.Path, target: str) -> pathlib.Path | None:
+    """The agent transcript a SendMessage `to` names inside one session: an
+    agent id, or the name or description its Agent call carried, the latest
+    call winning as SendMessage resolves it."""
+    sides = {s.stem.removeprefix("agent-"): s for s in subagent_transcripts(path)}
+    if target in sides:
+        return sides[target]
+    by_call: dict[str, pathlib.Path] = {}
+    for sid, side in sides.items():
+        try:
+            meta = json.loads(side.with_suffix(".meta.json").read_text(errors="replace"))
+            by_call[str(meta.get("toolUseId") or "")] = side
+        except (OSError, ValueError, AttributeError):
+            continue
+    hit = None
+    for r in _records(path):
+        content = (r.get("message") or {}).get("content") if r.get("type") == "assistant" else None
+        for c in content if isinstance(content, list) else []:
+            if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("name") == "Agent":
+                inp = c.get("input") or {}
+                if target in (inp.get("name"), inp.get("description")) and c.get("id") in by_call:
+                    hit = by_call[c["id"]]
+    return hit
+
+
+def _peer_session(target: str) -> dict | None:
+    """A running local session by its messaging name, from Claude Code's
+    registry `~/.claude/sessions/<pid>.json`. A `[ref]` suffix is dropped:
+    the name alone addresses a session unless two share it, and two matches
+    return None."""
+    name = re.sub(r"\s*\[[^\]]*\]\s*$", "", target)
+    hits = []
+    for f in (pathlib.Path.home() / ".claude" / "sessions").glob("*.json"):
+        try:
+            d = json.loads(f.read_text(errors="replace"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict) and d.get("name") == name and d.get("sessionId"):
+            hits.append(d)
+    return hits[0] if len(hits) == 1 else None
+
+
+def _pre_tool_out(**fields) -> int:
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", **fields}}))
+    return 0
+
+
+def _hook_pre_tool_use(payload: dict) -> int:
+    """PreToolUse on Agent and SendMessage: the cache cost of each choice,
+    placed where the choice is made. A launch carries the session's agent
+    cache lines as context. A message that resumes a finished agent, or wakes
+    an idle session, whose cache is cold asks the user first, naming the
+    tokens it rewrites. Exit 2 is the code that blocks a turn, so every path,
+    an exception included, exits 0 and lets the call run."""
+    try:
+        tool = payload.get("tool_name")
+        path = pathlib.Path(str(payload.get("transcript_path") or ""))
+        if tool not in ("Agent", "SendMessage") or not path.is_file():
+            return 0
+        now = time.time()
+        if tool == "Agent":
+            rows = sorted(_agent_rows(path, now), key=lambda a: a[1]["age"] or 0)[:5]
+            if not rows:
+                return 0
+            lines = [f"{s.stem.removeprefix('agent-')} {_agent_description(str(s))}: "
+                     f"{_cache_state(r)}, prefix {r['prefix']:,}" for s, r in rows]
+            return _pre_tool_out(additionalContext="chsum cache, this session's agents:\n"
+                                 + "\n".join(lines))
+        target = str((payload.get("tool_input") or {}).get("to") or "").strip()
+        if not target or target == "main":
+            return 0
+        side = _agent_by_target(path, target)
+        if side is not None:
+            records = list(_records(side))
+            row = dict(next((r for s, r in _agent_rows(path, now) if s == side), None) or {})
+            if not row or not _agent_finished(records):
+                return 0
+            warm = row["lifetime"] is not None and row["age"] is not None \
+                and row["age"] < row["lifetime"]
+            if row["tool_calls"] and warm:
+                return 0
+            why = (_cache_state(row) if row["tool_calls"] else
+                   "it made no tool calls, and such an agent rewrites on every resume")
+            return _pre_tool_out(
+                permissionDecision="ask",
+                permissionDecisionReason=f"chsum: resuming {target} rewrites "
+                f"~{max(row['prefix'] - row['shared'], 0):,} tokens: {why}")
+        peer = _peer_session(target)
+        if peer is None:
+            return _pre_tool_out(additionalContext=f"chsum: {target} matches no agent "
+                                 "of this session and no single local session, so "
+                                 "its cache state is not readable here")
+        if peer.get("status") == "busy":
+            return 0
+        hits = list(PROJECTS_ROOT.glob(f"*/{peer['sessionId']}.jsonl"))
+        row = _cache_row(list(_records(hits[0])), now) if hits else None
+        if row is None or row["lifetime"] is None or row["age"] is None:
+            return _pre_tool_out(additionalContext=f"chsum: {target}'s transcript "
+                                 "records no cache write, so its cache state is unknown")
+        if row["age"] < row["lifetime"]:
+            return 0
+        return _pre_tool_out(
+            permissionDecision="ask",
+            permissionDecisionReason=f"chsum: messaging {target} rewrites "
+            f"~{row['prefix']:,} tokens: its cache {_cache_state(row)}")
+    except Exception as e:  # noqa: BLE001 — a fault here lets the call run
+        print(f"chsum pre-tool-use hook: {e}", file=sys.stderr)
+        return 0
+
+
+def _hook_user_prompt_submit(payload: dict) -> int:
+    """UserPromptSubmit: a prompt to a session whose cache expired rewrites
+    the whole prefix at the write rate. The first such prompt is held back
+    with the cost, and a marker keyed on the session's last request lets the
+    same prompt sent again through; any new request moves the key, so each
+    cold spell warns once. Every path exits 0."""
+    try:
+        path = pathlib.Path(str(payload.get("transcript_path") or ""))
+        sid = str(payload.get("session_id") or "")
+        if not sid or not path.is_file():
+            return 0
+        records = list(_records(path))
+        row = _cache_row(records, time.time())
+        if row is None or row["lifetime"] is None or row["age"] is None \
+                or row["age"] < row["lifetime"]:
+            return 0
+        marker = CHSUM_DIR / "cold-warned" / f"{sid}.txt"
+        last = str((_cache_basis(records)[0] or {}).get("timestamp") or "")
+        try:
+            if marker.read_text().strip() == last:
+                return 0
+        except OSError:
+            pass
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(last)
+        print(json.dumps({"decision": "block", "reason":
+              f"chsum: this session's cache {_cache_state(row)}; this prompt "
+              f"rewrites ~{row['prefix']:,} tokens at the cache-write rate. Send "
+              f"it again to proceed. A new session, or Claude Code's resume from "
+              f"a summary, avoids the rewrite."}))
+        return 0
+    except Exception as e:  # noqa: BLE001 — a fault here lets the prompt through
+        print(f"chsum user-prompt-submit hook: {e}", file=sys.stderr)
+        return 0
 
 
 def cmd_name(args) -> int:
@@ -7392,6 +7853,10 @@ def cmd_hook(args) -> int:
     payload = _read_payload()
     if args.event == "post-tool-use":
         return _hook_post_tool_use(payload)
+    if args.event == "pre-tool-use":
+        return _hook_pre_tool_use(payload)
+    if args.event == "user-prompt-submit":
+        return _hook_user_prompt_submit(payload)
     return _hook_session_start(payload)
 
 
@@ -8894,13 +9359,18 @@ class HaikuSummariser(Summariser):
             raise SummariserError("claude CLI not on PATH")
         cwd = CHSUM_DIR
         cwd.mkdir(parents=True, exist_ok=True)
+        # A `-p` run writes one-hour cache entries at 2× input; a recap call is
+        # never resumed, so five-minute entries at 1.25× carry it and still
+        # serve a repeat recap of the same window inside five minutes.
+        env = {**os.environ, "CLAUDE_CODE_PROMPT_CACHE_TTL": "5m"}
         started = time.monotonic()
         try:
             proc = subprocess.run(
                 # JSON purely for accounting: it carries `usage`, tokens actually charged.
                 [exe, "-p", "--model", self.model, "--output-format", "json",
+                 "--no-session-persistence",
                  "--system-prompt", system_prompt, "--tools", "", "--setting-sources", ""],
-                input=material,
+                input=material, env=env,
                 capture_output=True, text=True, timeout=_CALL_TIMEOUT, cwd=cwd,
             )
         except subprocess.TimeoutExpired:
@@ -9076,6 +9546,24 @@ def main(argv=None) -> int:
                        help="this conversation's ref, session id and title")
     p.set_defaults(func=cmd_here)
 
+    p = sub.add_parser("cache", parents=[dbg],
+                       help="whether this conversation's prompt cache and each "
+                            "agent's are live, and what continuing each costs")
+    p.add_argument("ref", nargs="?", default="",
+                   help="a ch_ ref or session id (default: this conversation)")
+    p.add_argument("-n", "--limit", type=int, default=10, metavar="N",
+                   help="agents to list, most recent first, 0 for all (default: 10)")
+    p.set_defaults(func=cmd_cache)
+
+    p = sub.add_parser("warm", parents=[dbg],
+                       help="ping an idle conversation's prompt cache before it "
+                            "expires, leaving its transcript untouched")
+    p.add_argument("ref", nargs="?", default="",
+                   help="a ch_ ref or session id (default: this conversation)")
+    p.add_argument("--for", dest="duration", default="", metavar="SPAN",
+                   help="stop after this long, e.g. 90m, 3h (default: until interrupted)")
+    p.set_defaults(func=cmd_warm)
+
     p = sub.add_parser(
         "where", parents=[dbg],
         help="a locator like `01a0acf9:31` to the command that prints that row",
@@ -9201,7 +9689,11 @@ def main(argv=None) -> int:
                    metavar="N",
                    help="every branch a rewind left in the conversation; "
                         "with N, branch N copied into a session of its own "
-                        "and resumed there (piped: the command that resumes it)")
+                        "and resumed there (piped: the command that resumes it); "
+                        "refused when the transcript shows its cached prefix is gone")
+    p.add_argument("--force", action="store_true",
+                   help="with --branches N: resume although the cache check "
+                        "refuses, paying the full cache write")
     p.add_argument("--list", action="store_true",
                    help="this project's digest files, newest first (--all: every project)")
     p.set_defaults(func=cmd_digest)
@@ -9282,7 +9774,8 @@ def main(argv=None) -> int:
                     "`session-start` prints the checkpoint opt-in "
                     "where this project's gate file is absent.",
     )
-    p.add_argument("event", choices=["post-tool-use", "session-start"],
+    p.add_argument("event", choices=["post-tool-use", "pre-tool-use", "session-start",
+                                     "user-prompt-submit"],
                    help="which hook fired")
     p.set_defaults(func=cmd_hook)
 

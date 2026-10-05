@@ -15,7 +15,9 @@ import pathlib
 from .core import *  # noqa: F401,F403 — the CLI's whole surface
 from .core import (  # noqa: F401 — named so the hooks and the console script resolve
     _hook_post_tool_use,
+    _hook_pre_tool_use,
     _hook_session_start,
+    _hook_user_prompt_submit,
     _read_payload,
     main,
 )
