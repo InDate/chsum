@@ -25,6 +25,7 @@ import html
 import json
 import os
 import pathlib
+import random
 import re
 import shlex
 import shutil
@@ -4499,6 +4500,55 @@ def _cache_basis(records: list[dict]) -> tuple[dict | None, int | None]:
     return (requests[-1] if requests else None), lifetime
 
 
+def _request_start(records: list[dict], last: dict) -> float | None:
+    """When the request behind `last` went out. A reply is written one record
+    per content block, each stamped as its block lands, so `last` carries the
+    time the reply ended. An entry's lifetime runs from the request's start,
+    and a clock read off the end overstates the time left by the reply's
+    length. The reply's first block hangs off the record the request carried
+    last, a prompt, tool result or attachment, and that record's stamp bounds
+    the start from below."""
+    mid = (last.get("message") or {}).get("id")
+    first = next((r for r in records if r.get("type") == "assistant"
+                  and (r.get("message") or {}).get("id") == mid), last) if mid else last
+    parent = next((r for r in records if r.get("uuid") and r.get("uuid") == first.get("parentUuid")),
+                  None)
+    for r in (parent, first, last):
+        when = _parse_ts(str((r or {}).get("timestamp") or ""))
+        if when:
+            return when.timestamp()
+    return None
+
+
+PINGS_DIR = CHSUM_DIR / "pings"
+
+
+def _last_ping(sid: str) -> float:
+    """The start of the newest ping `chsum warm` logged for session `sid`, 0
+    for none. A ping runs with `--no-session-persistence` and leaves the
+    transcript as it was, so this log is the only record of the entries it read
+    and restarted; a clock read off the transcript alone reports them expired
+    while the pings hold them live."""
+    try:
+        lines = (PINGS_DIR / f"{sid}.jsonl").read_text().splitlines()
+    except OSError:
+        return 0.0
+    for line in reversed(lines):
+        try:
+            return float(json.loads(line)["start"])
+        except (ValueError, KeyError, TypeError):
+            continue
+    return 0.0
+
+
+def _log_ping(sid: str, start: float, usage: dict) -> None:
+    PINGS_DIR.mkdir(parents=True, exist_ok=True)
+    with (PINGS_DIR / f"{sid}.jsonl").open("a") as f:
+        f.write(json.dumps({"start": start,
+                            "read": int(usage.get("cache_read_input_tokens") or 0),
+                            "wrote": int(usage.get("cache_creation_input_tokens") or 0)}) + "\n")
+
+
 def _tool_inputs(cwd: str) -> list[pathlib.Path]:
     """Files that set the tool list a resume sends. The tool list opens the
     request, so a change there misses every cached entry. CLAUDE.md, the skill
@@ -4538,12 +4588,12 @@ def _cache_refusals(records: list[dict], now: float, running_version: str,
         return ["no request on the branch recorded cache usage, so no entry is "
                 "known to hold its prefix"]
     reasons = []
-    when = _parse_ts(str(last.get("timestamp") or ""))
+    start = _request_start(records, last)
     if lifetime is None:
         reasons.append("no request on the branch recorded a cache write, so the "
                        "lifetime of its entries is unknown")
-    elif when and now - when.timestamp() > lifetime:
-        reasons.append(f"the last request ran {_fmt_secs(int(now - when.timestamp()))} "
+    elif start and now - start > lifetime:
+        reasons.append(f"the last request ran {_fmt_secs(int(now - start))} "
                        f"ago and its entries last {_fmt_secs(lifetime)}: they have "
                        f"expired, and the resume writes the whole branch again")
     recorded = next((str(r["version"]) for r in reversed(records) if r.get("version")), "")
@@ -5203,22 +5253,27 @@ def cmd_here(args) -> int:
     return 0
 
 
-def _cache_row(records: list[dict], now: float) -> dict | None:
+def _cache_row(records: list[dict], now: float, sid: str = "") -> dict | None:
     """One conversation's cache state from its own requests: the lifetime of
     the entries its newest write left, their age, and the tokens its last
     request sent, which is the prefix a continuation sends again. `shared` is
     what its first request read, the part it holds in common with other
-    conversations on the same model and directory."""
+    conversations on the same model and directory. `sid` names the session
+    whose logged pings also restart the clock; an agent takes no pings, so its
+    rows pass none."""
     last, lifetime = _cache_basis(records)
     if last is None:
         return None
     usage = last["message"]["usage"]
-    when = _parse_ts(str(last.get("timestamp") or ""))
+    start = _request_start(records, last)
+    ping = _last_ping(sid) if sid else 0.0
+    active = max(start or 0.0, ping) or None
     first = next(r for r in records if r.get("type") == "assistant"
                  and isinstance((r.get("message") or {}).get("usage"), dict))
     return {
         "model": str(last["message"].get("model") or ""),
-        "age": int(now - when.timestamp()) if when else None,
+        "age": int(now - active) if active else None,
+        "pinged": bool(start) and ping > start,
         "lifetime": lifetime,
         "prefix": sum(int(usage.get(k) or 0) for k in
                       ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")),
@@ -5265,13 +5320,13 @@ def cmd_cache(args) -> int:
     cache-read rate; an expired one writes its whole prefix again."""
     path = path_for_ref(args.ref) if args.ref else live_transcript()
     now = time.time()
-    main = _cache_row(list(_records(path)), now)
+    main = _cache_row(list(_records(path)), now, path.stem)
     print(f"{ch_ref_for_path(path)}  cache state, read from the transcripts\n")
     if main is None:
         print("main   no request recorded cache usage")
     else:
         print(f"main   {main['model']}  {_cache_state(main)}  "
-              f"last request {_fmt_secs(main['age'] or 0)} ago  "
+              f"last {'ping' if main['pinged'] else 'request'} {_fmt_secs(main['age'] or 0)} ago  "
               f"prefix {main['prefix']:,} tokens")
     agents = _agent_rows(path, now)
     if not agents:
@@ -5309,7 +5364,10 @@ def _warm_ping(sid: str, cwd: str, model: str, lifetime: int) -> dict:
     restarts the clock of every entry it hits. The ping requests the lifetime
     the session's own writes carry: a request asking for the other lifetime
     read 10,470 of a 28,028-token prefix whose entries were still live.
-    Returns the request's usage, or an `error` key naming why it produced none."""
+    Returns the request's usage, or an `error` key carrying the reply's error
+    text. A reply with `is_error` set, a non-zero exit, and usage of all zeros
+    each return the error: all-zero usage is what an interrupted run reports,
+    and read as a ping it produces a false miss."""
     exe = shutil.which("claude")
     if not exe:
         return {"error": "claude is not on PATH"}
@@ -5324,20 +5382,42 @@ def _warm_ping(sid: str, cwd: str, model: str, lifetime: int) -> dict:
     try:
         proc = subprocess.run(cmd, cwd=cwd or None, stdin=subprocess.DEVNULL, env=env,
                               capture_output=True, text=True, timeout=300)
-        return json.loads(proc.stdout).get("usage") or {"error": "no usage in the reply"}
-    except (OSError, subprocess.SubprocessError, ValueError) as e:
+    except (OSError, subprocess.SubprocessError) as e:
         return {"error": f"{type(e).__name__}: {e}"}
+    try:
+        reply = json.loads(proc.stdout)
+    except ValueError:
+        reply = {}
+    if not isinstance(reply, dict):
+        reply = {}
+    usage = reply.get("usage") if isinstance(reply.get("usage"), dict) else {}
+    tokens = sum(int(usage.get(k) or 0) for k in
+                 ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+    if reply.get("is_error") or proc.returncode or not tokens:
+        detail = (str(reply.get("result") or reply.get("subtype") or "").strip()
+                  or proc.stderr.strip()[-500:] or "no usage in the reply")
+        return {"error": f"exit {proc.returncode}, {detail}"}
+    return usage
+
+
+def _ping_wait(lifetime: int) -> float:
+    return random.uniform(0.5, 58 / 60) * lifetime
 
 
 def cmd_warm(args) -> int:
     """Holds a conversation's prompt cache live while it sits idle. Every
     minute it reads the transcript's last request; once the conversation has
-    been idle for its entries' lifetime less a margin, it sends one ping over
-    the recorded prefix. Real turns move the last request forward, which
-    delays the next ping. It runs until interrupted or --for, and stops at the
-    first ping whose read
-    misses or whose write reaches a tenth of its read, since either marks a
-    prefix that changed and a ping that only pays for a rewrite."""
+    been idle for a wait drawn between half and 58/60 of its entries' lifetime
+    (30 to 58 minutes on one-hour entries), it sends one ping over the
+    recorded prefix. Each request and each ping draws a new wait, so the pings
+    carry no fixed cadence, the pattern scripted traffic produces. Real turns
+    move the last request forward, which delays the next ping. The clock runs
+    from the start of the last request or ping, the moment an entry's lifetime
+    is counted from. Each ping that hits is logged under the session, so the
+    hooks and `chsum cache` count it as activity. It runs until interrupted or
+    --for, and stops at the first ping whose read misses or whose write reaches
+    a tenth of its read, since either marks a prefix that changed and a ping
+    that only pays for a rewrite."""
     path = path_for_ref(args.ref) if args.ref else live_transcript()
     stop_at = float("inf")
     if args.duration:
@@ -5347,6 +5427,7 @@ def cmd_warm(args) -> int:
         stop_at = time.time() + int(m.group(1)) * {"m": 60, "h": 3600}[m.group(2)]
     cwd = _transcript_cwd(path)
     last_ping = 0.0
+    drawn_for, wait = -1.0, 0.0
 
     def say(text: str) -> None:
         print(f"{datetime.now(timezone.utc):%H:%M:%S}  {text}", flush=True)
@@ -5361,10 +5442,11 @@ def cmd_warm(args) -> int:
             say("no cache write recorded yet; checking again in 60s")
             time.sleep(60)
             continue
-        when = _parse_ts(str(last.get("timestamp") or ""))
-        active = max(when.timestamp() if when else 0.0, last_ping)
-        margin = min(300, lifetime // 5)
-        due = active + lifetime - margin
+        active = max(_request_start(records, last) or 0.0, last_ping, _last_ping(path.stem))
+        if active != drawn_for:
+            drawn_for = active
+            wait = _ping_wait(lifetime)
+        due = active + wait
         now = time.time()
         if now - active > lifetime:
             say(f"the entries expired {_fmt_secs(int(now - active - lifetime))} ago; "
@@ -5374,8 +5456,8 @@ def cmd_warm(args) -> int:
             time.sleep(min(60, max(due - now, 1)))
             continue
         model = str((last.get("message") or {}).get("model") or "")
+        started = time.time()
         usage = _warm_ping(path.stem, cwd, model, lifetime)
-        last_ping = time.time()
         if "error" in usage:
             say(f"ping failed: {usage['error']}; stopping")
             return 1
@@ -5386,6 +5468,12 @@ def cmd_warm(args) -> int:
             say("the ping missed most of the prefix: it changed since the last "
                 "request, so further pings pay for a rewrite; stopping")
             return 1
+        last_ping = started
+        try:
+            _log_ping(path.stem, started, usage)
+        except OSError as e:
+            say(f"ping not logged ({e}); the hooks and `chsum cache` read this "
+                f"session as idle since its last request")
     say("--for reached; stopping")
     return 0
 
@@ -5495,7 +5583,7 @@ def _hook_pre_tool_use(payload: dict) -> int:
         if peer.get("status") == "busy":
             return 0
         hits = list(PROJECTS_ROOT.glob(f"*/{peer['sessionId']}.jsonl"))
-        row = _cache_row(list(_records(hits[0])), now) if hits else None
+        row = _cache_row(list(_records(hits[0])), now, peer["sessionId"]) if hits else None
         if row is None or row["lifetime"] is None or row["age"] is None:
             return _pre_tool_out(additionalContext=f"chsum: {target}'s transcript "
                                  "records no cache write, so its cache state is unknown")
@@ -5522,7 +5610,7 @@ def _hook_user_prompt_submit(payload: dict) -> int:
         if not sid or not path.is_file():
             return 0
         records = list(_records(path))
-        row = _cache_row(records, time.time())
+        row = _cache_row(records, time.time(), path.stem)
         if row is None or row["lifetime"] is None or row["age"] is None \
                 or row["age"] < row["lifetime"]:
             return 0

@@ -490,7 +490,11 @@ chsum warm [ref]           # ping an idle session before expiry, until Ctrl-C; -
   agent with a one-hour cache (`cacheTtl: 1h`); long work you return to suits
   its own session, which keeps the hour, takes messages and takes `chsum warm`.
 - **`chsum warm`** resumes the session without saving a turn, so the transcript
-  stays as it was. Each ping draws on your usage limits. Agents fall outside it.
+  stays as it was. It pings after a random wait of 30 to 58 minutes on
+  one-hour entries (half to 58/60 of the lifetime), counted from the last
+  request or ping. A ping that fails, a hook block included, stops it with the
+  reply's own error text. Each ping draws on your usage limits. Agents fall
+  outside it.
 
 The plugin's hooks put the same figures where the choice is made: a message
 that would resume a cold agent, or wake an idle session with a cold cache,
@@ -668,7 +672,13 @@ command, and nothing reaches its context between runs.
 
 Every response in a transcript records the cache it read and wrote, split into
 one-hour and five-minute writes, so a session's or an agent's cache expiry is
-computed from the transcript with no request sent. Measured on a subscription:
+computed from the transcript with no request sent. The clock runs from the
+time the request went out, the record the reply hangs off, since an entry's
+lifetime counts from the request's start and the reply's own records are stamped
+as it streams. A `chsum warm` ping leaves no record in the transcript, so each
+ping that hits is logged in `pings/<session>.jsonl` in chsum's data directory;
+`chsum cache` and both hooks count the later of the last request and the last
+logged ping. Measured on a subscription:
 the main session's cache outlived a five-minute gap; an agent's did not, and
 `subagentPromptCacheTtl: "1h"` held it; a resumed agent read its cache only if
 it had made a tool call; a message to another idle session read that
