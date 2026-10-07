@@ -11,6 +11,7 @@ dist/
 # Bench outputs: per-run artefacts, read locally. The material and variants
 # are committed, which is what makes two runs comparable.
 bench/out/
+bench/observe/work/
 meta/*.mov
 meta/*.mp4
 

@@ -1,6 +1,6 @@
 ---
 name: chsum
-description: Verbatim recovery of past coding-agent sessions (Claude Code and Codex CLI) with the `chsum` CLI — sessions listed, one digested whole, a subagent's work while it runs, what a session changed on disk, and undoing those changes. Use when the user names earlier work you don't have in context ("what did we do yesterday", "pick up where we left off", "which session touched this file"), asks what an agent is doing, asks to reload a past session, or asks to undo a change made this session; and before reusing an agent or launching a new one, where the prompt cache sets the cost of each. For searching or quoting *inside* conversations, use the claude-history CLI directly.
+description: Verbatim recovery of past coding-agent sessions (Claude Code and Codex CLI) with the `chsum` CLI — sessions listed, one digested whole, a subagent's work while it runs, what a session changed on disk, and undoing those changes. Use when the user names earlier work you don't have in context ("what did we do yesterday", "pick up where we left off", "which session touched this file"), asks what an agent is doing, asks to reload a past session, or asks to undo a change made this session; when a change on disk has no record in this conversation; and before reusing an agent or launching a new one, where the prompt cache sets the cost of each. For searching or quoting *inside* conversations, use the claude-history CLI directly.
 ---
 
 # chsum
@@ -25,6 +25,9 @@ prints only its path.
 | `chsum digest --writes` | What it changed on disk, per turn |
 | `chsum digest --agents` | Its subagents and their reports |
 | `chsum digest --branches` | Paths a rewind left; `--branches <n>` resumes one |
+| `chsum resume` | After a rewind: writes the handoff for what it cut and sends it to this session as a message |
+| `chsum file <path>` | Which session and turn wrote a file, and whether that turn was rewound |
+| `chsum digest --rewound` | What the nearest rewind took out: each branch it cut, newest first, with its messages, handoff and files |
 | `chsum digest --call <id>` | One tool call and its output, whole |
 | `chsum digest -3 -1` | A window of turns: `1` the first, `-1` the last |
 | `chsum undo` / `chsum redo` | Take back a change made this session, or put it back |
@@ -93,6 +96,53 @@ a neighbour of the call that made it. *No checkpoints for this session* means
 checkpointing is off for the project.
 
 `references/checkpoints.md` — a row to its git diff, retention, the opt-in.
+
+## After a rewind
+
+The person's status line carries a rewind part this conversation never
+receives. Where a message quotes it, `worth it` beside `rewind to “<prompt>”`
+marks a rewind to that prompt, conversation only, then `! chsum resume`, as
+cheaper than carrying the turns since; `break-even N%` marks one not yet
+cheaper, N the share of its cost paid so far. The part drops off with the
+session's cache: the handoff's request fails on an expired branch.
+`cache expired` on that line is the observer's: `chsum observe reload`
+rebuilds its base.
+
+Straight after the rewind, `! chsum resume` starts a separate process and
+exits. Claude Code writes the command's records as it exits, and they hang off
+the point the conversation went back to; the process reads that point, takes
+every branch under it as the cut, and runs one request over the newest branch
+to write the handoff. That request sends the handoff to this session as a
+message from another session, about 20 seconds later, and an idle session
+takes it in at once. The digest of the cut goes in with the next prompt. A
+session missing from Claude Code's registry of running sessions receives the
+handoff with the next prompt instead.
+
+The handoff's facts stand in for the files the cut branch read: open one of
+those files for a fact the handoff leaves out. `chsum: a rewind handoff is
+being written` means it arrives at a later tool result. `chsum: no handoff
+was written` names why (the branch's cache expired, or the Claude Code
+version that built it is gone); the files are then read as the work needs
+them. A rewind with no `chsum resume` after it is found at the first tool
+result, which carries the digest, and the handoff follows at a later one.
+
+## A change with no record in this conversation
+
+A rewind takes a turn's messages out of the conversation and leaves its writes
+on disk, so code can stand in a file with no record here of writing it. Place
+it with `chsum file <path>`: each write to the file, newest first,
+with the session and turn whose call made it.
+
+- **`this session · turn N · rewound`**: written here, in a turn the user
+  rewound. The first tool result after a rewind carries what it took out;
+  `chsum digest --rewound --stdout` prints it again.
+- **A `ch_` ref**: another session wrote it; `chsum digest <ref> --writes
+  --stdout` shows its turn.
+- **`outside`**: the session saw the change between its calls, and the row of
+  the session that made it stands beside it.
+- **No checkpoint touches it**: no checkpointed call wrote it.
+
+A handoff, a report or a commit message names the writer from this list.
 
 ## Undoing a change
 

@@ -40,6 +40,13 @@ LOCK_NAME = "chsum-checkpoint.lock"
 _LOCK_WAIT = 20.0
 _LOCK_POLL = 0.05
 _CHECKPOINT_PREFIX = "chsum-checkpoint: "
+# The action of a checkpoint holding what changed between two of a session's
+# calls by any other writer. It carries no call and no step.
+OUTSIDE = "outside"
+# The trees `record_pre` writes, one file per call, under the worktree's git
+# directory, and how long one outlives a call that never reached PostToolUse.
+_PRE_DIR = "chsum-pre"
+_PRE_LIFE = 86400
 _HOOK_GIT_TIMEOUT = 30  # seconds per git call — this must never be what hangs a turn
 # The subject's tail is the call that wrote the change, or, for a checkpoint
 # `chsum undo` or `chsum redo` wrote, that action and the stamp of the step it
@@ -47,7 +54,8 @@ _HOOK_GIT_TIMEOUT = 30  # seconds per git call — this must never be what hangs
 # step. `_checkpoint_message` builds what this parses.
 _CHECKPOINT_RE = re.compile(
     "^" + re.escape(_CHECKPOINT_PREFIX) + r"(?P<session>\S+) @ (?P<when>\S+)"
-    r"(?: (?P<action>undo|redo) (?P<step>[^\s/]+)(?:/(?P<part>[a-z]+))?| (?P<call>\S+))?$")
+    r"(?: (?P<action>undo|redo) (?P<step>[^\s/]+)(?:/(?P<part>[a-z]+))?| (?P<outside>outside)"
+    r"| (?P<call>\S+))?$")
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 # `core` installs its tracer here at import. Left None, every call below runs
@@ -57,7 +65,7 @@ TRACER = None
 
 def _checkpoint_message(session_id: str, when: str, call: str = "",
                         action: str = "", step: str = "", part: str = "") -> str:
-    tail = (f" {action} {step}" + (f"/{part}" if part else "") if action
+    tail = (f" {action}" + (f" {step}" if step else "") + (f"/{part}" if part else "") if action
             else f" {call}" if call else "")
     return f"{_CHECKPOINT_PREFIX}{session_id} @ {when}{tail}"
 
@@ -66,8 +74,10 @@ def _checkpoint_message(session_id: str, when: str, call: str = "",
 class ChainEntry:
     """One checkpoint on a session's chain. `action` is "undo" or "redo" on a
     checkpoint those commands wrote, with `step` the stamp of the checkpoint
-    they reversed or re-applied; both are "" on one the hook wrote. `part` is
-    the letter of the one file of that step it acted on, "" for the whole step."""
+    they reversed or re-applied; both are "" on one the hook wrote. `action` is
+    `OUTSIDE` on a checkpoint holding other writers' changes, with no step and
+    no call. `part` is the letter of the one file of that step it acted on, ""
+    for the whole step."""
     when: str
     sha: str
     call: str = ""
@@ -203,13 +213,16 @@ def _tree_of(cwd: pathlib.Path, commit: str) -> str:
 
 def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str,
                       ref: str = "", action: str = "", step: str = "",
-                      part: str = "") -> str:
+                      part: str = "", pre_tree: str = "") -> str:
     """One checkpoint per tool call that changed the tree, chained under this
     session's ref. `ref` is the `tool_use` id of the call that caused it, "" where
     the payload carries none. `action` and `step` are set by `chsum undo` and
     `chsum redo`: the action, and the stamp of the checkpoint it reversed or
-    re-applied, with `part` the letter of the one file it acted on. Returns the
-    checkpoint written, "" where none was.
+    re-applied, with `part` the letter of the one file it acted on. `pre_tree`
+    is the tree `record_pre` wrote before the call: with it, changes made since
+    the last checkpoint by anything other than the call go into an `outside`
+    checkpoint beneath the call's, so the call's diff holds its own paths only
+    (`_outside_commit`). Returns the checkpoint written, "" where none was.
 
     `HEAD` is never written. The commit object is built by `commit-tree` from a
     tree and a parent, and only `update-ref` publishes it, so no step of this
@@ -235,43 +248,14 @@ def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str,
     if not status.stdout.strip() and not action:
         return ""
 
-    try:
-        index = _git(["git", "rev-parse", "--git-path", _INDEX_NAME], cwd)
-    except (OSError, subprocess.SubprocessError):
+    tree_sha = _worktree_tree(cwd)
+    if not tree_sha:
         return ""
-    if index.returncode != 0:
+    # A tree equal to the one before the call means the call wrote nothing,
+    # whatever else changed since the last checkpoint: those changes wait for
+    # the next call that writes, and go into its `outside` checkpoint.
+    if pre_tree == tree_sha and not action:
         return ""
-    # Absolute, so the environment holds one path whatever `cwd` git resolves to.
-    index_path = pathlib.Path(index.stdout.strip())
-    if not index_path.is_absolute():
-        index_path = (cwd / index_path).resolve()
-    env = {**os.environ, "GIT_INDEX_FILE": str(index_path)}
-
-    try:
-        staged = _git(["git", "add", "-A"], cwd, env=env)
-        if staged.returncode != 0:
-            return ""
-        tree = _git(["git", "write-tree"], cwd, env=env)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    finally:
-        # The throwaway index is rebuilt from scratch on the next call, so a
-        # stale one costs nothing; leaving it does not touch the user's.
-        pass
-    if tree.returncode != 0:
-        return ""
-    tree_sha = tree.stdout.strip()
-
-    session_ref = checkpoint_ref(session_id)
-    tip = _ref_tip(cwd, session_ref)
-    # A call that wrote nothing leaves the tree equal to the last checkpoint's:
-    # the working tree differs from `HEAD` for the whole session, so the status
-    # check above passes on every call and a `Read` would otherwise chain a copy.
-    if tip and _tree_of(cwd, tip) == tree_sha:
-        return ""
-    parent = tip or _head_sha(cwd)
-    if not parent:
-        return ""  # no commits yet — nothing to parent the first checkpoint on
 
     now = datetime.now(timezone.utc)
     # Millisecond precision, matching Claude Code's transcript timestamps: every
@@ -283,37 +267,185 @@ def _write_checkpoint(cwd: pathlib.Path, git_dir: pathlib.Path, session_id: str,
     # that address at read time — the transcript record holding the call is
     # flushed after the hook fires, so the row does not exist yet here.
     message = _checkpoint_message(session_id, ts, ref, action, step, part)
-
-    try:
-        made = _git(["git", "commit-tree", tree_sha, "-p", parent, "-m", message], cwd)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    if made.returncode != 0:
-        return ""
-    commit = made.stdout.strip()
+    session_ref = checkpoint_ref(session_id)
 
     # Compare-and-swap on the tip: parallel subagents share one worktree, and two
     # hooks reading the same tip would otherwise fork the chain. The loser sees
     # its expected old value fail and takes the retry, which re-reads the tip and
     # chains onto the winner.
     for _ in range(2):
+        tip = _ref_tip(cwd, session_ref)
+        # A call that wrote nothing leaves the tree equal to the last checkpoint's:
+        # the working tree differs from `HEAD` for the whole session, so the status
+        # check above passes on every call and a `Read` would otherwise chain a copy.
+        if tip and _tree_of(cwd, tip) == tree_sha:
+            return ""
+        parent = tip or _head_sha(cwd)
+        if not parent:
+            return ""  # no commits yet — nothing to parent the first checkpoint on
+        if pre_tree:
+            parent = _outside_commit(cwd, session_id, ts, parent, pre_tree, tree_sha)
+        if parent and _tree_of(cwd, parent) == tree_sha:
+            # Every change since the last checkpoint came from outside the call:
+            # the `outside` checkpoint alone records them.
+            commit, made_one = parent, False
+        else:
+            try:
+                made = _git(["git", "commit-tree", tree_sha, "-p", parent, "-m", message], cwd)
+            except (OSError, subprocess.SubprocessError):
+                return ""
+            if made.returncode != 0:
+                return ""
+            commit, made_one = made.stdout.strip(), True
+        if commit == tip:
+            return ""
         try:
-            done = _git(["git", "update-ref", session_ref, commit,
-                         tip or _EMPTY_SHA], cwd)
+            done = _git(["git", "update-ref", session_ref, commit, tip or _EMPTY_SHA], cwd)
         except (OSError, subprocess.SubprocessError):
             return ""
         if done.returncode == 0:
-            return commit
-        tip = _ref_tip(cwd, session_ref)
-        if not tip or _tree_of(cwd, tip) == tree_sha:
-            return ""  # the winner wrote this same tree; nothing left to record
+            return commit if made_one else ""
+    return ""
+
+
+def _git_path(cwd: pathlib.Path, name: str) -> pathlib.Path | None:
+    """`name` under this worktree's git directory, absolute, or None where git
+    returns none. Per worktree, so two worktrees never share a staging file."""
+    try:
+        proc = _git(["git", "rev-parse", "--git-path", name], cwd)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    path = pathlib.Path(proc.stdout.strip())
+    return path if path.is_absolute() else (cwd / path).resolve()
+
+
+def _index_env(cwd: pathlib.Path) -> dict | None:
+    """The environment that points git at the throwaway index, so the user's
+    staging area is never in the sequence."""
+    index_path = _git_path(cwd, _INDEX_NAME)
+    return {**os.environ, "GIT_INDEX_FILE": str(index_path)} if index_path else None
+
+
+def _worktree_tree(cwd: pathlib.Path) -> str:
+    """The tree of the working tree as it stands, every file `git add -A`
+    stages, written through the throwaway index; "" where git fails."""
+    env = _index_env(cwd)
+    if env is None:
+        return ""
+    try:
+        staged = _git(["git", "add", "-A"], cwd, env=env)
+        if staged.returncode != 0:
+            return ""
+        tree = _git(["git", "write-tree"], cwd, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return tree.stdout.strip() if tree.returncode == 0 else ""
+
+
+def _changed_paths(cwd: pathlib.Path, old: str, new: str) -> set[str]:
+    try:
+        proc = _git(["git", "diff-tree", "-r", "--name-only", "-z", old, new], cwd)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return {p for p in proc.stdout.split("\0") if p} if proc.returncode == 0 else set()
+
+
+def _tree_with(cwd: pathlib.Path, tree: str, source: str, paths: set[str]) -> str:
+    """`tree` with each of `paths` set to its entry in `source`, and removed
+    where `source` holds none; "" where git fails."""
+    env = _index_env(cwd)
+    if env is None:
+        return ""
+    try:
+        if _git(["git", "read-tree", tree], cwd, env=env).returncode != 0:
+            return ""
+        listed = _git(["git", "ls-tree", "-r", "-z", source, "--", *sorted(paths)], cwd)
+        if listed.returncode != 0:
+            return ""
+        entries = {}
+        for row in listed.stdout.split("\0"):
+            meta, _, path = row.partition("\t")
+            if path:
+                mode, _, sha = meta.split(" ")
+                entries[path] = f"{mode} {sha}"
+        info = "".join(f"{entries.get(p, '0 ' + _EMPTY_SHA)}\t{p}\0" for p in sorted(paths))
+        if subprocess.run(["git", "update-index", "-z", "--index-info"], cwd=cwd, input=info,
+                          capture_output=True, text=True, timeout=_HOOK_GIT_TIMEOUT,
+                          env=env).returncode != 0:
+            return ""
+        made = _git(["git", "write-tree"], cwd, env=env)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+    return made.stdout.strip() if made.returncode == 0 else ""
+
+
+def _outside_commit(cwd: pathlib.Path, session_id: str, ts: str, parent: str,
+                    pre_tree: str, post_tree: str) -> str:
+    """The commit a call's checkpoint is parented on: `parent` where the tree
+    before the call matches it, and otherwise an `outside` checkpoint on
+    `parent` holding what changed between them, written by another session,
+    the person, or a call of this session running in parallel.
+
+    The call's own paths are those that differ both from before the call to
+    after it and from `parent` to after it. The second condition drops a path a
+    parallel call of this session wrote and checkpointed first: `parent`
+    already holds it as it stands. The `outside` tree is the tree after the
+    call with the call's own paths set back to `parent`'s, so the call's
+    checkpoint diffs against it with its own paths only. Returns `parent`
+    where git fails, which leaves the outside changes in the call's diff, as
+    every checkpoint carried them before."""
+    base = _tree_of(cwd, parent)
+    if not base or base == pre_tree:
+        return parent
+    own = _changed_paths(cwd, pre_tree, post_tree) & _changed_paths(cwd, base, post_tree)
+    tree = _tree_with(cwd, post_tree, base, own) if own else post_tree
+    if not tree or tree == base:
+        return parent
+    try:
+        made = _git(["git", "commit-tree", tree, "-p", parent, "-m",
+                     _checkpoint_message(session_id, ts, action=OUTSIDE)], cwd)
+    except (OSError, subprocess.SubprocessError):
+        return parent
+    return made.stdout.strip() if made.returncode == 0 else parent
+
+
+def record_pre(cwd: pathlib.Path, git_dir: pathlib.Path, call: str) -> None:
+    """PreToolUse: the tree before call `call`, which `_write_checkpoint`
+    compares against the tree after it. One small file per call under the
+    worktree's git directory; `take_pre` removes it."""
+    if not call or not _enabled(git_dir):
+        return
+    tree = _worktree_tree(cwd)
+    folder = _git_path(cwd, _PRE_DIR)
+    if not tree or folder is None:
+        return
+    folder.mkdir(exist_ok=True)
+    (folder / call).write_text(tree)
+
+
+def take_pre(cwd: pathlib.Path, call: str) -> str:
+    """The tree `record_pre` wrote for `call`, removed as it is read; "" for
+    none. A call that never reaches PostToolUse, one a hook denied, leaves its
+    file; any file older than `_PRE_LIFE` goes on the next read."""
+    folder = _git_path(cwd, _PRE_DIR)
+    if not call or folder is None or not folder.is_dir():
+        return ""
+    now = time.time()
+    for f in folder.iterdir():
         try:
-            again = _git(["git", "commit-tree", tree_sha, "-p", tip, "-m", message], cwd)
-        except (OSError, subprocess.SubprocessError):
-            return ""
-        if again.returncode != 0:
-            return ""
-        commit = again.stdout.strip()
+            if now - f.stat().st_mtime > _PRE_LIFE:
+                f.unlink()
+        except OSError:
+            pass
+    f = folder / call
+    try:
+        tree = f.read_text().strip()
+        f.unlink()
+    except OSError:
+        return ""
+    return tree
 
 
 def _head_sha(cwd: pathlib.Path) -> str:
@@ -465,7 +597,8 @@ def chain_entries(project_dir: pathlib.Path,
         m = _CHECKPOINT_RE.match(subject)
         if m and m["session"] == session_uuid:
             out.append(ChainEntry(m["when"], sha, m["call"] or "",
-                                  m["action"] or "", m["step"] or "", m["part"] or ""))
+                                  m["action"] or m["outside"] or "", m["step"] or "",
+                                  m["part"] or ""))
     out.reverse()
     TRACER and TRACER.step("chain_entries", repo=str(project_dir), session=session_uuid[:8],
                checkpoints=len(out))
@@ -475,8 +608,18 @@ def chain_entries(project_dir: pathlib.Path,
 def _chain_shas(project_dir: pathlib.Path,
                 session_uuid: str) -> list[tuple[str, str, str]]:
     """The session's checkpoints off its own ref, oldest first, in the shape
-    `_checkpoint_shas` returns."""
-    return [(e.when, e.sha, e.call) for e in chain_entries(project_dir, session_uuid)]
+    `_checkpoint_shas` returns. An `outside` checkpoint holds other writers'
+    changes, not the session's, and is left out."""
+    return [(e.when, e.sha, e.call) for e in chain_entries(project_dir, session_uuid)
+            if e.action != OUTSIDE]
+
+
+def outside_parented(project_dir: pathlib.Path, session_uuid: str) -> set[str]:
+    """The checkpoints parented on an `outside` one. Each diffs against its own
+    parent; measured against the session's previous checkpoint, its diff would
+    take in the outside changes as well."""
+    entries = chain_entries(project_dir, session_uuid)
+    return {e.sha for prev, e in zip(entries, entries[1:]) if prev.action == OUTSIDE}
 
 
 def _checkpoint_shas(project_dir: pathlib.Path | None,

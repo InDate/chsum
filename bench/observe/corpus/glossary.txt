@@ -1,0 +1,2 @@
+bank: the sloped ground at the edge of a river.
+charge: the electrical charge a capacitor holds, in coulombs.

@@ -1,0 +1,600 @@
+Day 1, reading 1: the capacitor showed no change.
+Day 1, reading 2: the float switch was cleared of reeds.
+Day 1, reading 3: the north bank was checked at dawn.
+Day 1, reading 4: the pump was checked at dawn.
+Day 1, reading 5: the capacitor read steady.
+Day 1, reading 6: the north bank read steady.
+Day 1, reading 7: the south bank was checked at dawn.
+Day 1, reading 8: the north bank lost some soil in the rain.
+Day 1, reading 9: the float switch was checked at dawn.
+Day 1, reading 10: the south bank was checked at dawn.
+Day 1, reading 11: the pump lost some soil in the rain.
+Day 1, reading 12: the north bank read steady.
+Day 1, reading 13: the north bank showed no change.
+Day 1, reading 14: the gauge was cleared of reeds.
+Day 1, reading 15: the pump was checked at dawn.
+Day 2, reading 1: the pump read steady.
+Day 2, reading 2: the float switch was checked at dawn.
+Day 2, reading 3: the south bank was checked at dawn.
+Day 2, reading 4: the pump showed no change.
+Day 2, reading 5: the capacitor lost some soil in the rain.
+Day 2, reading 6: the south bank read steady.
+Day 2, reading 7: the north bank read steady.
+Day 2, reading 8: the capacitor read steady.
+Day 2, reading 9: the gauge showed no change.
+Day 2, reading 10: the north bank read steady.
+Day 2, reading 11: the pump was cleared of reeds.
+Day 2, reading 12: the south bank held its charge overnight.
+Day 2, reading 13: the north bank read steady.
+Day 2, reading 14: the gauge was checked at dawn.
+Day 2, reading 15: the pump was checked at dawn.
+Day 3, reading 1: the pump showed no change.
+Day 3, reading 2: the float switch was cleared of reeds.
+Day 3, reading 3: the pump lost some soil in the rain.
+Day 3, reading 4: the capacitor lost some soil in the rain.
+Day 3, reading 5: the pump lost some soil in the rain.
+Day 3, reading 6: the capacitor held its charge overnight.
+Day 3, reading 7: the south bank showed no change.
+Day 3, reading 8: the gauge showed no change.
+Day 3, reading 9: the north bank read steady.
+Day 3, reading 10: the capacitor read steady.
+Day 3, reading 11: the float switch held its charge overnight.
+Day 3, reading 12: the gauge lost some soil in the rain.
+Day 3, reading 13: the capacitor read steady.
+Day 3, reading 14: the north bank was checked at dawn.
+Day 3, reading 15: the pump lost some soil in the rain.
+Day 4, reading 1: the south bank held its charge overnight.
+Day 4, reading 2: the south bank lost some soil in the rain.
+Day 4, reading 3: the float switch was checked at dawn.
+Day 4, reading 4: the gauge was checked at dawn.
+Day 4, reading 5: the pump read steady.
+Day 4, reading 6: the capacitor held its charge overnight.
+Day 4, reading 7: the gauge held its charge overnight.
+Day 4, reading 8: the pump lost some soil in the rain.
+Day 4, reading 9: the pump lost some soil in the rain.
+Day 4, reading 10: the north bank was checked at dawn.
+Day 4, reading 11: the capacitor lost some soil in the rain.
+Day 4, reading 12: the gauge was cleared of reeds.
+Day 4, reading 13: the north bank was checked at dawn.
+Day 4, reading 14: the gauge was cleared of reeds.
+Day 4, reading 15: the capacitor was cleared of reeds.
+Day 5, reading 1: the pump was cleared of reeds.
+Day 5, reading 2: the float switch held its charge overnight.
+Day 5, reading 3: the gauge lost some soil in the rain.
+Day 5, reading 4: the gauge held its charge overnight.
+Day 5, reading 5: the north bank lost some soil in the rain.
+Day 5, reading 6: the capacitor showed no change.
+Day 5, reading 7: the pump was checked at dawn.
+Day 5, reading 8: the float switch was checked at dawn.
+Day 5, reading 9: the south bank held its charge overnight.
+Day 5, reading 10: the south bank was cleared of reeds.
+Day 5, reading 11: the south bank lost some soil in the rain.
+Day 5, reading 12: the float switch lost some soil in the rain.
+Day 5, reading 13: the north bank showed no change.
+Day 5, reading 14: the float switch lost some soil in the rain.
+Day 5, reading 15: the pump held its charge overnight.
+Day 6, reading 1: the south bank lost some soil in the rain.
+Day 6, reading 2: the pump held its charge overnight.
+Day 6, reading 3: the gauge lost some soil in the rain.
+Day 6, reading 4: the capacitor was cleared of reeds.
+Day 6, reading 5: the float switch showed no change.
+Day 6, reading 6: the south bank was checked at dawn.
+Day 6, reading 7: the south bank showed no change.
+Day 6, reading 8: the south bank was cleared of reeds.
+Day 6, reading 9: the south bank was checked at dawn.
+Day 6, reading 10: the float switch read steady.
+Day 6, reading 11: the south bank held its charge overnight.
+Day 6, reading 12: the capacitor was checked at dawn.
+Day 6, reading 13: the south bank lost some soil in the rain.
+Day 6, reading 14: the pump held its charge overnight.
+Day 6, reading 15: the pump read steady.
+Day 7, reading 1: the capacitor showed no change.
+Day 7, reading 2: the gauge read steady.
+Day 7, reading 3: the pump was cleared of reeds.
+Day 7, reading 4: the gauge was cleared of reeds.
+Day 7, reading 5: the north bank lost some soil in the rain.
+Day 7, reading 6: the gauge read steady.
+Day 7, reading 7: the float switch lost some soil in the rain.
+Day 7, reading 8: the float switch lost some soil in the rain.
+Day 7, reading 9: the north bank lost some soil in the rain.
+Day 7, reading 10: the gauge lost some soil in the rain.
+Day 7, reading 11: the north bank showed no change.
+Day 7, reading 12: the north bank showed no change.
+Day 7, reading 13: the float switch showed no change.
+Day 7, reading 14: the north bank held its charge overnight.
+Day 7, reading 15: the pump was checked at dawn.
+Day 8, reading 1: the north bank was checked at dawn.
+Day 8, reading 2: the pump showed no change.
+Day 8, reading 3: the pump was checked at dawn.
+Day 8, reading 4: the capacitor read steady.
+Day 8, reading 5: the north bank was checked at dawn.
+Day 8, reading 6: the south bank read steady.
+Day 8, reading 7: the float switch showed no change.
+Day 8, reading 8: the gauge held its charge overnight.
+Day 8, reading 9: the capacitor read steady.
+Day 8, reading 10: the capacitor lost some soil in the rain.
+Day 8, reading 11: the north bank was checked at dawn.
+Day 8, reading 12: the float switch lost some soil in the rain.
+Day 8, reading 13: the float switch lost some soil in the rain.
+Day 8, reading 14: the capacitor was checked at dawn.
+Day 8, reading 15: the south bank was checked at dawn.
+Day 9, reading 1: the gauge held its charge overnight.
+Day 9, reading 2: the gauge held its charge overnight.
+Day 9, reading 3: the float switch was cleared of reeds.
+Day 9, reading 4: the south bank read steady.
+Day 9, reading 5: the north bank showed no change.
+Day 9, reading 6: the pump held its charge overnight.
+Day 9, reading 7: the south bank was cleared of reeds.
+Day 9, reading 8: the pump was checked at dawn.
+Day 9, reading 9: the pump held its charge overnight.
+Day 9, reading 10: the gauge was checked at dawn.
+Day 9, reading 11: the gauge held its charge overnight.
+Day 9, reading 12: the pump held its charge overnight.
+Day 9, reading 13: the south bank held its charge overnight.
+Day 9, reading 14: the south bank read steady.
+Day 9, reading 15: the pump read steady.
+Day 10, reading 1: the capacitor was cleared of reeds.
+Day 10, reading 2: the south bank read steady.
+Day 10, reading 3: the south bank showed no change.
+Day 10, reading 4: the float switch was cleared of reeds.
+Day 10, reading 5: the south bank showed no change.
+Day 10, reading 6: the pump lost some soil in the rain.
+Day 10, reading 7: the capacitor was cleared of reeds.
+Day 10, reading 8: the north bank was checked at dawn.
+Day 10, reading 9: the capacitor lost some soil in the rain.
+Day 10, reading 10: the capacitor showed no change.
+Day 10, reading 11: the gauge read steady.
+Day 10, reading 12: the capacitor lost some soil in the rain.
+Day 10, reading 13: the gauge held its charge overnight.
+Day 10, reading 14: the capacitor was checked at dawn.
+Day 10, reading 15: the south bank was checked at dawn.
+Day 11, reading 1: the south bank lost some soil in the rain.
+Day 11, reading 2: the south bank held its charge overnight.
+Day 11, reading 3: the south bank lost some soil in the rain.
+Day 11, reading 4: the pump read steady.
+Day 11, reading 5: the north bank lost some soil in the rain.
+Day 11, reading 6: the gauge held its charge overnight.
+Day 11, reading 7: the gauge was checked at dawn.
+Day 11, reading 8: the gauge was checked at dawn.
+Day 11, reading 9: the float switch was cleared of reeds.
+Day 11, reading 10: the south bank lost some soil in the rain.
+Day 11, reading 11: the south bank lost some soil in the rain.
+Day 11, reading 12: the gauge held its charge overnight.
+Day 11, reading 13: the north bank was cleared of reeds.
+Day 11, reading 14: the float switch lost some soil in the rain.
+Day 11, reading 15: the float switch was cleared of reeds.
+Day 12, reading 1: the north bank was cleared of reeds.
+Day 12, reading 2: the south bank showed no change.
+Day 12, reading 3: the south bank was checked at dawn.
+Day 12, reading 4: the south bank read steady.
+Day 12, reading 5: the float switch was cleared of reeds.
+Day 12, reading 6: the south bank read steady.
+Day 12, reading 7: the pump lost some soil in the rain.
+Day 12, reading 8: the gauge held its charge overnight.
+Day 12, reading 9: the south bank read steady.
+Day 12, reading 10: the pump showed no change.
+Day 12, reading 11: the north bank was checked at dawn.
+Day 12, reading 12: the gauge was cleared of reeds.
+Day 12, reading 13: the north bank read steady.
+Day 12, reading 14: the gauge showed no change.
+Day 12, reading 15: the float switch showed no change.
+Day 13, reading 1: the south bank was checked at dawn.
+Day 13, reading 2: the capacitor showed no change.
+Day 13, reading 3: the capacitor read steady.
+Day 13, reading 4: the south bank read steady.
+Day 13, reading 5: the capacitor held its charge overnight.
+Day 13, reading 6: the pump lost some soil in the rain.
+Day 13, reading 7: the south bank was checked at dawn.
+Day 13, reading 8: the gauge held its charge overnight.
+Day 13, reading 9: the float switch was cleared of reeds.
+Day 13, reading 10: the pump read steady.
+Day 13, reading 11: the float switch read steady.
+Day 13, reading 12: the south bank read steady.
+Day 13, reading 13: the south bank read steady.
+Day 13, reading 14: the pump was checked at dawn.
+Day 13, reading 15: the float switch showed no change.
+Day 14, reading 1: the pump was checked at dawn.
+Day 14, reading 2: the south bank showed no change.
+Day 14, reading 3: the south bank lost some soil in the rain.
+Day 14, reading 4: the pump was cleared of reeds.
+Day 14, reading 5: the north bank read steady.
+Day 14, reading 6: the north bank held its charge overnight.
+Day 14, reading 7: the gauge read steady.
+Day 14, reading 8: the pump read steady.
+Day 14, reading 9: the float switch was checked at dawn.
+Day 14, reading 10: the pump was checked at dawn.
+Day 14, reading 11: the south bank showed no change.
+Day 14, reading 12: the capacitor was checked at dawn.
+Day 14, reading 13: the north bank read steady.
+Day 14, reading 14: the float switch read steady.
+Day 14, reading 15: the north bank was checked at dawn.
+Day 15, reading 1: the float switch held its charge overnight.
+Day 15, reading 2: the pump read steady.
+Day 15, reading 3: the pump read steady.
+Day 15, reading 4: the south bank was cleared of reeds.
+Day 15, reading 5: the capacitor lost some soil in the rain.
+Day 15, reading 6: the pump read steady.
+Day 15, reading 7: the float switch read steady.
+Day 15, reading 8: the south bank was cleared of reeds.
+Day 15, reading 9: the pump held its charge overnight.
+Day 15, reading 10: the pump showed no change.
+Day 15, reading 11: the float switch showed no change.
+Day 15, reading 12: the float switch was checked at dawn.
+Day 15, reading 13: the float switch lost some soil in the rain.
+Day 15, reading 14: the capacitor was checked at dawn.
+Day 15, reading 15: the gauge showed no change.
+Day 16, reading 1: the float switch was checked at dawn.
+Day 16, reading 2: the south bank was cleared of reeds.
+Day 16, reading 3: the capacitor was checked at dawn.
+Day 16, reading 4: the south bank was cleared of reeds.
+Day 16, reading 5: the gauge was cleared of reeds.
+Day 16, reading 6: the capacitor showed no change.
+Day 16, reading 7: the capacitor showed no change.
+Day 16, reading 8: the float switch showed no change.
+Day 16, reading 9: the gauge was checked at dawn.
+Day 16, reading 10: the float switch lost some soil in the rain.
+Day 16, reading 11: the south bank was cleared of reeds.
+Day 16, reading 12: the south bank showed no change.
+Day 16, reading 13: the gauge lost some soil in the rain.
+Day 16, reading 14: the pump lost some soil in the rain.
+Day 16, reading 15: the capacitor lost some soil in the rain.
+Day 17, reading 1: the south bank held its charge overnight.
+Day 17, reading 2: the capacitor was checked at dawn.
+Day 17, reading 3: the gauge held its charge overnight.
+Day 17, reading 4: the north bank held its charge overnight.
+Day 17, reading 5: the pump lost some soil in the rain.
+Day 17, reading 6: the float switch was cleared of reeds.
+Day 17, reading 7: the north bank lost some soil in the rain.
+Day 17, reading 8: the capacitor read steady.
+Day 17, reading 9: the pump held its charge overnight.
+Day 17, reading 10: the pump was checked at dawn.
+Day 17, reading 11: the north bank showed no change.
+Day 17, reading 12: the north bank was checked at dawn.
+Day 17, reading 13: the capacitor held its charge overnight.
+Day 17, reading 14: the north bank showed no change.
+Day 17, reading 15: the capacitor showed no change.
+Day 18, reading 1: the float switch was cleared of reeds.
+Day 18, reading 2: the capacitor lost some soil in the rain.
+Day 18, reading 3: the south bank read steady.
+Day 18, reading 4: the pump read steady.
+Day 18, reading 5: the float switch was cleared of reeds.
+Day 18, reading 6: the capacitor was checked at dawn.
+Day 18, reading 7: the capacitor was checked at dawn.
+Day 18, reading 8: the gauge showed no change.
+Day 18, reading 9: the float switch was checked at dawn.
+Day 18, reading 10: the capacitor was checked at dawn.
+Day 18, reading 11: the gauge was checked at dawn.
+Day 18, reading 12: the capacitor was checked at dawn.
+Day 18, reading 13: the pump showed no change.
+Day 18, reading 14: the north bank held its charge overnight.
+Day 18, reading 15: the north bank lost some soil in the rain.
+Day 19, reading 1: the north bank held its charge overnight.
+Day 19, reading 2: the pump lost some soil in the rain.
+Day 19, reading 3: the capacitor read steady.
+Day 19, reading 4: the south bank was checked at dawn.
+Day 19, reading 5: the pump was cleared of reeds.
+Day 19, reading 6: the south bank was checked at dawn.
+Day 19, reading 7: the south bank held its charge overnight.
+Day 19, reading 8: the north bank showed no change.
+Day 19, reading 9: the south bank held its charge overnight.
+Day 19, reading 10: the gauge held its charge overnight.
+Day 19, reading 11: the pump showed no change.
+Day 19, reading 12: the capacitor lost some soil in the rain.
+Day 19, reading 13: the pump was cleared of reeds.
+Day 19, reading 14: the south bank held its charge overnight.
+Day 19, reading 15: the capacitor was checked at dawn.
+Day 20, reading 1: the capacitor was checked at dawn.
+Day 20, reading 2: the north bank was checked at dawn.
+Day 20, reading 3: the gauge read steady.
+Day 20, reading 4: the pump showed no change.
+Day 20, reading 5: the pump lost some soil in the rain.
+Day 20, reading 6: the south bank lost some soil in the rain.
+Day 20, reading 7: the north bank was cleared of reeds.
+Day 20, reading 8: the gauge lost some soil in the rain.
+Day 20, reading 9: the gauge lost some soil in the rain.
+Day 20, reading 10: the pump lost some soil in the rain.
+Day 20, reading 11: the pump held its charge overnight.
+Day 20, reading 12: the gauge showed no change.
+Day 20, reading 13: the south bank held its charge overnight.
+Day 20, reading 14: the south bank was cleared of reeds.
+Day 20, reading 15: the gauge was cleared of reeds.
+Day 21, reading 1: the south bank lost some soil in the rain.
+Day 21, reading 2: the capacitor was checked at dawn.
+Day 21, reading 3: the south bank was checked at dawn.
+Day 21, reading 4: the north bank was cleared of reeds.
+Day 21, reading 5: the gauge held its charge overnight.
+Day 21, reading 6: the float switch showed no change.
+Day 21, reading 7: the north bank was checked at dawn.
+Day 21, reading 8: the gauge lost some soil in the rain.
+Day 21, reading 9: the pump was cleared of reeds.
+Day 21, reading 10: the capacitor read steady.
+Day 21, reading 11: the south bank was cleared of reeds.
+Day 21, reading 12: the capacitor was checked at dawn.
+Day 21, reading 13: the float switch showed no change.
+Day 21, reading 14: the south bank held its charge overnight.
+Day 21, reading 15: the float switch was checked at dawn.
+Day 22, reading 1: the capacitor held its charge overnight.
+Day 22, reading 2: the capacitor read steady.
+Day 22, reading 3: the capacitor showed no change.
+Day 22, reading 4: the north bank held its charge overnight.
+Day 22, reading 5: the south bank held its charge overnight.
+Day 22, reading 6: the south bank was checked at dawn.
+Day 22, reading 7: the capacitor lost some soil in the rain.
+Day 22, reading 8: the north bank lost some soil in the rain.
+Day 22, reading 9: the capacitor read steady.
+Day 22, reading 10: the gauge showed no change.
+Day 22, reading 11: the south bank read steady.
+Day 22, reading 12: the north bank was checked at dawn.
+Day 22, reading 13: the capacitor was checked at dawn.
+Day 22, reading 14: the south bank lost some soil in the rain.
+Day 22, reading 15: the pump was checked at dawn.
+Day 23, reading 1: the float switch was checked at dawn.
+Day 23, reading 2: the capacitor held its charge overnight.
+Day 23, reading 3: the gauge showed no change.
+Day 23, reading 4: the north bank read steady.
+Day 23, reading 5: the pump showed no change.
+Day 23, reading 6: the gauge was cleared of reeds.
+Day 23, reading 7: the pump lost some soil in the rain.
+Day 23, reading 8: the capacitor was cleared of reeds.
+Day 23, reading 9: the float switch showed no change.
+Day 23, reading 10: the capacitor was cleared of reeds.
+Day 23, reading 11: the pump was cleared of reeds.
+Day 23, reading 12: the south bank was checked at dawn.
+Day 23, reading 13: the gauge read steady.
+Day 23, reading 14: the gauge lost some soil in the rain.
+Day 23, reading 15: the gauge was cleared of reeds.
+Day 24, reading 1: the pump showed no change.
+Day 24, reading 2: the pump read steady.
+Day 24, reading 3: the pump was checked at dawn.
+Day 24, reading 4: the gauge read steady.
+Day 24, reading 5: the gauge was cleared of reeds.
+Day 24, reading 6: the gauge was cleared of reeds.
+Day 24, reading 7: the south bank was checked at dawn.
+Day 24, reading 8: the north bank was checked at dawn.
+Day 24, reading 9: the south bank was cleared of reeds.
+Day 24, reading 10: the capacitor was checked at dawn.
+Day 24, reading 11: the float switch lost some soil in the rain.
+Day 24, reading 12: the pump was checked at dawn.
+Day 24, reading 13: the gauge was checked at dawn.
+Day 24, reading 14: the gauge read steady.
+Day 24, reading 15: the gauge showed no change.
+Day 25, reading 1: the float switch held its charge overnight.
+Day 25, reading 2: the north bank lost some soil in the rain.
+Day 25, reading 3: the north bank was cleared of reeds.
+Day 25, reading 4: the pump read steady.
+Day 25, reading 5: the north bank was cleared of reeds.
+Day 25, reading 6: the pump was checked at dawn.
+Day 25, reading 7: the gauge was cleared of reeds.
+Day 25, reading 8: the float switch held its charge overnight.
+Day 25, reading 9: the north bank held its charge overnight.
+Day 25, reading 10: the south bank was cleared of reeds.
+Day 25, reading 11: the south bank showed no change.
+Day 25, reading 12: the gauge was cleared of reeds.
+Day 25, reading 13: the float switch lost some soil in the rain.
+Day 25, reading 14: the float switch was checked at dawn.
+Day 25, reading 15: the float switch was cleared of reeds.
+Day 26, reading 1: the capacitor was checked at dawn.
+Day 26, reading 2: the pump was cleared of reeds.
+Day 26, reading 3: the gauge showed no change.
+Day 26, reading 4: the north bank read steady.
+Day 26, reading 5: the south bank held its charge overnight.
+Day 26, reading 6: the capacitor was cleared of reeds.
+Day 26, reading 7: the gauge was cleared of reeds.
+Day 26, reading 8: the capacitor read steady.
+Day 26, reading 9: the pump showed no change.
+Day 26, reading 10: the north bank lost some soil in the rain.
+Day 26, reading 11: the north bank lost some soil in the rain.
+Day 26, reading 12: the capacitor was cleared of reeds.
+Day 26, reading 13: the north bank was cleared of reeds.
+Day 26, reading 14: the south bank was cleared of reeds.
+Day 26, reading 15: the float switch held its charge overnight.
+Day 27, reading 1: the gauge read steady.
+Day 27, reading 2: the capacitor lost some soil in the rain.
+Day 27, reading 3: the float switch lost some soil in the rain.
+Day 27, reading 4: the north bank read steady.
+Day 27, reading 5: the south bank held its charge overnight.
+Day 27, reading 6: the north bank lost some soil in the rain.
+Day 27, reading 7: the north bank held its charge overnight.
+Day 27, reading 8: the float switch was checked at dawn.
+Day 27, reading 9: the pump lost some soil in the rain.
+Day 27, reading 10: the capacitor lost some soil in the rain.
+Day 27, reading 11: the south bank showed no change.
+Day 27, reading 12: the north bank read steady.
+Day 27, reading 13: the north bank showed no change.
+Day 27, reading 14: the gauge read steady.
+Day 27, reading 15: the capacitor held its charge overnight.
+Day 28, reading 1: the south bank read steady.
+Day 28, reading 2: the gauge read steady.
+Day 28, reading 3: the capacitor was checked at dawn.
+Day 28, reading 4: the gauge held its charge overnight.
+Day 28, reading 5: the south bank lost some soil in the rain.
+Day 28, reading 6: the float switch lost some soil in the rain.
+Day 28, reading 7: the north bank showed no change.
+Day 28, reading 8: the north bank lost some soil in the rain.
+Day 28, reading 9: the gauge lost some soil in the rain.
+Day 28, reading 10: the float switch held its charge overnight.
+Day 28, reading 11: the gauge showed no change.
+Day 28, reading 12: the float switch held its charge overnight.
+Day 28, reading 13: the float switch held its charge overnight.
+Day 28, reading 14: the north bank held its charge overnight.
+Day 28, reading 15: the north bank held its charge overnight.
+Day 29, reading 1: the capacitor lost some soil in the rain.
+Day 29, reading 2: the north bank showed no change.
+Day 29, reading 3: the gauge was checked at dawn.
+Day 29, reading 4: the gauge held its charge overnight.
+Day 29, reading 5: the capacitor held its charge overnight.
+Day 29, reading 6: the north bank lost some soil in the rain.
+Day 29, reading 7: the float switch read steady.
+Day 29, reading 8: the north bank held its charge overnight.
+Day 29, reading 9: the float switch held its charge overnight.
+Day 29, reading 10: the north bank held its charge overnight.
+Day 29, reading 11: the north bank was checked at dawn.
+Day 29, reading 12: the gauge held its charge overnight.
+Day 29, reading 13: the gauge showed no change.
+Day 29, reading 14: the south bank held its charge overnight.
+Day 29, reading 15: the float switch read steady.
+Day 30, reading 1: the capacitor showed no change.
+Day 30, reading 2: the capacitor lost some soil in the rain.
+Day 30, reading 3: the north bank was cleared of reeds.
+Day 30, reading 4: the float switch read steady.
+Day 30, reading 5: the pump showed no change.
+Day 30, reading 6: the gauge was checked at dawn.
+Day 30, reading 7: the north bank was cleared of reeds.
+Day 30, reading 8: the float switch lost some soil in the rain.
+Day 30, reading 9: the pump showed no change.
+Day 30, reading 10: the gauge held its charge overnight.
+Day 30, reading 11: the float switch was checked at dawn.
+Day 30, reading 12: the pump showed no change.
+Day 30, reading 13: the south bank lost some soil in the rain.
+Day 30, reading 14: the float switch held its charge overnight.
+Day 30, reading 15: the capacitor held its charge overnight.
+Day 31, reading 1: the capacitor was cleared of reeds.
+Day 31, reading 2: the gauge was cleared of reeds.
+Day 31, reading 3: the capacitor lost some soil in the rain.
+Day 31, reading 4: the gauge showed no change.
+Day 31, reading 5: the capacitor lost some soil in the rain.
+Day 31, reading 6: the pump was cleared of reeds.
+Day 31, reading 7: the float switch was checked at dawn.
+Day 31, reading 8: the south bank was cleared of reeds.
+Day 31, reading 9: the south bank was checked at dawn.
+Day 31, reading 10: the south bank read steady.
+Day 31, reading 11: the float switch read steady.
+Day 31, reading 12: the south bank lost some soil in the rain.
+Day 31, reading 13: the capacitor lost some soil in the rain.
+Day 31, reading 14: the float switch showed no change.
+Day 31, reading 15: the pump showed no change.
+Day 32, reading 1: the south bank was checked at dawn.
+Day 32, reading 2: the south bank held its charge overnight.
+Day 32, reading 3: the pump was checked at dawn.
+Day 32, reading 4: the capacitor showed no change.
+Day 32, reading 5: the capacitor held its charge overnight.
+Day 32, reading 6: the pump showed no change.
+Day 32, reading 7: the north bank was cleared of reeds.
+Day 32, reading 8: the float switch lost some soil in the rain.
+Day 32, reading 9: the float switch was cleared of reeds.
+Day 32, reading 10: the pump showed no change.
+Day 32, reading 11: the float switch held its charge overnight.
+Day 32, reading 12: the capacitor was checked at dawn.
+Day 32, reading 13: the float switch held its charge overnight.
+Day 32, reading 14: the pump held its charge overnight.
+Day 32, reading 15: the south bank was cleared of reeds.
+Day 33, reading 1: the pump read steady.
+Day 33, reading 2: the gauge showed no change.
+Day 33, reading 3: the north bank held its charge overnight.
+Day 33, reading 4: the south bank lost some soil in the rain.
+Day 33, reading 5: the float switch was cleared of reeds.
+Day 33, reading 6: the float switch lost some soil in the rain.
+Day 33, reading 7: the capacitor was checked at dawn.
+Day 33, reading 8: the south bank was checked at dawn.
+Day 33, reading 9: the float switch was cleared of reeds.
+Day 33, reading 10: the float switch read steady.
+Day 33, reading 11: the float switch was checked at dawn.
+Day 33, reading 12: the north bank lost some soil in the rain.
+Day 33, reading 13: the pump lost some soil in the rain.
+Day 33, reading 14: the float switch showed no change.
+Day 33, reading 15: the north bank showed no change.
+Day 34, reading 1: the south bank showed no change.
+Day 34, reading 2: the pump was cleared of reeds.
+Day 34, reading 3: the north bank was cleared of reeds.
+Day 34, reading 4: the gauge was cleared of reeds.
+Day 34, reading 5: the float switch was checked at dawn.
+Day 34, reading 6: the pump was checked at dawn.
+Day 34, reading 7: the north bank showed no change.
+Day 34, reading 8: the south bank read steady.
+Day 34, reading 9: the north bank was cleared of reeds.
+Day 34, reading 10: the gauge held its charge overnight.
+Day 34, reading 11: the south bank was cleared of reeds.
+Day 34, reading 12: the capacitor read steady.
+Day 34, reading 13: the gauge lost some soil in the rain.
+Day 34, reading 14: the gauge was checked at dawn.
+Day 34, reading 15: the north bank was checked at dawn.
+Day 35, reading 1: the capacitor read steady.
+Day 35, reading 2: the pump showed no change.
+Day 35, reading 3: the float switch held its charge overnight.
+Day 35, reading 4: the south bank read steady.
+Day 35, reading 5: the north bank was checked at dawn.
+Day 35, reading 6: the pump held its charge overnight.
+Day 35, reading 7: the float switch held its charge overnight.
+Day 35, reading 8: the capacitor was cleared of reeds.
+Day 35, reading 9: the south bank lost some soil in the rain.
+Day 35, reading 10: the pump showed no change.
+Day 35, reading 11: the pump showed no change.
+Day 35, reading 12: the north bank lost some soil in the rain.
+Day 35, reading 13: the gauge was cleared of reeds.
+Day 35, reading 14: the capacitor was checked at dawn.
+Day 35, reading 15: the north bank showed no change.
+Day 36, reading 1: the float switch was cleared of reeds.
+Day 36, reading 2: the gauge lost some soil in the rain.
+Day 36, reading 3: the north bank held its charge overnight.
+Day 36, reading 4: the south bank was cleared of reeds.
+Day 36, reading 5: the float switch held its charge overnight.
+Day 36, reading 6: the south bank lost some soil in the rain.
+Day 36, reading 7: the north bank was cleared of reeds.
+Day 36, reading 8: the capacitor was cleared of reeds.
+Day 36, reading 9: the float switch held its charge overnight.
+Day 36, reading 10: the gauge lost some soil in the rain.
+Day 36, reading 11: the south bank was checked at dawn.
+Day 36, reading 12: the capacitor was cleared of reeds.
+Day 36, reading 13: the pump was checked at dawn.
+Day 36, reading 14: the south bank lost some soil in the rain.
+Day 36, reading 15: the south bank held its charge overnight.
+Day 37, reading 1: the south bank showed no change.
+Day 37, reading 2: the float switch showed no change.
+Day 37, reading 3: the capacitor held its charge overnight.
+Day 37, reading 4: the north bank read steady.
+Day 37, reading 5: the float switch read steady.
+Day 37, reading 6: the south bank showed no change.
+Day 37, reading 7: the float switch lost some soil in the rain.
+Day 37, reading 8: the gauge was checked at dawn.
+Day 37, reading 9: the pump showed no change.
+Day 37, reading 10: the float switch was checked at dawn.
+Day 37, reading 11: the south bank was checked at dawn.
+Day 37, reading 12: the pump showed no change.
+Day 37, reading 13: the float switch was checked at dawn.
+Day 37, reading 14: the gauge was checked at dawn.
+Day 37, reading 15: the south bank lost some soil in the rain.
+Day 38, reading 1: the float switch was cleared of reeds.
+Day 38, reading 2: the capacitor was cleared of reeds.
+Day 38, reading 3: the north bank was checked at dawn.
+Day 38, reading 4: the south bank held its charge overnight.
+Day 38, reading 5: the south bank showed no change.
+Day 38, reading 6: the gauge read steady.
+Day 38, reading 7: the gauge lost some soil in the rain.
+Day 38, reading 8: the north bank held its charge overnight.
+Day 38, reading 9: the gauge was cleared of reeds.
+Day 38, reading 10: the float switch held its charge overnight.
+Day 38, reading 11: the capacitor lost some soil in the rain.
+Day 38, reading 12: the south bank was checked at dawn.
+Day 38, reading 13: the north bank was checked at dawn.
+Day 38, reading 14: the capacitor was checked at dawn.
+Day 38, reading 15: the capacitor lost some soil in the rain.
+Day 39, reading 1: the north bank read steady.
+Day 39, reading 2: the south bank lost some soil in the rain.
+Day 39, reading 3: the capacitor held its charge overnight.
+Day 39, reading 4: the float switch was checked at dawn.
+Day 39, reading 5: the north bank was cleared of reeds.
+Day 39, reading 6: the float switch showed no change.
+Day 39, reading 7: the capacitor read steady.
+Day 39, reading 8: the float switch showed no change.
+Day 39, reading 9: the capacitor held its charge overnight.
+Day 39, reading 10: the gauge lost some soil in the rain.
+Day 39, reading 11: the north bank was cleared of reeds.
+Day 39, reading 12: the float switch showed no change.
+Day 39, reading 13: the gauge lost some soil in the rain.
+Day 39, reading 14: the north bank lost some soil in the rain.
+Day 39, reading 15: the north bank lost some soil in the rain.
+Day 40, reading 1: the north bank was checked at dawn.
+Day 40, reading 2: the capacitor showed no change.
+Day 40, reading 3: the gauge was checked at dawn.
+Day 40, reading 4: the pump held its charge overnight.
+Day 40, reading 5: the capacitor held its charge overnight.
+Day 40, reading 6: the capacitor read steady.
+Day 40, reading 7: the north bank held its charge overnight.
+Day 40, reading 8: the gauge was cleared of reeds.
+Day 40, reading 9: the gauge held its charge overnight.
+Day 40, reading 10: the capacitor held its charge overnight.
+Day 40, reading 11: the north bank was cleared of reeds.
+Day 40, reading 12: the pump was cleared of reeds.
+Day 40, reading 13: the north bank was checked at dawn.
+Day 40, reading 14: the south bank was checked at dawn.
+Day 40, reading 15: the float switch was cleared of reeds.

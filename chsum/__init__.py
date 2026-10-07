@@ -17,6 +17,7 @@ from .core import (  # noqa: F401 — named so the hooks and the console script 
     _hook_post_tool_use,
     _hook_pre_tool_use,
     _hook_session_start,
+    _hook_stop,
     _hook_user_prompt_submit,
     _read_payload,
     main,

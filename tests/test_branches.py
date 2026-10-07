@@ -180,12 +180,12 @@ class SessionList(Case):
     def test_the_column_sits_under_its_heading(self):
         meta = core._meta_from_transcript(self.transcript(TRUNK + ABANDONED + KEPT))
         cells = core._session_cells(meta, pathlib.Path(self._tmp.name))
-        self.assertEqual(cells[core.SESSION_HEADS.index("branches") - 1], "2")
+        self.assertEqual(cells[core.SESSION_HEADS.index("rewinds") - 1], "1")
 
     def test_one_branch_prints_a_dash(self):
         meta = core._meta_from_transcript(self.transcript(TRUNK))
         cells = core._session_cells(meta, pathlib.Path(self._tmp.name))
-        self.assertEqual(cells[core.SESSION_HEADS.index("branches") - 1], "-")
+        self.assertEqual(cells[core.SESSION_HEADS.index("rewinds") - 1], "-")
 
 
 if __name__ == "__main__":
