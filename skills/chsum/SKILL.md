@@ -24,8 +24,8 @@ prints only its path.
 | `chsum digest --tools` | Every tool call |
 | `chsum digest --writes` | What it changed on disk, per turn |
 | `chsum digest --agents` | Its subagents and their reports |
-| `chsum digest --branches` | Paths a rewind left; `--branches <n>` resumes one |
-| `chsum resume` | After a rewind: writes the handoff for what it cut and sends it to this session as a message |
+| `chsum digest --branches` | Paths a rewind left; `--branches <n>` resumes one; `--stdout` prints numbered rows with each branch's cache state and the `<session>:<line>` anchors `chsum resume` takes |
+| `chsum resume [<session>:<line>]` | After a rewind: writes what it cut, the messages whole and the files changed, and prints the path; `--stdout` prints the cut; `--why [files]` sends what its messages leave out about the edits |
 | `chsum file <path>` | Which session and turn wrote a file, and whether that turn was rewound |
 | `chsum digest --rewound` | What the nearest rewind took out: each branch it cut, newest first, with its messages, handoff and files |
 | `chsum digest --call <id>` | One tool call and its output, whole |
@@ -109,23 +109,38 @@ session's cache: the handoff's request fails on an expired branch.
 rebuilds its base. `references/observe.md` — the hook that feeds an
 observer, `hold`, the reviewer's approved calls, `close --pass`.
 
-Straight after the rewind, `! chsum resume` starts a separate process and
-exits. Claude Code writes the command's records as it exits, and they hang off
-the point the conversation went back to; the process reads that point, takes
-every branch under it as the cut, and runs one request over the newest branch
-to write the handoff. That request sends the handoff to this session as a
-message from another session, about 20 seconds later, and an idle session
-takes it in at once. The digest of the cut goes in with the next prompt. A
-session missing from Claude Code's registry of running sessions receives the
-handoff with the next prompt instead.
+Straight after the rewind, `! chsum resume` writes the cut to the digests
+directory and prints its path: every message of the cut whole, and each file
+it changed with its line counts and its state on disk. Reading that file
+brings the cut into the conversation; `--stdout` prints it in place, where
+Claude Code holds output past its size limit on disk and passes on only a
+2KB preview. A rewind writes no record, and the command's own
+records land only as it exits, so the cut's point comes from the status
+line's rewind point, or from an anchor: `chsum resume <session>:<line>` names
+the prompt the rewind went to. Its first line, on stderr, names the point it
+wrote; stdout holds the path alone. `chsum digest --rewound` writes the same
+`<uuid>-rewound.md`, so each run of either replaces the file the other wrote.
 
-The handoff's facts stand in for the files the cut branch read: open one of
-those files for a fact the handoff leaves out. `chsum: a rewind handoff is
-being written` means it arrives at a later tool result. `chsum: no handoff
-was written` names why (the branch's cache expired, or the Claude Code
-version that built it is gone); the files are then read as the work needs
-them. A rewind with no `chsum resume` after it is found at the first tool
-result, which carries the digest, and the handoff follows at a later one.
+After the command exits, a separate process reads the point its record hangs
+off. A rewind to a different point arrives as a message from another session
+naming that point's anchor; `chsum resume <anchor>` writes that cut. A session
+missing from Claude Code's registry of running sessions receives the message
+at the next tool result.
+
+The printed messages carry the conversation; the files they changed carry the
+work. Open a changed file for a line the output leaves out.
+
+The written file ends on `chsum resume <anchor> --why [files]` and the files it
+takes. The command starts a separate request that resumes the cut branch from
+the session's cache, so the branch's edits and tool results, absent from the
+printed messages, reach that request at a cache read's price. Its reply holds,
+per file, the lines and structure the edit touched, each approach reverted with
+the result that ruled it out, and a reason the messages leave out; a file the
+messages explain fully gets `covered by the conversation`. Output tokens grow
+with each file named. The reply arrives as a message, or at the next tool
+result for a session missing from the registry. An expired branch cache or an
+uninstalled Claude Code version returns the reason and runs no request: either
+one rewrites the whole branch.
 
 ## A change with no record in this conversation
 

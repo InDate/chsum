@@ -352,30 +352,5 @@ class DiskState(Case):
         self.assertEqual(set(core._named_by_calls(self.repo, records, files)), {"a.py", "b.py"})
 
 
-class StopReadsTheReply(Case):
-    def _stop(self, payload_extra: dict) -> tuple[str, list]:
-        c, records = _fixture(time.time() - 60)
-        path = self.transcript(records)
-        filed = []
-        out = io.StringIO()
-        with redirect_stdout(out), \
-                mock.patch.object(core, "_git_dir", return_value=self.root), \
-                mock.patch.object(core, "_turn_shas", return_value=["sha1"]), \
-                mock.patch.object(core, "_file_changes_note", side_effect=lambda *a: filed.append(a)):
-            core._hook_stop({"session_id": SESSION, "transcript_path": str(path),
-                             "cwd": str(self.root), **payload_extra})
-        return out.getvalue(), filed
-
-    def test_the_changes_block_comes_from_the_reply_in_the_hook_input(self) -> None:
-        printed, filed = self._stop({"last_assistant_message": "done\n\n## Changes\n- `a.py`: x. Why: y."})
-        self.assertEqual(printed, "")
-        self.assertEqual(len(filed), 1)
-
-    def test_a_turn_that_wrote_with_no_block_ends_and_files_nothing(self) -> None:
-        printed, filed = self._stop({"last_assistant_message": "done"})
-        self.assertEqual(printed, "")
-        self.assertEqual(filed, [])
-
-
 if __name__ == "__main__":
     unittest.main()

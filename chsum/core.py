@@ -4452,6 +4452,8 @@ class _Branch:
     chain: list[dict]  # root to tip, in parent order
     prompts: list[dict]  # the typed prompts along `chain`
     shared: int = 0  # leading prompts held in common with another branch
+    openers: list[dict] = dataclasses.field(default_factory=list)  # path-opening records along `chain`
+    split: int = 0  # leading openers held in common with another branch
 
 
 def _branch_prompt(rec: dict, command_ids: frozenset[str]) -> bool:
@@ -4481,32 +4483,67 @@ def _branches(path: pathlib.Path, records: list[dict] | None = None) -> list[_Br
             at = up[at]
         chain.reverse()
         prompts = [r for r in chain if _branch_prompt(r, command_ids)]
-        key = tuple(r["uuid"] for r in prompts)
+        # Keyed by the records that open a path, so a `!` command, which is no
+        # typed prompt, splits a branch off where it hangs beside one.
+        openers = [r for r in chain if _opens_path(r)]
+        key = tuple(r["uuid"] for r in openers)
         tip = chain[-1]
         held = best.get(key)
         if held is None or str(tip.get("timestamp") or "") > str(held.tip.get("timestamp") or ""):
-            best[key] = _Branch(tip, chain, prompts)
+            best[key] = _Branch(tip, chain, prompts, openers=openers)
     keys = [k for k in best
             if not any(len(o) > len(k) and o[:len(k)] == k for o in best)]
-    out = [best[k] for k in keys]
+    out = _replied(best[k] for k in keys)
     for b in out:
-        mine = [r["uuid"] for r in b.prompts]
+        mine = [r["uuid"] for r in b.openers]
         for o in out:
             if o is b:
                 continue
             n = 0
-            for x, y in zip(mine, (r["uuid"] for r in o.prompts)):
+            for x, y in zip(mine, (r["uuid"] for r in o.openers)):
                 if x != y:
                     break
                 n += 1
-            b.shared = max(b.shared, n)
+            if n > b.split:
+                held = {r["uuid"] for r in b.openers[:n]}
+                b.split = n
+                b.shared = sum(1 for r in b.prompts if r["uuid"] in held)
 
     def diverges(b: _Branch) -> str:
-        at = b.prompts[b.shared] if b.shared < len(b.prompts) else b.tip
+        at = b.openers[b.split] if b.split < len(b.openers) else b.tip
         return str(at.get("timestamp") or "")
     out.sort(key=diverges)
     TRACE.step("_branches", records=len(recs), branches=len(out))
     return out
+
+
+def _replied(branches) -> list[_Branch]:
+    """The branches holding a model reply past the record they share with any
+    other, plus the newest. A prompt stopped before its reply, and a tool call
+    the session ended mid-run, leave a sibling with no reply: the reply Claude
+    Code writes for the second carries the model `<synthetic>`. The newest
+    branch stays, since it is the conversation that continues."""
+    branches = list(branches)
+    if len(branches) < 2:
+        return branches
+    newest = max(branches, key=lambda b: str(b.tip.get("timestamp") or ""))
+
+    def own(b: _Branch) -> list[dict]:
+        n = 0
+        for o in branches:
+            if o is not b:
+                k = 0
+                for x, y in zip(b.chain, o.chain):
+                    if x is not y:
+                        break
+                    k += 1
+                n = max(n, k)
+        return b.chain[n:]
+
+    def replied(r: dict) -> bool:
+        return (r.get("type") == "assistant"
+                and (r.get("message") or {}).get("model") != "<synthetic>")
+    return [b for b in branches if b is newest or any(replied(r) for r in own(b))]
 
 
 def _branch_count(n: int) -> str:
@@ -4520,11 +4557,14 @@ def _resumed_branch(branches: list[_Branch]) -> int:
                key=lambda i: str(branches[i].tip.get("timestamp") or ""))
 
 
-def _branch_line(b: _Branch) -> str:
-    """Clock span, active duration and counts over the records a branch holds
-    past the point it diverges, in the shape `_meta_line` gives a session."""
+def _branch_stats(b: _Branch) -> dict:
+    """Clock span, active seconds, counts and the records a branch holds past
+    the point it diverges, from the first record that opens its own path: a
+    `!` command ahead of its first typed prompt starts the span."""
     own = b.prompts[b.shared:]
-    first = b.chain.index(own[0]) if own else len(b.chain) - 1
+    opened = b.openers[b.split] if b.split < len(b.openers) else None
+    first = (b.chain.index(opened) if opened else
+             b.chain.index(own[0]) if own else len(b.chain) - 1)
     stamps, edited, read, cmds = [], [], [], []
     agents = calls = 0
     for rec in b.chain[first:]:
@@ -4534,14 +4574,107 @@ def _branch_line(b: _Branch) -> str:
             agents += _collect_tools(rec, edited, read, cmds)
             calls += len(_tool_lines(rec))
     start, end = _hhmm(stamps[0]), _hhmm(stamps[-1])
-    bits = [start if start == end else f"{start}–{end}"]
-    secs = active_seconds(sorted(stamps))
-    if secs:
-        bits.append(_fmt_secs(secs))
-    bits.append(_counts(len(own), len(set(edited)), agents))
-    if calls:
-        bits.append(_plural(calls, "tool call"))
+    return {"span": start if start == end else f"{start}–{end}",
+            "secs": active_seconds(sorted(stamps)), "prompts": len(own),
+            "files": len(set(edited)), "agents": agents, "calls": calls,
+            "records": b.chain[first:], "opened": opened}
+
+
+def _branch_line(b: _Branch) -> str:
+    """Clock span, active duration and counts over the records a branch holds
+    past the point it diverges, in the shape `_meta_line` gives a session."""
+    st = _branch_stats(b)
+    bits = [st["span"]]
+    if st["secs"]:
+        bits.append(_fmt_secs(st["secs"]))
+    bits.append(_counts(st["prompts"], st["files"], st["agents"]))
+    if st["calls"]:
+        bits.append(_plural(st["calls"], "tool call"))
     return " · ".join(bits)
+
+
+def _branch_cache(b: _Branch, records: list[dict], now: float, sid: str) -> tuple[str, bool]:
+    """The cache state a resume of the branch meets, and whether it reads
+    the prefix from cache. A branch with no request past its divergence left
+    no entry for its own tail. An uninstalled version builds another prefix,
+    which rewrites the whole branch inside the window."""
+    if not any(r.get("type") == "assistant" and isinstance((r.get("message") or {}).get("usage"), dict)
+               for r in records):
+        return "no request", False
+    version = _request_version(b.chain)
+    if version and not _claude_at(version):
+        return f"Claude Code {version} no longer installed", False
+    row = _cache_row(b.chain, now, sid)
+    if row is None:
+        return "no request", False
+    warm = (row["lifetime"] is not None and row["age"] is not None
+            and row["age"] < row["lifetime"])
+    return _cache_state(row), warm
+
+
+def render_branch_rows(meta: Meta, ref: str, path: pathlib.Path, branches: list[_Branch]) -> str:
+    """The branches as numbered rows under their rewind points, each with its
+    cache state: the plain-text listing `--stdout` prints, in the row shape
+    `chsum cache` takes. A rewind point and each branch's first and last
+    prompt carry their `<session>:<line>` anchors, the form `chsum resume`
+    takes."""
+    if len(branches) < 2:
+        return f"{ref}  one branch: the conversation holds no rewind\n"
+    lines = _record_lines(path)
+    now = time.time()
+    live = _resumed_branch(branches)
+    root = pathlib.Path(meta.project) if meta.project else None
+
+    lit = _colour_ok()
+
+    def paint(text: str, code: str) -> str:
+        return f"{code}{text}{_ANSI_OFF}" if lit else text
+
+    def anchor(rec: dict) -> str:
+        return paint(_anchor(path, lines, rec), _ANSI_DIM)
+
+    def quote(rec: dict, code: str = "\033[32m") -> str:
+        return paint(f"“{_clip_line(_prompt_words(rec, 40), 80)}”", code)
+
+    rows, warm = [], 0
+    for i, b in enumerate(branches):
+        st = _branch_stats(b)
+        state, hot = _branch_cache(b, st["records"], now, path.stem if i == live else "")
+        warm += hot
+        recs = st["records"]
+        named = _named_by_calls(root, recs, _file_shapes(root, path.stem, recs)) if root else {}
+        rows.append((b, st, [str(i + 1), st["span"], _plural(st["prompts"], "prompt"),
+                         _plural(len(named) or st["files"], "file"),
+                         _plural(st["calls"], "call") if st["calls"] else "", state]))
+    widths = [max(len(cells[c]) for _, _, cells in rows) for c in range(5)]
+
+    def point(b: _Branch) -> dict | None:
+        # A `!` command opens two records, its input and its output; the
+        # input carries the command the rewind menu lists.
+        at = b.split - 1
+        if at > 0 and "<bash-stdout>" in str((b.openers[at].get("message") or {}).get("content")):
+            at -= 1
+        return b.openers[at] if b.split else None
+    points = len({(point(b) or {}).get("uuid") for b in branches})
+    out = [f"{ref}  {_branch_count(len(branches))}, {_plural(points, 'rewind point')}, "
+           f"{warm} in cache", ""]
+    held = ""
+    for i, (b, st, cells) in enumerate(rows):
+        at = point(b)
+        if (at or {}).get("uuid", "start") != held:
+            held = (at or {}).get("uuid", "start")
+            out.append(f"{anchor(at)}  {quote(at, _ANSI_BOLD)}" if at
+                       else paint("from the start", _ANSI_BOLD))
+        row = "  ".join(cells[c].ljust(widths[c]) if c else cells[c].rjust(widths[c])
+                        for c in range(5))
+        out.append(f"  {row}  {cells[5]}" + (paint("  resumed by default", _ANSI_BOLD) if i == live else ""))
+        own = b.prompts[b.shared:]
+        ends = ([st["opened"]] if st["opened"] else own[:1]) + own[-1:]
+        for rec in {r["uuid"]: r for r in ends}.values():
+            out.append(f"       {anchor(rec)}  {quote(rec)}")
+    out += ["", paint(f"`chsum digest {ref} --branches <n>` resumes one · "
+                      f"`chsum resume <anchor> --why [files]` explains a cut's edits", _ANSI_DIM)]
+    return "\n".join(out) + "\n"
 
 
 def render_branches(meta: Meta, ref: str, branches: list[_Branch]) -> str:
@@ -4789,7 +4922,8 @@ def _rewind_status(records: list[dict]) -> dict | None:
     cut = after[-1] - base
     paid = sum(rho * max(x - base, 0) for x in after)
     cost = rho * after[-1] + handoff_cost
-    out.update(cursor=_prompt_words(live[cursor]), cut=cut, paid=paid, cost=cost,
+    out.update(cursor=_prompt_words(live[cursor]), cursor_id=live[cursor]["uuid"],
+               cut=cut, paid=paid, cost=cost,
                per_request=rho * max(cut - s, 0))
     return out
 
@@ -4802,18 +4936,19 @@ _RUNNING_STALE = 900
 def _handoff_phase(sid: str, now: float) -> tuple[str, str] | None:
     """The handoff's phase and its detail: `writing` with its age, `sent`,
     `ready`, `skipped` with the error, or `delivered` under a minute ago.
-    None where no handoff holds a phase."""
+    A `--why` run's `why-` files hold no rewind handoff and stay out. None
+    where no handoff holds a phase."""
     d = _side_dir(sid)
     if not sid or not d.is_dir():
         return None
-    for f in d.glob("*.running"):
+    for f in (f for f in d.glob("*.running") if not f.name.startswith("why-")):
         try:
             started = float(json.loads(f.read_text()).get("started") or 0)
         except (OSError, ValueError):
             continue
         if now - started < _RUNNING_STALE:
             return "writing", f"{int(now - started)}s"
-    ready = list(d.glob("*.json"))
+    ready = [f for f in d.glob("*.json") if not f.name.startswith("why-")]
     if ready:
         try:
             got = json.loads(max(ready, key=lambda f: f.stat().st_mtime).read_text())
@@ -4822,7 +4957,7 @@ def _handoff_phase(sid: str, now: float) -> tuple[str, str] | None:
         if got.get("sent"):
             return "sent", ""
         return ("ready", "") if got.get("text") else ("skipped", str(got.get("error") or "no reply"))
-    done = [f.stat().st_mtime for f in d.glob("*.delivered")]
+    done = [f.stat().st_mtime for f in d.glob("*.delivered") if not f.name.startswith("why-")]
     if done and now - max(done) < 60:
         return "delivered", ""
     return None
@@ -5053,28 +5188,14 @@ def _file_shapes(root: pathlib.Path, session: str, records: list[dict]) -> dict[
     return files
 
 
-def _note_on(root: pathlib.Path, sha: str) -> str:
-    """The `## Changes` note filed on checkpoint `sha`, '' where none is."""
-    try:
-        proc = subprocess.run(["git", "notes", f"--ref={_NOTES_REF}", "show", sha],
-                              cwd=root, capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return proc.stdout if proc.returncode == 0 else ""
-
-
-def _files_section(root: pathlib.Path, files: dict[str, dict], changes: dict[str, str]) -> list[str]:
-    """Each file a branch changed: its line counts and writes, the reason its
-    `## Changes` entry gives, its shape, and each call that wrote it with the
-    line that announced the call."""
+def _files_section(root: pathlib.Path, files: dict[str, dict]) -> list[str]:
+    """Each file a branch changed: its line counts and writes, its shape, and
+    each call that wrote it with the line that announced the call."""
     out = ["## Files changed\n"]
     for name, f in files.items():
-        why = _why_for(changes, name) or _why_for(
-            _changes_by_file(_changes_block(_note_on(root, f["last_sha"]))), name)
         disk = _disk_state(root, name, f["last_sha"]) if f.get("last_sha") else ""
         out.append(f"### `{name}` · +{f['added']} −{f['removed']} · "
                    f"{_plural(len(f['calls']), 'write')}" + (f" · {disk}" if disk else "") + "\n")
-        out.append(f"- Why: {why}" if why else "- Why: *no `## Changes` entry names this file*")
         shape = f["shape"]
         parts = [f"{label} " + ", ".join(f"`{s}`" for s in shape[key][:8])
                  + (f" and {len(shape[key]) - 8} more" if len(shape[key]) > 8 else "")
@@ -5399,19 +5520,14 @@ def _disk_state(root: pathlib.Path, rel: str, sha: str) -> str:
     return "on disk as the branch left it" if want == have else "changed on disk since the branch"
 
 
-def _files_brief(root: pathlib.Path, files: dict[str, dict], changes: dict[str, str],
-                 why: bool = True) -> list[str]:
+def _files_brief(root: pathlib.Path, files: dict[str, dict]) -> list[str]:
     """`_files_section` in one line per file, for a hook's bounded context:
-    the line counts, the writes and the reason. `why` False leaves the reason
-    out where the branch's `## Changes` block is printed whole below."""
+    the line counts and the writes."""
     out = ["## Files changed\n"]
     for name, f in files.items():
-        reason = why and (_why_for(changes, name) or _why_for(
-            _changes_by_file(_changes_block(_note_on(root, f["last_sha"]))), name))
         disk = _disk_state(root, name, f["last_sha"]) if f.get("last_sha") else ""
         out.append(f"- `{name}` · +{f['added']} −{f['removed']} · "
-                   f"{_plural(len(f['calls']), 'write')}" + (f" · {disk}" if disk else "")
-                   + (f" · Why: {reason}" if reason else ""))
+                   f"{_plural(len(f['calls']), 'write')}" + (f" · {disk}" if disk else ""))
     out.append("")
     return out
 
@@ -5452,10 +5568,7 @@ def render_rewound(meta: Meta, ref: str, path: pathlib.Path, records: list[dict]
     handed = _newest_handoff(said)
     shapes = _named_by_calls(root, lead, _file_shapes(root, path.stem, lead)) if root else {}
     if shapes:
-        final = said[handed if handed is not None else last][0].text if last is not None else ""
-        changes = _changes_by_file(_changes_block(final))
-        out += (_files_section(root, shapes, changes) if not compact
-                else _files_brief(root, shapes, changes, why=handed is None))
+        out += _files_section(root, shapes) if not compact else _files_brief(root, shapes)
     elif edited:
         out.append("## Files changed\n")
         out += [f"- `{_relpath(f, meta.project)}`" for f in edited]
@@ -5464,6 +5577,7 @@ def render_rewound(meta: Meta, ref: str, path: pathlib.Path, records: list[dict]
     unchecked = _unchecked_files(root, path.stem, lead, checked)
     if unchecked:
         out += _unchecked_section(unchecked, meta.project)
+    changed = (list(shapes) or [_relpath(f, meta.project) for f in edited]) + [e["path"] for e in unchecked]
     if cmds and not compact:
         shown = _dedupe(cmds)
         out.append("## Commands run\n")
@@ -5519,6 +5633,11 @@ def render_rewound(meta: Meta, ref: str, path: pathlib.Path, records: list[dict]
             else:
                 out.append(f"Its last message · `{meta.uuid[:8]}:{blast.line}`\n")
                 out.append(_quote(_clip_line(blast.text, 1500)) + "\n")
+    if changed and not compact:
+        out.append(f"`chsum resume {meta.uuid[:8]}:{lines.get(lead[0]['uuid'], 0)} --why [files]` "
+                   f"sends what the messages above leave out about the first branch's edits, "
+                   f"as a message to this session. The files it takes: "
+                   + ", ".join(f"`{f}`" for f in changed) + "\n")
     return "\n".join(out)
 
 
@@ -5940,6 +6059,9 @@ def _digest_branches(args, path: pathlib.Path, ref: str) -> int:
                          "this transcript's format does not carry")
     meta = extract_meta(path)
     branches = _branches(path)
+    if not args.branches and args.stdout:
+        print(render_branch_rows(meta, ref, path, branches), end="")
+        return 0
     if not args.branches:
         return _deliver(args, render_branches(meta, ref, branches),
                         meta.uuid, _view_suffix("branches"))
@@ -6612,9 +6734,6 @@ def cmd_file(args) -> int:
         if w["call"]:
             bits.append(w["call"])
         print(f"{stamp}  " + " · ".join(bits))
-        why = _why_for(_changes_by_file(_changes_block(_note_on(root, w["sha"]))), rel)
-        if why:
-            print(f"          why: {_clip_line(why, 200)}")
     if any_rewound:
         print("\nA turn of this session marked rewound left the conversation by a rewind and "
               "its writes stayed on disk. `chsum digest --rewound --stdout` prints what the "
@@ -7084,41 +7203,6 @@ _OUTPUT_RATE = 5.0
 _HANDOFF_HEADING = "## Rewind handoff"
 
 
-def _turn_growth(records: list[dict]) -> tuple[int, dict | None]:
-    """The tokens the current turn added to the context, and its last request.
-    The turn opens at the last prompt the person typed; its first request
-    carries everything before it plus the prompt, and its last request plus
-    that request's output is what the next request carries."""
-    command_ids = _command_prompt_ids(records)
-    main = _live_chain(records)
-    opened = max((i for i, r in enumerate(main) if r.get("type") == "user"
-                  and _is_typed_prompt(r, command_ids)), default=None)
-    if opened is None:
-        return 0, None
-    requests = [r for r in main[opened:] if r.get("type") == "assistant"
-                and isinstance((r.get("message") or {}).get("usage"), dict)]
-    if not requests:
-        return 0, None
-
-    def size(r: dict, output: bool) -> int:
-        u = r["message"]["usage"]
-        keys = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
-        return sum(int(u.get(k) or 0) for k in keys + (("output_tokens",) if output else ()))
-    return max(size(requests[-1], True) - size(requests[0], False), 0), requests[-1]
-
-
-
-
-def _turn_opener(records: list[dict]) -> dict | None:
-    """The prompt the person typed last on the main thread: the record a
-    rewind to the start of the current turn returns to. A message sent while
-    the turn runs is an attachment, not a typed prompt, so the opener stays
-    the prompt that started the turn."""
-    command_ids = _command_prompt_ids(records)
-    return next((r for r in reversed(_live_chain(records)) if r.get("type") == "user"
-                 and _is_typed_prompt(r, command_ids)), None)
-
-
 def _live_chain(records: list[dict]) -> list[dict]:
     """The main thread's records from the session's first to its newest, in
     parent order. A rewind leaves the branch it abandoned in the file, so the
@@ -7140,38 +7224,18 @@ def _live_chain(records: list[dict]) -> list[dict]:
     return chain
 
 
-def _opening_words(opener: dict | None, n: int = 5) -> str:
-    """The first `n` words of the opening prompt, tags such as a paste's
-    `<pasted_content>` wrapper removed: the words the rewind menu shows."""
-    text = re.sub(r"<[^>]+>", " ", _typed_text(opener)) if opener else ""
-    return " ".join(text.split()[:n])
-
-
 
 
 
 
 _CHANGES_HEADING = "## Changes"
 
-# The notes ref the `## Changes` block of a turn is filed under, one note per
-# checkpoint the turn's calls committed. A note leaves the commit it annotates
-# as it was, so the checkpoint chain keeps its shas.
-_NOTES_REF = "refs/notes/chsum"
 
 
 
 
 
 
-
-
-
-def _turn_records(records: list[dict]) -> list[dict]:
-    """The current turn's records on the main thread, its opening prompt first."""
-    main = _live_chain(records)
-    opener = _turn_opener(records)
-    at = next((i for i, r in enumerate(main) if r is opener), None)
-    return main[at:] if at is not None else []
 
 
 def _call_ids(records: list[dict]) -> set[str]:
@@ -7181,85 +7245,6 @@ def _call_ids(records: list[dict]) -> set[str]:
             and p.get("type") == "tool_use" and p.get("id")}
 
 
-def _turn_shas(cwd: pathlib.Path, sid: str, records: list[dict]) -> list[str]:
-    """The checkpoints the calls in `records` committed, oldest first."""
-    calls = _call_ids(records)
-    return [e.sha for e in checkpoints.chain_entries(cwd, sid)
-            if not e.action and e.call in calls]
-
-
-def _final_text(records: list[dict], last: dict) -> str:
-    """The text of the reply `last` ends: every text block of the records that
-    share its message id, in order. A reply is written one record per block."""
-    mid = (last.get("message") or {}).get("id")
-    parts = [str(c.get("text") or "") for r in records
-             if r.get("type") == "assistant" and (r.get("message") or {}).get("id") == mid
-             for c in ((r.get("message") or {}).get("content") or [])
-             if isinstance(c, dict) and c.get("type") == "text"]
-    return "\n".join(parts)
-
-
-def _changes_block(text: str) -> str:
-    """The lines under a line reading `## Changes`, up to the next `## `
-    heading or a fence, '' where no such line stands in `text`."""
-    lines = text.splitlines()
-    at = next((i for i, line in enumerate(lines) if line.strip() == _CHANGES_HEADING), None)
-    if at is not None:
-        out = []
-        for line in lines[at + 1:]:
-            if line.startswith("## ") or line.strip().startswith("```"):
-                break
-            out.append(line)
-        return "\n".join(out).strip()
-    # A handoff written before the `## Changes` block existed carries its
-    # reasons in a `Changed` section inside its fence, up to the next section.
-    at = next((i for i, line in enumerate(lines) if line.strip() == "Changed"), None)
-    if at is None:
-        return ""
-    out = []
-    for line in lines[at + 1:]:
-        if line.strip() in ("Facts", "Checked", "Dropped", "Next") or line.strip().startswith("```"):
-            break
-        out.append(line)
-    return "\n".join(out).strip()
-
-
-def _changes_by_file(block: str) -> dict[str, str]:
-    """`## Changes` bullets keyed by the path in backticks that opens each;
-    an indented line below a bullet belongs to it. A `:line` suffix on the
-    path is dropped, so the key matches the file."""
-    out: dict[str, str] = {}
-    key = ""
-    for line in block.splitlines():
-        m = (re.match(r"\s*[-*]\s+`([^`]+)`\s*[:—–-]?\s*(.*)", line)
-             or re.match(r"\s*[-*]\s+([\w./-]+\.\w+(?::[\d,\-]+)?)\s+(.*)", line))
-        if m:
-            key = re.sub(r":[\d,\-]+$", "", m.group(1).strip())
-            out[key] = " · ".join(t for t in (out.get(key, ""), m.group(2).strip()) if t)
-        elif key and line.strip():
-            out[key] = f"{out[key]} {line.strip()}".strip()
-    return out
-
-
-def _why_for(changes: dict[str, str], rel: str) -> str:
-    """The `## Changes` entry for the file at repo path `rel`: the entry whose
-    path is `rel`, ends it, or is ended by it."""
-    for key, text in changes.items():
-        k = key.lstrip("./")
-        if k == rel or rel.endswith("/" + k) or k.endswith("/" + rel):
-            return text
-    return ""
-
-
-def _file_changes_note(cwd: pathlib.Path, shas: list[str], block: str, opener: dict | None) -> None:
-    """Files `block` as a note on each checkpoint in `shas` under `_NOTES_REF`,
-    replacing any note there, so a view reaching any one of the turn's
-    checkpoints reads the turn's reasons."""
-    text = (f"chsum-changes: turn opened by “{_opening_words(opener, 12)}”\n\n"
-            f"{_CHANGES_HEADING}\n{block}\n")
-    for sha in shas:
-        subprocess.run(["git", "notes", f"--ref={_NOTES_REF}", "add", "-f", "-F", "-", sha],
-                       cwd=cwd, input=text, capture_output=True, text=True, timeout=15)
 
 
 
@@ -7278,7 +7263,9 @@ _SIDE_HANDOFF_ASK = (
     "as of the branch's last message: what was done, read and found by then. This request "
     "runs as a separate session, with its own session id, scratchpad and background tasks, "
     "and every notice it received after the branch ended describes that separate session; "
-    "the handoff carries none of them. The conversation that continues may have moved on "
+    "the handoff carries none of them. This request starts no watcher and no background "
+    "task, a session-start notice to arm one included: a background task holds this "
+    "request's exit until the task ends. The conversation that continues may have moved on "
     "since, so a step the branch had not taken is written as not taken in the branch.\n\n"
     "The handoff is complete when a session holding only the conversation up to that "
     "point, plus the handoff, can take the next step without opening any file this "
@@ -7292,14 +7279,34 @@ _SIDE_HANDOFF_ASK = (
     "- Dropped: each approach tried and abandoned, and the fact that ruled it out.\n"
     "- Next: the next step and the files it opens.\n")
 
+# The `--why` request's ask. The conversation that continues has read the cut
+# branch's messages from `chsum resume`, so the reply holds only what the
+# edits and tool results carry.
+_SIDE_WHY_ASK = (
+    "The conversation that continues past {point} (record `{uuid}`, line {line}) already "
+    "holds every message of this branch past that point, word for word, and the list of "
+    "files the branch changed with their line counts. For each file below, write only what "
+    "that conversation cannot read in those messages and cannot work out from them:\n"
+    "- the lines the edit changed and the structure it touched (functions, sections);\n"
+    "- each approach tried in an edit or a command and then reverted, with the result that "
+    "ruled it out;\n"
+    "- the reason for a change, where the messages give none.\n\n"
+    "Leave out anything the messages already say. A file whose change the messages explain "
+    "fully gets the single line `covered by the conversation`. Reply with one block per file: "
+    "`### `path``, then `Lines`, `Structure`, `Not in the conversation`. Open no file and run "
+    "no tool other than SendMessage: this branch's own tool results already hold the edits. "
+    "This request starts no watcher and no background task, a session-start notice to arm "
+    "one included: a background task holds this request's exit until the task ends.\n\n"
+    "Files:\n{files}\n\n")
+
 # Where the conversation that continues is running, the handoff goes to it as
 # a message, so it arrives as soon as it is written rather than with the next
 # prompt or tool result.
-_SIDE_SEND = ("Send the handoff with SendMessage to {address}, the conversation that "
-              "continues, the handoff itself as the message; ToolSearch loads SendMessage "
+_SIDE_SEND = ("Send the {what} with SendMessage to {address}, the conversation that "
+              "continues, the {what} itself as the message; ToolSearch loads SendMessage "
               "where it is listed as deferred. Then reply with the one word: sent. Where "
-              "SendMessage fails, reply with the handoff alone.")
-_SIDE_REPLY = "Reply with the handoff alone; run no tools."
+              "SendMessage fails, reply with the {what} alone.")
+_SIDE_REPLY = "Reply with the {what} alone; run no tools."
 
 
 def _arrival(sid: str) -> str:
@@ -7384,21 +7391,23 @@ def _side_handoff(payload: dict) -> int:
         tip, point, payload = found["tip"], found["point"], {**payload, "words": found["words"]}
     if not (sid and tip and point and path.is_file()):
         return 0
+    why = payload.get("why")
     out_dir = _side_dir(sid)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"{point}.json"
-    if out.exists() or (out_dir / f"{point}.delivered").exists():
+    out = out_dir / (f"why-{int(time.time() * 1000)}.json" if why is not None else f"{point}.json")
+    if why is None and (out.exists() or (out_dir / f"{point}.delivered").exists()):
         (out_dir / "resume.running").unlink(missing_ok=True)
         return 0
 
     running = out_dir / "resume.running"
     if not running.exists():
-        running = out_dir / f"{point}.running"
-        running.write_text(json.dumps({"started": time.time(), "doing": "writing the handoff"}))
+        running = out.with_suffix(".running")
+        running.write_text(json.dumps({"started": time.time(), "doing": "writing the handoff"
+                                       if why is None else "writing the --why answer"}))
 
     def done(**fields) -> int:
         out.write_text(json.dumps({"point": point, "words": payload.get("words") or "",
-                                   "at": time.time(), **fields}))
+                                   "at": time.time(), "why": why, **fields}))
         running.unlink(missing_ok=True)
         return 0
 
@@ -7423,21 +7432,24 @@ def _side_handoff(payload: dict) -> int:
         env.pop("FORCE_PROMPT_CACHING_5M", None)
         env["CLAUDE_CODE_PROMPT_CACHE_TTL"] = "1h"
     address = sessions.address(sid)
-    ask = (_SIDE_HANDOFF_ASK.format(point=payload.get("words") or "the rewind point")
-           + _disk_lines(chain, point, sid, cwd_of=by[tip])
-           + (_SIDE_SEND.format(address=address) if address else _SIDE_REPLY))
+    what = "handoff" if why is None else "answer"
+    if why is None:
+        ask = (_SIDE_HANDOFF_ASK.format(point=payload.get("words") or "the rewind point")
+               + _disk_lines(chain, point, sid, cwd_of=by[tip]))
+    else:
+        prompt = by.get(str(payload.get("prompt") or "")) or {}
+        ask = _SIDE_WHY_ASK.format(
+            point=f"“{_prompt_words(prompt, 12)}…”" if prompt else "the rewind point",
+            uuid=point, line=str(payload.get("anchor") or "").rpartition(":")[2] or "unknown",
+            files="\n".join(f"- `{f}`" for f in why))
+    ask += _SIDE_SEND.format(what=what, address=address) if address else _SIDE_REPLY.format(what=what)
     cwd = str(by[tip].get("cwd") or "") or None
     allowed = ["--allowedTools", "SendMessage,ToolSearch"] if address else []
     try:
         # The ask goes on stdin: `--allowedTools` takes every argument after it
-        # as a tool name, a prompt among them. A plugin's SessionStart hook can
-        # start a background task in the request, and `-p` holds its exit until
-        # that task ends, which runs the request to the timeout after the
-        # handoff is sent. Hooks are kept off; the tool list stays as the branch
-        # sent it, since a changed tool list misses the branch's whole cache.
+        # as a tool name, a prompt among them.
         proc = subprocess.run([exe, "-p", "--resume", dest.stem, "--no-session-persistence",
-                               "--output-format", "json", "--model", row["model"],
-                               "--settings", json.dumps({"disableAllHooks": True}), *allowed],
+                               "--output-format", "json", "--model", row["model"], *allowed],
                               cwd=cwd, env=env, input=ask, capture_output=True,
                               text=True, timeout=600)
         reply = json.loads(proc.stdout or "{}") if (proc.stdout or "").strip() else {
@@ -7450,7 +7462,8 @@ def _side_handoff(payload: dict) -> int:
     usage = reply.get("usage") or {}
     spent = {"read": int(usage.get("cache_read_input_tokens") or 0),
              "wrote": int(usage.get("cache_creation_input_tokens") or 0),
-             "output": int(usage.get("output_tokens") or 0)}
+             "output": int(usage.get("output_tokens") or 0),
+             "requests": int(reply.get("num_turns") or 0)}
     result = str(reply.get("result") or "").strip()
     if reply.get("is_error") or not result:
         return done(error=(result or "no reply")[:500], **spent)
@@ -7482,22 +7495,11 @@ def _resume_cut(sid: str, path: pathlib.Path, started: float) -> dict | None:
             {"point": "", "words": "", "at": time.time(), "error": error}))
         running.unlink(missing_ok=True)
 
-    deadline, mark = time.time() + _RESUME_WAIT, None
-    while time.time() < deadline:
-        records = list(_records(path))
-        for r in reversed(records):
-            content = (r.get("message") or {}).get("content")
-            when = _parse_ts(str(r.get("timestamp") or ""))
-            if (r.get("type") == "user" and isinstance(content, str) and "<bash-input>" in content
-                    and "chsum resume" in content and when and when.timestamp() >= started - 2):
-                mark = r
-                break
-        if mark:
-            break
-        time.sleep(0.25)
-    if not mark:
+    found = _resume_mark(path, started)
+    if not found:
         fail(f"the `chsum resume` record did not reach the transcript within {_RESUME_WAIT}s")
         return None
+    mark, records = found
     recs, by, up, kids = _record_tree(records)
     point = by.get(str(mark.get("parentUuid") or ""))
     if point is None:
@@ -7518,14 +7520,159 @@ def _resume_cut(sid: str, path: pathlib.Path, started: float) -> dict | None:
     return {"tip": paths[0][-1]["uuid"], "point": point["uuid"], "words": words}
 
 
+def _resume_mark(path: pathlib.Path, started: float) -> tuple[dict, list[dict]] | None:
+    """The `<bash-input>` record of `chsum resume` timestamped at or after
+    `started`, and the records read with it. Claude Code writes it as the
+    command exits, so this polls the transcript for up to `_RESUME_WAIT`
+    seconds. None where it does not land in that time."""
+    deadline = time.time() + _RESUME_WAIT
+    while time.time() < deadline:
+        records = list(_records(path))
+        for r in reversed(records):
+            content = (r.get("message") or {}).get("content")
+            when = _parse_ts(str(r.get("timestamp") or ""))
+            if (r.get("type") == "user" and isinstance(content, str) and "<bash-input>" in content
+                    and "chsum resume" in content and when and when.timestamp() >= started - 2):
+                return r, records
+        time.sleep(0.25)
+    return None
+
+
+def _anchor(path: pathlib.Path, lines: dict, rec: dict) -> str:
+    """`<session>:<line>`, the form the digests print a record's place in."""
+    return f"{path.stem[:8]}:{lines.get(rec.get('uuid'), 0)}"
+
+
+def _anchored_prompt(path: pathlib.Path, records: list[dict], lines: dict, anchor: str) -> dict:
+    """The prompt record `<session>:<line>` names in this session's
+    transcript; exits with the reason where the anchor names another
+    session, no record, or a record that opens no path."""
+    m = re.fullmatch(r"(?:([0-9a-f]{4,}):)?(\d+)", anchor.strip())
+    if not m:
+        raise SystemExit(f"{anchor}: an anchor reads `<session>:<line>`, as `chsum digest` prints it")
+    if m.group(1) and not path.stem.startswith(m.group(1)):
+        raise SystemExit(f"{anchor}: names session {m.group(1)}; this session is {path.stem[:8]}")
+    at = int(m.group(2))
+    uuid = next((u for u, n in lines.items() if n == at), None)
+    rec = next((r for r in records if r.get("uuid") == uuid), None) if uuid else None
+    if rec is None or not _opens_path(rec):
+        raise SystemExit(f"{anchor}: line {at} holds no prompt a rewind returns to")
+    return rec
+
+
+def _lead_files(meta: Meta, path: pathlib.Path, lead: list[dict]) -> list[str]:
+    """The files the cut's first branch wrote, as `render_rewound` lists
+    them: the paths `--why` takes."""
+    root = pathlib.Path(meta.project) if meta.project else None
+    edited, read, cmds, writes = [], [], [], {}
+    for rec in lead:
+        if rec.get("type") in ("user", "assistant"):
+            _collect_tools(rec, edited, read, cmds, None, writes)
+    edited = _checkpoint_files(meta.project, path.stem, lead) or _dedupe(f for f in edited if f)
+    shapes = _named_by_calls(root, lead, _file_shapes(root, path.stem, lead)) if root else {}
+    checked = set(shapes) | {_relpath(f, meta.project) for f in edited}
+    return ((list(shapes) or [_relpath(f, meta.project) for f in edited])
+            + [e["path"] for e in _unchecked_files(root, path.stem, lead, checked)])
+
+
+def _cut_from(records: list[dict], prompt: dict) -> _Cut | None:
+    """The cut a rewind to `prompt` makes: the conversation continues from
+    the prompt's parent, and every branch under that parent is cut. Read
+    before the next record lands, the newest of those branches is the one the
+    rewind just left, and it runs through the prompt. Read after the
+    conversation has moved on, the newest record's chain leaves the point
+    through a record other than the prompt: that chain is the conversation
+    that continues, and it stays out of the cut. None where the prompt hangs
+    off no record."""
+    recs, by, up, kids = _record_tree(records)
+    point = by.get(str(prompt.get("parentUuid") or ""))
+    if point is None:
+        return None
+    on = {r["uuid"] for r in _chain_to(by, up, _newest(recs)["uuid"])}
+    on.discard(prompt["uuid"])
+    roots = [k for k in kids[point["uuid"]] if _opens_path(k) and k["uuid"] not in on]
+    return _Cut(point, _cut_paths(by, up, kids, roots), _chain_to(by, up, point["uuid"]), 0)
+
+
+def _recent_prompts(path: pathlib.Path, records: list[dict], lines: dict, n: int = 10) -> list[str]:
+    """The last `n` typed prompts on the conversation's newest chain, each as
+    its anchor and first words: the points `chsum resume <anchor>` takes."""
+    command_ids = _command_prompt_ids(records)
+    chain = [r for r in _live_chain(records) if r.get("type") == "user"
+             and _is_typed_prompt(r, command_ids)]
+    return [f"  {_anchor(path, lines, r)}  “{_prompt_words(r, 12)}…”" for r in chain[-n:]]
+
+
 def cmd_resume(args) -> int:
-    """After a rewind: starts the process that finds the rewind point and
-    writes the handoff, and exits at once. Claude Code writes this command's
-    `!` records when it exits, and those records name the point the
-    conversation went back to; the process waits for them (`_resume_cut`)."""
+    """After a rewind: writes what it cut, the messages whole and the files
+    changed, beside the digests and prints the path; `--stdout` prints the cut
+    itself. A rewind writes no record, and this command's own `!` records
+    land only as it exits, so the point comes from an anchor given, or else
+    from the status line's rewind point. With the status line's point, a
+    process outlives the command, reads the point the `!` record hangs off,
+    and sends a message to the session where the two differ."""
     path = live_transcript()
+    records = list(_records(path))
+    lines = _record_lines(path)
+    if args.anchor:
+        prompt = _anchored_prompt(path, records, lines, args.anchor)
+        source = "the anchor given"
+    else:
+        status = _rewind_status(records) or {}
+        _, by, _, _ = _record_tree(records)
+        prompt = by.get(str(status.get("cursor_id") or ""))
+        source = "the status line's rewind point"
+        if prompt is None:
+            print("chsum resume: the status line holds no rewind point, so the point the rewind "
+                  "went to reaches this command only as an anchor: `chsum resume <session>:<line>`. "
+                  "The latest prompts:\n" + "\n".join(_recent_prompts(path, records, lines)))
+            return 1
+    cut = _cut_from(records, prompt)
+    if cut is None or not cut.paths:
+        raise SystemExit(f"chsum resume: {_anchor(path, lines, prompt)} hangs off no record")
+    anchor = _anchor(path, lines, prompt)
+    meta = extract_meta(path)
+    if args.why is not None:
+        return _resume_why(args, path, meta, cut, anchor)
+    print(f"chsum resume: the cut from {anchor} “{_prompt_words(prompt, 12)}…”, {source}.",
+          file=sys.stderr)
+    _deliver(args, render_rewound(meta, ch_ref_for_path(path), path, records, cut),
+             meta.uuid, _view_suffix("rewound"))
+    if args.anchor:
+        return 0
     payload = json.dumps({"session_id": path.stem, "transcript_path": str(path),
-                          "wait": time.time()})
+                          "started": time.time(), "taken": cut.point["uuid"], "anchor": anchor})
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(
+        [str(pathlib.Path(__file__).resolve().parent.parent), os.environ.get("PYTHONPATH", "")]).rstrip(os.pathsep)}
+    proc = subprocess.Popen([sys.executable, "-m", "chsum", "hook", "resume-check"],
+                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True, env=env)
+    proc.stdin.write(payload.encode())
+    proc.stdin.close()
+    return 0
+
+
+def _resume_why(args, path: pathlib.Path, meta: Meta, cut: _Cut, anchor: str) -> int:
+    """Starts the side request over the cut's first branch with the `--why`
+    ask for the files named, or every file the branch wrote, and returns
+    once it is running: its answer reaches the session as a message where
+    the session is listed in Claude Code's registry, and with the next tool
+    result where it is not."""
+    lead = cut.paths[0]
+    changed = _lead_files(meta, path, lead)
+    if not changed:
+        raise SystemExit(f"chsum resume: the cut from {anchor} wrote no file")
+    named = [_relpath(str(pathlib.Path(f).resolve()), meta.project) if pathlib.Path(f).is_absolute()
+             or (pathlib.Path.cwd() / f).exists() else f for f in args.why]
+    missing = [f for f in named if f not in changed]
+    if missing:
+        raise SystemExit(f"chsum resume: the cut from {anchor} wrote no "
+                         + ", ".join(f"`{f}`" for f in missing) + "; it wrote "
+                         + ", ".join(f"`{f}`" for f in changed))
+    files = named or changed
+    payload = json.dumps({"session_id": path.stem, "transcript_path": str(path),
+                          "tip": lead[-1]["uuid"], "point": cut.point["uuid"],
+                          "prompt": lead[0]["uuid"], "anchor": anchor, "why": files})
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(
         [str(pathlib.Path(__file__).resolve().parent.parent), os.environ.get("PYTHONPATH", "")]).rstrip(os.pathsep)}
     proc = subprocess.Popen([sys.executable, "-m", "chsum", "hook", "side-handoff"],
@@ -7533,7 +7680,70 @@ def cmd_resume(args) -> int:
                             stderr=subprocess.DEVNULL, start_new_session=True, env=env)
     proc.stdin.write(payload.encode())
     proc.stdin.close()
-    print(f"chsum: writing the rewind handoff; {_arrival(path.stem)}.")
+    print(f"chsum resume: a separate request over the cut from {anchor} is writing what the "
+          f"messages leave out about " + ", ".join(f"`{f}`" for f in files)
+          + f"; {_arrival(path.stem)}.")
+    return 0
+
+
+# The relay request that carries a correction to the session. It starts
+# fresh, so hooks are off: a session-start hook's background task holds a
+# `-p` request's exit until the task ends, and a fresh request has no cache
+# for a changed setting to miss.
+_RELAY_ASK = ("Send the text below with SendMessage to {address}, word for word, as the "
+              "message; ToolSearch loads SendMessage where it is listed as deferred. Then "
+              "reply with the one word: sent.\n\n{text}")
+
+
+def _resume_check(payload: dict) -> int:
+    """After `chsum resume` printed the cut under the status line's rewind
+    point: the `!` record lands as the command exits and hangs off the point
+    the rewind went to. The same point ends the check. A different point is
+    sent to the session as a message carrying the anchor that prints its
+    cut, through one fresh `claude -p` request; with no running session to
+    address, the message waits in `_side_dir` for the next tool result."""
+    sid, taken = str(payload.get("session_id") or ""), str(payload.get("taken") or "")
+    path = pathlib.Path(str(payload.get("transcript_path") or ""))
+    if not (sid and taken and path.is_file()):
+        return 0
+    found = _resume_mark(path, float(payload.get("started") or time.time()))
+    if not found:
+        return 0
+    mark, records = found
+    if str(mark.get("parentUuid") or "") == taken:
+        return 0
+    recs, by, up, kids = _record_tree(records)
+    point = by.get(str(mark.get("parentUuid") or ""))
+    roots = [k for k in kids[point["uuid"]] if k["uuid"] != mark["uuid"] and _opens_path(k)] \
+        if point else []
+    if not roots:
+        return 0
+    lines = _record_lines(path)
+    went = max(roots, key=lambda r: str(r.get("timestamp") or ""))
+    there = _anchor(path, lines, went)
+    text = (f"chsum resume wrote the cut from {payload.get('anchor')}, the status line's rewind "
+            f"point. The rewind went to {there} “{_prompt_words(went, 12)}…”: "
+            f"`chsum resume {there}` writes that cut and prints its path.")
+    address = sessions.address(sid)
+    exe = shutil.which("claude")
+    if address and exe:
+        env = {k: v for k, v in os.environ.items() if k not in observe._SESSION_ENV}
+        try:
+            proc = subprocess.run([exe, "-p", "--no-session-persistence", "--output-format", "json",
+                                   "--settings", json.dumps({"disableAllHooks": True}),
+                                   "--allowedTools", "SendMessage,ToolSearch"],
+                                  input=_RELAY_ASK.format(address=address, text=text),
+                                  cwd=str(mark.get("cwd") or "") or None, env=env,
+                                  capture_output=True, text=True, timeout=300)
+            reply = json.loads(proc.stdout or "{}") if (proc.stdout or "").strip() else {}
+        except (OSError, subprocess.SubprocessError, ValueError):
+            reply = {}
+        if str(reply.get("result") or "").strip(" .*\n").lower() == "sent":
+            return 0
+    out_dir = _side_dir(sid)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"{point['uuid']}.json").write_text(json.dumps(
+        {"point": point["uuid"], "at": time.time(), "note": text}))
     return 0
 
 
@@ -7551,6 +7761,17 @@ def _side_handoff_text(payload: dict, prompt: bool = False) -> str:
         except (OSError, ValueError):
             continue
         f.rename(f.with_suffix(".delivered"))
+        if got.get("note"):
+            return "chsum: " + got["note"]
+        if got.get("why") is not None:
+            named = ", ".join(f"`{n}`" for n in got["why"])
+            if got.get("sent"):
+                continue
+            if got.get("text"):
+                return (f"chsum: what the cut branch's messages leave out about {named}, written "
+                        f"by a separate request over that branch (read {got['read']:,} from "
+                        f"cache, wrote {got['wrote']:,}):\n\n" + got["text"])
+            return f"chsum: `chsum resume --why` wrote nothing about {named}: {got.get('error')}."
         where = f"the rewind to {got.get('words') or 'the rewind point'}"
         digest_file = f.with_suffix(".digest")
         digest = digest_file.read_text() if digest_file.exists() else ""
@@ -7566,7 +7787,7 @@ def _side_handoff_text(payload: dict, prompt: bool = False) -> str:
                     f"the cut branch (read {got['read']:,} from cache, wrote {got['wrote']:,}):\n\n"
                     + got["text"])
         return lead + f"chsum: no handoff was written for {where}: {got.get('error')}."
-    if prompt and any(_side_dir(sid).glob("*.running")):
+    if prompt and any(not r.name.startswith("why-") for r in _side_dir(sid).glob("*.running")):
         return f"chsum: writing the rewind handoff; {_arrival(sid)}."
     return ""
 
@@ -7584,35 +7805,6 @@ def _post_tool_asks(payload: dict) -> None:
     if text:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse",
                                                  "additionalContext": text}}))
-
-
-def _hook_stop(payload: dict) -> int:
-    """Stop: a `## Changes` block the turn's reply carries is filed as a note
-    on each checkpoint its calls committed, which `chsum file` and the writes
-    view show beside the change. A reply with no block files nothing, and the
-    turn ends. Every path exits 0."""
-    try:
-        path = pathlib.Path(str(payload.get("transcript_path") or ""))
-        sid = str(payload.get("session_id") or "")
-        cwd = pathlib.Path(str(payload.get("cwd") or "."))
-        if not sid or not path.is_file():
-            return 0
-        records = list(_records(path))
-        _, last = _turn_growth(records)
-        if last is None:
-            return 0
-        turn = _turn_records(records)
-        shas = _turn_shas(cwd, sid, turn) if _git_dir(cwd) else []
-        # The reply reaches the transcript after Stop runs; the hook's input
-        # carries it as `last_assistant_message`.
-        block = _changes_block(str(payload.get("last_assistant_message") or "")
-                               or _final_text(records, last))
-        if block and shas:
-            _file_changes_note(cwd, shas, block, _turn_opener(records))
-        return 0
-    except Exception as e:  # noqa: BLE001 — a fault here lets the turn end
-        print(f"chsum stop hook: {e}", file=sys.stderr)
-        return 0
 
 
 def cmd_name(args) -> int:
@@ -9948,10 +10140,10 @@ def cmd_hook(args) -> int:
         return _hook_pre_tool_use(payload)
     if args.event == "user-prompt-submit":
         return _hook_user_prompt_submit(payload)
-    if args.event == "stop":
-        return _hook_stop(payload)
     if args.event == "side-handoff":
         return _side_handoff(payload)
+    if args.event == "resume-check":
+        return _resume_check(payload)
     if args.event == "observe-pre":
         return observe.hook_pre(payload)
     if args.event == "observe-post":
@@ -11606,6 +11798,7 @@ _OPTION_FORMS = {
         ("chsum digest --messages", "this session, written the same way"),
         ("chsum digest <ref> --messages --stdout", "prints it instead"),
         ("chsum digest <ref> --messages > out.md", "your own path, any view"),
+        ("chsum resume --stdout", "prints the cut; the point line goes to stderr"),
     ],
     "--last": [
         ("chsum digest --last", "the most recent conversation that is not this one"),
@@ -11720,8 +11913,16 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_here)
 
     p = sub.add_parser("resume", parents=[dbg],
-                       help="after a rewind: writes the handoff for what it cut, which goes "
-                            "in with your next prompt")
+                       help="after a rewind: writes what it cut, the messages whole and the "
+                            "files changed, and prints the path")
+    p.add_argument("anchor", nargs="?",
+                   help="`<session>:<line>` of the prompt the rewind went to; without it, "
+                        "the status line's rewind point")
+    p.add_argument("--stdout", action="store_true",
+                   help="print the cut instead of writing a file")
+    p.add_argument("--why", nargs="*", metavar="FILE",
+                   help="a separate request over the cut branch sends what its messages leave "
+                        "out about these files, or every file it wrote, as a message")
     p.set_defaults(func=cmd_resume)
 
     p = sub.add_parser("file", parents=[dbg],
@@ -11967,8 +12168,8 @@ def main(argv=None) -> int:
                     "where this project's gate file is absent.",
     )
     p.add_argument("event", choices=["post-tool-use", "pre-tool-use", "session-start",
-                                     "user-prompt-submit", "stop", "observe-pre", "observe-post",
-                                     "side-handoff"],
+                                     "user-prompt-submit", "observe-pre", "observe-post",
+                                     "side-handoff", "resume-check"],
                    help="which hook fired")
     p.set_defaults(func=cmd_hook)
 
