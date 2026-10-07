@@ -130,10 +130,6 @@ _TAIL_ASK = "Reply with one word: ok."
 # costs each later request a few tokens to re-write, so no tail turn follows.
 _ADVANCE_ASK = "Reply with one word: noted."
 
-# A Bash command that names a watched file and carries one of these writes it,
-# moves it or removes it outside Write and Edit, where no review runs.
-_BASH_WRITE = re.compile(r">|\btee\b|\bsed\s+(-\w*\s+)*-\w*i|\bperl\s+-\w*i|\bmv\b|\bcp\b|\brm\b|\btruncate\b")
-
 # A base with less than this left on its cache takes a ping from the next
 # chsum hook in any session. A ping restarts the clock of every entry it
 # reads, so a base is held warm while any session fires hooks within its hour.
@@ -349,7 +345,7 @@ def _commit(state: dict, tree: str, edit: dict | None = None, outcome: str = "",
     outcome after `stop` has removed the edit files."""
     parent = ["-p", state["held"]] if state.get("held") else []
     if edit:
-        subject = f"chsum observe {state['name']}: {edit.get('title') or edit['rel']} {outcome}"
+        subject = f"chsum observe {state['name']}: {edit.get('title') or _subject(edit)} {outcome}"
         body = (f"Edit: {edit['number']}\nRoot: {state['root']}\nFile: {edit['rel']}\nWriter: {edit['writer']}\n"
                 f"Fork: {edit.get('fork') or ''}\nTitle: {edit.get('title') or ''}\nOutcome: {outcome}")
         message = f"{subject}\n\n{body}"
@@ -617,6 +613,22 @@ def _open_edits(state: dict) -> list[dict]:
     return out
 
 
+def _cleared(state: dict, session_id: str, tool: str, inp: dict) -> dict | None:
+    """The passed edit holding this exact call from this session, closed
+    within `_EDIT_LIFE`: the clearance its rerun runs on, once."""
+    now = time.time()
+    for f in _path(state, ".edits").glob("*.json"):
+        try:
+            edit = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if (edit.get("status") == "passed" and edit.get("writer") == session_id
+                and edit.get("tool") == tool and edit.get("input") == inp
+                and now - float(edit.get("ended") or 0) <= _EDIT_LIFE):
+            return edit
+    return None
+
+
 def _fork_name(state: dict, number: int) -> str:
     return f"observe-{state['name']}-{number}"
 
@@ -708,11 +720,16 @@ def _phase(edit: dict) -> str:
     return "waiting"
 
 
-def _hold(state: dict, rel: str, text: str, session_id: str, path: pathlib.Path) -> dict:
-    """Records a write as a held edit and starts its fork. The file stays as
-    it stands; `before` is its text now, which `apply` checks again."""
+def _hold(state: dict, rel: str, text: str | None, session_id: str, path: pathlib.Path | None,
+          tool: str = "", inp: dict | None = None) -> dict:
+    """Records a call as a held edit and starts its fork. A write to a
+    watched file carries `rel`, `text` and `path`: the file stays as it
+    stands, and `before` is its text now, which `close` checks again. Any
+    other call carries `tool` and `inp` with `rel` empty."""
     for edit in _open_edits(state):
-        if edit["rel"] == rel and edit["writer"] == session_id:
+        if edit["writer"] == session_id and (
+                (rel and edit["rel"] == rel) or
+                (not rel and edit.get("tool") == tool and edit.get("input") == inp)):
             return edit
     with _Lock(state):
         fresh = _load(state["root"], state["name"])
@@ -720,33 +737,74 @@ def _hold(state: dict, rel: str, text: str, session_id: str, path: pathlib.Path)
         fresh["next_edit"] = number + 1
         _save(fresh)
     try:
-        before = path.read_text(errors="replace")
+        before = path.read_text(errors="replace") if path else None
     except OSError:
         before = None
-    edit = {"number": number, "rel": rel, "writer": session_id, "to": sessions.address(session_id),
-            "before": before, "pending": text, "agreed": None, "status": "held",
-            "fork": "", "created": time.time()}
-    _event(edit, f"held · `{rel}`")
+    edit = {"number": number, "rel": rel, "tool": tool, "input": inp, "writer": session_id,
+            "to": sessions.address(session_id), "before": before, "pending": text, "agreed": None,
+            "status": "held", "fork": "", "created": time.time()}
+    _event(edit, f"held · `{_subject(edit)}`")
     _save_edit(state, edit)
-    _note(state, outcome={"file": rel, "result": "held", "at": time.time()})
+    _note(state, outcome={"file": _subject(edit), "result": "held", "at": time.time()})
     _detach(state, "fork", number)
     return edit
 
 
-def _fork_prompt(state: dict, edit: dict, shown: str) -> str:
+def _subject(edit: dict) -> str:
+    return edit["rel"] or edit.get("tool") or ""
+
+
+# The skill directory's file of the tool calls a fork carries out an agreed
+# result with, one permission rule per line, `{file}` standing for the held
+# file's absolute path. A rule naming `{file}` drops out for a call that
+# holds no file. The calls stay within the base's `--tools` list: a fork
+# sending another tool list misses the base's cached prefix.
+_ALLOWED_FILE = "allowed-tools.txt"
+_ALLOWED_DEFAULT = ["Read(/{file})", "Write(/{file})", "Edit(/{file})"]
+
+
+def _allowed(state: dict, held: pathlib.Path | None) -> list[str]:
+    try:
+        lines = (pathlib.Path(state["skill"]) / _ALLOWED_FILE).read_text().splitlines()
+    except OSError:
+        lines = _ALLOWED_DEFAULT
+    out = []
+    for rule in (x.strip() for x in lines):
+        if not rule or rule.startswith("#") or ("{file}" in rule and not held):
+            continue
+        out.append(rule.replace("{file}", str(held)))
+    return out
+
+
+def _fork_prompt(state: dict, edit: dict, shown: str, allowed: list[str]) -> str:
     n, rel, to = edit["number"], edit["rel"], edit["to"]
-    path = pathlib.Path(state["root"]) / rel
     close = _edit_cmd(state, "close", n)
-    return (f"Edit #{n}: the session at {to} generated a write to {rel}; chsum held it, left "
-            f"{path} as it stands, and told that session this session ({_fork_name(state, n)}) "
-            f"would message it.\n\n{shown}\n\n"
-            f"Where the held write holds to the rules, write it to {path} as it is. Otherwise "
-            f"message the session the change it needs and why, and on its accept write that "
-            f"version; on a stated purpose, message a new change; on a decline, write nothing. "
-            f"Message the session what was written, or that nothing was. Then run "
-            f"`{close} --title '<name>'` as the last call, <name> two to four lowercase "
-            f"hyphenated words for what the edit does. That command is the one Bash command "
-            f"approved here: any other is refused, and a refusal leaves it approved.")
+    if rel:
+        path = pathlib.Path(state["root"]) / rel
+        head = (f"Edit #{n}: the session at {to} generated a write to {rel}; chsum held it, left "
+                f"{path} as it stands, and told that session this session ({_fork_name(state, n)}) "
+                f"would message it.\n\n{shown}\n\n"
+                f"Where the held write holds to the rules, write it to {path} as it is. Otherwise "
+                f"message the session the change it needs and why, and on its accept write that "
+                f"version; on a stated purpose, message a new change; on a decline, write nothing. "
+                f"Message the session what was written, or that nothing was.")
+    else:
+        head = (f"Edit #{n}: the session at {to} generated a {edit['tool']} call; chsum held it "
+                f"unrun, and told that session this session ({_fork_name(state, n)}) would "
+                f"message it.\n\n{shown}\n\n"
+                f"Where the held call holds to the rules, carry it out as it is. Otherwise "
+                f"message the session the change it needs and why, and on its accept carry out "
+                f"that version; on a stated purpose, message a new change; on a decline, carry "
+                f"out nothing. Message the session what was carried out, or that nothing was.")
+    rules = "; ".join(allowed) or "none"
+    return (f"{head} A held call that holds to the rules and that the approved calls below "
+            f"cannot carry out closes with `--pass`: the session's rerun of that same call, "
+            f"unchanged, then runs once, and the message to the session says to run it again "
+            f"unchanged. Then run `{close} --title '<name>'`, with `--pass` where it applies, as "
+            f"the last call, <name> two to four lowercase hyphenated words for what the edit "
+            f"does. The calls approved here are "
+            f"SendMessage, that command, and these: {rules}. Any other call is refused, and a "
+            f"refusal leaves the approved ones approved.")
 
 
 def _fork(state: dict, number: int) -> int:
@@ -762,12 +820,18 @@ def _fork(state: dict, number: int) -> int:
         edit.update(status="error", error=f"the base did not advance: {err}")
         _save_edit(state, edit)
         return 1
-    new = edit["pending"].encode()
-    old = _show(state, state["held"], edit["rel"])
-    diff = "" if old is None else _unified(edit["rel"], old.decode(errors="replace"), edit["pending"], context=1)
-    shown = (f"The diff below turns the file as it stands in this conversation into the "
-             f"held write.\n\n```diff\n{diff}```" if _fits(diff, new) else
-             f"The held write's full content is below.\n\n{_block(edit['rel'], new)}")
+    if edit["rel"]:
+        new = edit["pending"].encode()
+        old = _show(state, state["held"], edit["rel"])
+        diff = "" if old is None else _unified(edit["rel"], old.decode(errors="replace"), edit["pending"], context=1)
+        shown = (f"The diff below turns the file as it stands in this conversation into the "
+                 f"held write.\n\n```diff\n{diff}```" if _fits(diff, new) else
+                 f"The held write's full content is below.\n\n{_block(edit['rel'], new)}")
+        held = pathlib.Path(state["root"]) / edit["rel"]
+    else:
+        shown = (f"The held call's input is below.\n\n```json\n"
+                 f"{json.dumps(edit['input'], indent=2)}\n```")
+        held = None
     ended = (f"nohup {_edit_cmd(state, 'ended', number)} >/dev/null 2>&1 &")
     # `bgIsolation: none` lets the background fork edit the shared checkout:
     # measured 2026-10-06, a fork without it had Write refused with "Call
@@ -775,9 +839,8 @@ def _fork(state: dict, number: int) -> int:
     # what git tracks, so a watched file git ignores is absent from one.
     settings = {**_SETTINGS, "worktree": {"bgIsolation": "none"},
                 "hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": ended}]}]}}
-    held = pathlib.Path(state["root"]) / edit["rel"]
-    allowed = ",".join(["SendMessage", f"Read(/{held})", f"Write(/{held})", f"Edit(/{held})",
-                        f"Bash({_launcher()} observe close:*)"])
+    rules = _allowed(state, held)
+    allowed = ",".join(["SendMessage", *rules, f"Bash({_launcher()} observe close:*)"])
     flags = _BASE_FLAGS[:_BASE_FLAGS.index("--settings")]
     exe, error = _base_exe(state)
     if not exe:
@@ -786,7 +849,7 @@ def _fork(state: dict, number: int) -> int:
         return 1
     cmd = [exe, "--bg", "--resume", state["sid"], "--fork-session", "--name", _fork_name(state, number),
            "--model", state["model"], *flags, "--allowedTools", allowed,
-           "--settings", json.dumps(settings), _fork_prompt(state, edit, shown)]
+           "--settings", json.dumps(settings), _fork_prompt(state, edit, shown, rules)]
     env = _call_env()
     reason = ""
     for _ in range(2):
@@ -799,7 +862,7 @@ def _fork(state: dict, number: int) -> int:
     edit.update(status="error", error=f"the fork did not start: {reason}")
     _event(edit, "fork failed")
     _save_edit(state, edit)
-    _note(state, outcome={"file": edit["rel"], "title": edit.get("title") or "", "fork": edit.get("fork") or "", "result": "error",
+    _note(state, outcome={"file": _subject(edit), "title": edit.get("title") or "", "fork": edit.get("fork") or "", "result": "error",
                           "at": time.time()})
     return 1
 
@@ -835,14 +898,14 @@ def _launch(cmd: list[str], cwd: str, env: dict) -> tuple[str, str]:
     return "", f"job {short} did not start within {_START_WAIT} s"
 
 
-def _record_drop(state: dict, edit: dict) -> None:
+def _record_drop(state: dict, edit: dict, outcome: str = "dropped") -> None:
     """An edit closed unapplied leaves the files as they stand, so its commit
     carries the held tree unchanged, with the edit's trailers."""
     try:
         with _Lock(state):
             fresh = _load(state["root"], state["name"])
             state.update(held=fresh.get("held", ""))
-            new = _commit(state, _held_tree(state), edit, "dropped")
+            new = _commit(state, _held_tree(state), edit, outcome)
             _git(state, ["update-ref", _ref(state), new, state["held"]])
             fresh["held"] = new
             _save(fresh)
@@ -850,20 +913,36 @@ def _record_drop(state: dict, edit: dict) -> None:
         pass
 
 
-def _close(state: dict, number: int, title: str = "") -> int:
-    """The fork's last call. The file decides the outcome: changed since the
-    write was held means the fork wrote it, applied, and the base moves
-    forward to it; unchanged means dropped. Then the fork is stopped."""
+def _close(state: dict, number: int, title: str = "", passed: bool = False) -> int:
+    """The fork's last call. With `passed`, the edit closes as passed, and
+    the writing session's rerun of the same call runs once. Otherwise a held
+    write's file sets the outcome: changed since the write was held means the
+    fork wrote it, applied, and the base moves forward to it; unchanged means
+    dropped. A held call with no file reads as applied where any watched file
+    differs from the held commit, and as dropped where none does. Then the
+    fork is stopped."""
     edit = _edit(state, number)
     if title:
         edit["title"] = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40]
         _event(edit, f"named `{edit['title']}`")
-    if edit["status"] in ("held", "forked"):
-        try:
-            now = (pathlib.Path(state["root"]) / edit["rel"]).read_text(errors="replace")
-        except OSError:
+    if edit["status"] in ("held", "forked") and passed:
+        edit.update(status="passed", ended=time.time())
+        _event(edit, "passed")
+        _record_drop(state, edit, "passed")
+    elif edit["status"] in ("held", "forked"):
+        if edit["rel"]:
+            try:
+                now = (pathlib.Path(state["root"]) / edit["rel"]).read_text(errors="replace")
+            except OSError:
+                now = None
+            changed = now is not None and now != edit["before"]
+        else:
             now = None
-        if now is not None and now != edit["before"]:
+            try:
+                changed = _tree(state) != _held_tree(state)
+            except _GitError:
+                changed = False
+        if changed:
             edit.update(status="applied", agreed=now, applied=time.time(), ended=time.time())
             _event(edit, "applied" if now == edit["pending"] else "applied, changed")
             _save_edit(state, edit)
@@ -879,8 +958,8 @@ def _close(state: dict, number: int, title: str = "") -> int:
             _event(edit, "dropped")
             _record_drop(state, edit)
     _save_edit(state, edit)
-    result = "applied" if edit["status"] == "applied" else "dropped"
-    _note(state, outcome={"file": edit["rel"], "title": edit.get("title") or "", "fork": edit.get("fork") or "",
+    result = edit["status"] if edit["status"] in ("applied", "passed") else "dropped"
+    _note(state, outcome={"file": _subject(edit), "title": edit.get("title") or "", "fork": edit.get("fork") or "",
                           "result": result, "at": time.time()})
     _detach(state, "end", number)
     print(f"edit #{number} {result}; this session stops in {_CLOSE_DELAY} s")
@@ -961,7 +1040,7 @@ def edits_for_session(session_id: str) -> list[dict]:
     for state in _states():
         for edit in _open_edits(state):
             if edit["writer"] == session_id and (state["name"], edit["number"]) not in seen:
-                out.append({"observer": state["name"], "number": edit["number"], "file": edit["rel"],
+                out.append({"observer": state["name"], "number": edit["number"], "file": _subject(edit),
                             "root": state["root"], "title": edit.get("title") or "",
                             "writer": session_id, "fork": edit.get("fork") or "", "outcome": "open",
                             "when": datetime.fromtimestamp(edit["created"], timezone.utc).isoformat()})
@@ -1281,70 +1360,55 @@ def base_call(sid: str) -> tuple[list[str], dict[str, str]]:
 
 # --- hooks ------------------------------------------------------------------
 
-def _pre_out(**fields) -> int:
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", **fields}}))
-    return 0
-
-
-def _bash_target(command: str, cwd: pathlib.Path) -> tuple[dict | None, str]:
-    if not _BASH_WRITE.search(command):
-        return None, ""
-    try:
-        tokens = shlex.split(command, posix=True)
-    except ValueError:
-        tokens = command.split()
-    for tok in tokens:
-        tok = tok.lstrip("<>&|0123456789").rstrip(";&|")
-        if not tok:
-            continue
-        p = pathlib.Path(tok).expanduser()
-        state, rel = _state_for(p if p.is_absolute() else cwd / p)
-        if state:
-            return state, rel
-    return None, ""
-
-
 def _reload_hint(state: dict) -> str:
     return f"chsum observe reload --root {state['root']} --name {state['name']}"
 
 
-def hook_pre(payload: dict) -> int:
-    """PreToolUse on Write, Edit, MultiEdit and Bash. A write to a watched
-    file is held as an edit and denied, the deny naming the fork that will
-    message the writing session; the fork's `apply` writes the agreed
-    version. A Bash command writing such a file is denied. Every other path,
-    an exception included, exits 0 and lets the call run."""
-    try:
-        tool = str(payload.get("tool_name") or "")
-        inp = payload.get("tool_input") or {}
-        cwd = pathlib.Path(str(payload.get("cwd") or "."))
-        if tool == "Bash":
-            state, rel = _bash_target(str(inp.get("command") or ""), cwd)
-            if not state:
-                return 0
-            return _pre_out(permissionDecision="deny", permissionDecisionReason=(
-                f"chsum observe: {rel} is watched ({state['name']}); write it with Write or Edit."))
-        if tool not in ("Write", "Edit", "MultiEdit"):
-            return 0
-        path = pathlib.Path(str(inp.get("file_path") or ""))
-        path = path if path.is_absolute() else cwd / path
-        state, rel = _state_for(path)
-        if not state:
-            return 0
-        text = _proposed(tool, inp, path)
-        if text is None:
-            return 0
-        if _expired(state):
-            return _pre_out(additionalContext=(
-                f"chsum observe: the base reviewing {rel} has expired, so this "
-                f"write lands unreviewed. The person relaunches it with "
-                f"`{_reload_hint(state)}`."))
-        edit = _hold(state, rel, text, str(payload.get("session_id") or ""), path)
-        return _pre_out(permissionDecision="deny", permissionDecisionReason=(
-            f"held for review by {state['name']}; its reviewer will message you."))
-    except Exception as e:  # noqa: BLE001 — a fault here lets the call run
-        print(f"chsum observe pre-tool-use hook: {e}", file=sys.stderr)
+def hold_call(payload: dict, root: str, name: str) -> int:
+    """`observe hold`: one PreToolUse payload, printed back as a decision in
+    JSON for the calling hook to return. A call matching a passed edit from
+    the same session spends that clearance and prints `allow`. Any other
+    call becomes a held edit with its fork started, and prints `deny` with
+    the reason. A Write, Edit or MultiEdit to a watched file holds the
+    file's text after the call. Any other call holds on the observer --root
+    and --name select, --root falling back to the payload's cwd. Exit 1,
+    with the cause on stderr, where the payload names no tool, no observer
+    holds the call, its cache has expired, or the write fails on its own."""
+    tool = str(payload.get("tool_name") or "")
+    inp = payload.get("tool_input") or {}
+    if not tool:
+        print("the payload names no tool_name; hold takes a PreToolUse payload", file=sys.stderr)
+        return 1
+    cwd = pathlib.Path(str(payload.get("cwd") or "."))
+    state, rel, path, text = None, "", None, None
+    if tool in ("Write", "Edit", "MultiEdit") and inp.get("file_path"):
+        target = pathlib.Path(str(inp["file_path"]))
+        target = target if target.is_absolute() else cwd / target
+        state, rel = _state_for(target)
+        if state:
+            path, text = target, _proposed(tool, inp, target)
+            if text is None:
+                print(f"the {tool} call fails on its own: its old_string is absent from {rel}",
+                      file=sys.stderr)
+                return 1
+    if not state:
+        state = _load(_resolve_root(root or str(cwd)), name)
+    session = str(payload.get("session_id") or "")
+    cleared = _cleared(state, session, tool, inp)
+    if cleared:
+        cleared["status"] = "released"
+        _event(cleared, "rerun released")
+        _save_edit(state, cleared)
+        print(json.dumps({"observer": state["name"], "edit": cleared["number"], "decision": "allow"}))
         return 0
+    if _expired(state):
+        print(f"observer {state['name']} has expired; `{_reload_hint(state)}` relaunches it",
+              file=sys.stderr)
+        return 1
+    edit = _hold(state, rel, text, session, path, tool, inp)
+    print(json.dumps({"observer": state["name"], "edit": edit["number"], "decision": "deny",
+                      "reason": f"held for review by {state['name']}; its reviewer will message you."}))
+    return 0
 
 
 def hook_post(payload: dict) -> int:
@@ -1515,14 +1579,16 @@ def _paint(text: str, key: str) -> str:
 
 
 def _spread(left: tuple[str, int], mid: tuple[str, int], right: tuple[str, int], width: int) -> str:
-    """Places `mid` on the centre of `width` and `right` against its end. Each
-    part is (painted text, visible length): the escapes take no columns, so
-    the padding is computed on the visible lengths. A width too narrow for
-    the three parts with a gap between each returns them joined by spaces."""
+    """Places `right` against the end of `width` and `mid` on its centre,
+    shifted left by the columns a centred `mid` would take from `right` and
+    the two-column gap before it. Each part is (painted text, visible
+    length): the escapes take no columns, so the padding is computed on the
+    visible lengths. A width too narrow for the three parts with a gap
+    between each returns them joined by spaces."""
     (lt, ll), (mt, ml), (rt, rl) = left, mid, right
     if width <= 0:
         return f"{lt}  {mt}  {rt}"
-    mid_at = max((width - ml) // 2, ll + 2)
+    mid_at = max(min((width - ml) // 2, width - rl - 2 - ml), ll + 2)
     gap = width - rl - (mid_at + ml)
     if gap < 2:
         return f"{lt}  {mt}  {rt}"
@@ -1845,6 +1911,14 @@ def cmd_observe(args) -> int:
         payload = payload if isinstance(payload, dict) else {}
         print(_line(payload))
         return 0
+    if args.action == "hold":
+        try:
+            payload = json.loads(sys.stdin.read() or "{}")
+        except ValueError:
+            raise SystemExit("hold reads one hook payload as JSON on stdin") from None
+        if not isinstance(payload, dict):
+            raise SystemExit("hold reads one hook payload as JSON on stdin")
+        return hold_call(payload, "" if args.root == "." else args.root, args.name)
     root = _resolve_root(args.root)
     _compile_all(args.match + args.skip + args.skill_match + args.skill_skip)
     try:
@@ -1882,7 +1956,7 @@ def cmd_observe(args) -> int:
             if args.action == "fork":
                 return _fork(state, args.edit)
             if args.action == "close":
-                return _close(state, args.edit, args.title)
+                return _close(state, args.edit, args.title, args.passed)
             if args.action == "end":
                 return _end(state, args.edit, _CLOSE_DELAY)
             return _ended(state, args.edit)
@@ -1937,16 +2011,20 @@ def add_parser(sub, parents) -> None:
                     "files as its system prompt and every file under --root a --match regex "
                     "fully matches, and no --skip regex removes, as its first turn, "
                     "and holds that state on refs/chsum/observe/<name> in a git "
-                    "directory of its own under the chsum data directory. From then "
-                    "on a Write or Edit to a watched file is held and denied, and a "
-                    "background session forked from the base reviews it and messages "
-                    "the writing session; on an accept it runs `apply`, which writes "
-                    "the agreed version. A change made out of band is carried to the "
-                    "base as a diff. A Bash write to a watched file is denied. "
+                    "directory of its own under the chsum data directory. A call a "
+                    "hook passes to `hold` is reviewed by a background session forked "
+                    "from the base, which messages the calling session and on an accept "
+                    "carries out the agreed version. A change made out of band is "
+                    "carried to the "
+                    "base as a diff. "
+                    "`hold` reads one PreToolUse hook payload on stdin, holds that call "
+                    "for review, and prints the edit and a deny reason as JSON for the "
+                    "calling hook to return; the fork's tools come from allowed-tools.txt "
+                    "in the skill directory. "
                     "`preview` prints what `start` would send, with no model call. "
                     "`reload` rebuilds the base from the files as they stand; `stop` "
                     "drops it and deletes its git directory unless --keep-history.")
-    p.add_argument("action", choices=["start", "preview", "status", "reload", "stop", "line", "ping",
+    p.add_argument("action", choices=["start", "preview", "status", "reload", "stop", "hold", "line", "ping",
                                       "advance", "fork", "close", "end", "ended", "log",
                                       "show"],
                    nargs="?", default="status")
@@ -1976,6 +2054,9 @@ def add_parser(sub, parents) -> None:
                         "e.g. '(.*/)?node_modules'; repeatable")
     p.add_argument("--model", default="", help="the base's model, e.g. opus")
     p.add_argument("--title", default="", help="close: the edit's name, two to four words")
+    p.add_argument("--pass", dest="passed", action="store_true",
+                   help="close: the held call passes, and the writing session's rerun of "
+                        "it, unchanged, runs once")
     p.add_argument("--full", action="store_true",
                    help="preview: print the system prompt and first message as sent")
     p.add_argument("--keep-history", action="store_true",

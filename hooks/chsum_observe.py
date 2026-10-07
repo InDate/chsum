@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""PreToolUse and PostToolUse for `chsum observe`, run out of the plugin's own directory.
-
-The first argument names the event: `pre` reviews a pending write to a file an
-observe base covers, `post` appends a landed one to the base. With no observe
-base started, both exit 0 at once.
+"""PostToolUse for `chsum observe`, run out of the plugin's own directory: a
+landed write to a file an observe base covers moves the base forward. With no
+observe base started, it exits 0 at once.
 
 One JSON payload arrives on stdin. Exit 2 is the code that blocks a turn, so
-every path here exits 0; a deny travels in the JSON on stdout.
+every path here exits 0.
 """
 import pathlib
 import sys
@@ -20,5 +18,4 @@ except Exception as e:  # noqa: BLE001 — an unimportable module stops the hook
     print(f"chsum observe hook: {e}", file=sys.stderr)
     raise SystemExit(0)
 
-hook = observe.hook_post if sys.argv[1:2] == ["post"] else observe.hook_pre
-raise SystemExit(hook(chsum._read_payload()))
+raise SystemExit(observe.hook_post(chsum._read_payload()))

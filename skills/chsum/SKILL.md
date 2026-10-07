@@ -106,7 +106,8 @@ cheaper than carrying the turns since; `break-even N%` marks one not yet
 cheaper, N the share of its cost paid so far. The part drops off with the
 session's cache: the handoff's request fails on an expired branch.
 `cache expired` on that line is the observer's: `chsum observe reload`
-rebuilds its base.
+rebuilds its base. `references/observe.md` — the hook that feeds an
+observer, `hold`, the reviewer's approved calls, `close --pass`.
 
 Straight after the rewind, `! chsum resume` starts a separate process and
 exits. Claude Code writes the command's records as it exits, and they hang off

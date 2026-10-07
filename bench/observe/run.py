@@ -16,9 +16,10 @@ sentence returns EDIT naming "bank", the river and capacitor sentences return
 PASS, the out-of-band edit moves the ref, and every request after the create
 reads the base's prefix from cache.
 
-The live observer watches `bench/observe/work/notes/` in this repo, so a
-session here reviews its Write and Edit calls, denies its Bash writes, and
-shows it on the status line.
+The live observer watches `bench/observe/work/notes/` in this repo. This
+repo's `.claude/hooks/observe.py` passes a session's Write, Edit and Bash
+calls on that folder to `chsum observe hold`, and the status line shows the
+observer.
 """
 import argparse
 import json
